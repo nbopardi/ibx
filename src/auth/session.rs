@@ -121,6 +121,13 @@ pub fn recv_secure<R: Read>(
             format!("Secure error: {}", parts[2..].join(";")),
         ));
     }
+    if msg_type == NS_REDIRECT {
+        let target = parts.get(2).unwrap_or(&"");
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            format!("REDIRECT:{}", target),
+        ));
+    }
     if msg_type != NS_SECURE_MESSAGE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -646,6 +653,47 @@ mod tests {
         assert_eq!(ar.session_id, "abc.0001");
         assert_eq!(ar.features.len(), 2);
         assert!(ar.authenticated);
+    }
+
+    // ── recv_secure ──────────────────────────────────────────────────────
+
+    /// Build a fake NS frame with the given text payload.
+    fn build_ns_frame(payload: &str) -> Vec<u8> {
+        let bytes = payload.as_bytes();
+        let mut frame = Vec::with_capacity(8 + bytes.len());
+        frame.extend_from_slice(ns::NS_MAGIC);
+        frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        frame.extend_from_slice(bytes);
+        frame
+    }
+
+    #[test]
+    fn recv_secure_redirect_returns_target() {
+        let frame = build_ns_frame("50;524;ndc1.ibllc.com:4000;");
+        let mut cursor = io::Cursor::new(frame);
+        let mut channel = SecureChannel::new();
+        let err = recv_secure(&mut cursor, &mut channel).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        assert!(err.to_string().starts_with("REDIRECT:"));
+        assert!(err.to_string().contains("ndc1.ibllc.com:4000"));
+    }
+
+    #[test]
+    fn recv_secure_error_still_works() {
+        let frame = build_ns_frame("50;535;some error message;");
+        let mut cursor = io::Cursor::new(frame);
+        let mut channel = SecureChannel::new();
+        let err = recv_secure(&mut cursor, &mut channel).unwrap_err();
+        assert!(err.to_string().contains("Secure error"));
+    }
+
+    #[test]
+    fn recv_secure_unknown_type_returns_error() {
+        let frame = build_ns_frame("50;999;payload;");
+        let mut cursor = io::Cursor::new(frame);
+        let mut channel = SecureChannel::new();
+        let err = recv_secure(&mut cursor, &mut channel).unwrap_err();
+        assert!(err.to_string().contains("Expected 534, got 999"));
     }
 
     // ── Constants ───────────────────────────────────────────────────────

@@ -422,12 +422,28 @@ impl Gateway {
     /// Connect to IB: auth + logon + data farm connections.
     /// Returns Gateway + farm Connection + auth Connection + optional historical data Connection.
     pub fn connect(config: &GatewayConfig) -> io::Result<(Self, Connection, Connection, Option<Connection>)> {
+        Self::connect_to_host(config, &config.host, 0)
+    }
+
+    /// Internal: connect to a specific host, with redirect depth tracking.
+    fn connect_to_host(
+        config: &GatewayConfig,
+        host: &str,
+        redirect_depth: u32,
+    ) -> io::Result<(Self, Connection, Connection, Option<Connection>)> {
+        if redirect_depth > 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Too many redirects during auth",
+            ));
+        }
+
         let hw_info = session::get_hw_info();
         let encoded = IB_ENCODED.to_string();
 
         // --- Phase 1: TLS + auth ---
-        log::info!("Connecting to auth server {}:{}", config.host, AUTH_PORT);
-        let addr = format!("{}:{}", config.host, AUTH_PORT)
+        log::info!("Connecting to auth server {}:{}", host, AUTH_PORT);
+        let addr = format!("{}:{}", host, AUTH_PORT)
             .to_socket_addrs()?
             .next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "DNS resolution failed"))?;
@@ -438,7 +454,7 @@ impl Gateway {
             .build()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let mut tls = connector
-            .connect(&config.host, tcp)
+            .connect(host, tcp)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         // Key exchange
@@ -493,8 +509,19 @@ impl Gateway {
         );
         session::send_secure(&mut tls, &mut channel, connect_req.as_bytes())?;
 
-        // Receive AUTH_START
-        let _auth_start = session::recv_secure(&mut tls, &mut channel)?;
+        // Receive AUTH_START (may get a redirect instead for paper accounts)
+        let _auth_start = match session::recv_secure(&mut tls, &mut channel) {
+            Ok(data) => data,
+            Err(e) if e.to_string().starts_with("REDIRECT:") => {
+                let target = e.to_string().strip_prefix("REDIRECT:").unwrap().to_string();
+                // Extract host (strip port if present — auth always uses AUTH_PORT)
+                let redirect_host = target.split(':').next().unwrap_or(&target);
+                log::info!("Redirected to {}, reconnecting...", redirect_host);
+                drop(tls);
+                return Self::connect_to_host(config, redirect_host, redirect_depth + 1);
+            }
+            Err(e) => return Err(e),
+        };
 
         // Authentication
         log::info!("Starting auth for {}", config.username);
@@ -526,6 +553,12 @@ impl Gateway {
                     io::ErrorKind::Other,
                     format!("Post-auth secure error: {}", parts[2..].join(";")),
                 ));
+            } else if raw_type == ns::NS_REDIRECT {
+                let target = parts.get(2).unwrap_or(&"");
+                let redirect_host = target.split(':').next().unwrap_or(target);
+                log::info!("Post-auth redirect to {}, reconnecting...", redirect_host);
+                drop(tls);
+                return Self::connect_to_host(config, redirect_host, redirect_depth + 1);
             } else {
                 payload
             };
@@ -702,14 +735,14 @@ impl Gateway {
 
         // --- Phase 3: Data farm connections ---
         let farm_conn = connect_farm(
-            &config.host, "usfarm",
+            host, "usfarm",
             &config.username, config.paper,
             &server_session_id, &session_key, &hw_info, &encoded,
         )?;
 
         // Historical data farm (optional)
         let hmds_conn = match connect_farm(
-            &config.host, "ushmds",
+            host, "ushmds",
             &config.username, config.paper,
             &server_session_id, &session_key, &hw_info, &encoded,
         ) {
