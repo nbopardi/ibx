@@ -46,10 +46,27 @@ pub fn chrono_free_timestamp() -> String {
     let minutes = (time_secs % 3600) / 60;
     let seconds = time_secs % 60;
     let (year, month, day) = days_to_ymd(days);
-    format!(
-        "{:04}{:02}{:02}-{:02}:{:02}:{:02}",
-        year, month, day, hours, minutes, seconds
-    )
+    // Write directly into a fixed buffer: "YYYYMMDD-HH:MM:SS"
+    let mut buf = [b'0'; 17];
+    write_u2(&mut buf[0..], (year / 100) as u8);
+    write_u2(&mut buf[2..], (year % 100) as u8);
+    write_u2(&mut buf[4..], month as u8);
+    write_u2(&mut buf[6..], day as u8);
+    buf[8] = b'-';
+    write_u2(&mut buf[9..], hours as u8);
+    buf[11] = b':';
+    write_u2(&mut buf[12..], minutes as u8);
+    buf[14] = b':';
+    write_u2(&mut buf[15..], seconds as u8);
+    // SAFETY: buf is all ASCII digits, '-', and ':'
+    unsafe { String::from_utf8_unchecked(buf.to_vec()) }
+}
+
+/// Write a u8 as 2 zero-padded decimal digits into a byte slice.
+#[inline]
+fn write_u2(buf: &mut [u8], val: u8) {
+    buf[0] = b'0' + val / 10;
+    buf[1] = b'0' + val % 10;
 }
 
 /// Format unix timestamp (seconds) to IB's "YYYYMMDD HH:MM:SS" format (UTC).

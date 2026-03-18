@@ -65,29 +65,65 @@ pub fn fix_checksum(data: &[u8]) -> String {
 /// `fields` should NOT include tags 8, 9, 34, or 10 (auto-generated).
 /// Body length is 4-digit zero-padded, MsgSeqNum is 6-digit zero-padded.
 pub fn fix_build(fields: &[(u32, &str)], seq: u32) -> Vec<u8> {
-    // Build body: first_field SOH 34=NNNNNN SOH [rest...] SOH
-    let mut body = String::new();
-    for (i, (tag, val)) in fields.iter().enumerate() {
+    // Build body directly into bytes (no intermediate String, no format! per field)
+    let mut body = Vec::with_capacity(fields.len() * 20 + 20);
+    for (i, &(tag, val)) in fields.iter().enumerate() {
         if i == 1 {
-            // Insert seq after first field (35=MsgType)
-            body.push_str(&format!("34={:06}\x01", seq));
+            body.extend_from_slice(b"34=");
+            push_u32_padded::<6>(&mut body, seq);
+            body.push(SOH);
         }
-        body.push_str(&format!("{}={}\x01", tag, val));
+        push_u32(&mut body, tag);
+        body.push(b'=');
+        body.extend_from_slice(val.as_bytes());
+        body.push(SOH);
     }
     if fields.len() == 1 {
-        // Only one field, append seq after it
-        body.push_str(&format!("34={:06}\x01", seq));
+        body.extend_from_slice(b"34=");
+        push_u32_padded::<6>(&mut body, seq);
+        body.push(SOH);
     }
 
     // Header: 8=FIX.4.1 SOH 9=NNNN SOH
-    let header = format!("8=FIX.4.1\x019={:04}\x01", body.len());
+    let mut msg = Vec::with_capacity(body.len() + 30);
+    msg.extend_from_slice(b"8=FIX.4.1\x019=");
+    push_u32_padded::<4>(&mut msg, body.len() as u32);
+    msg.push(SOH);
 
     // Checksum covers header + body
-    let pre_checksum = format!("{}{}", header, body);
-    let cksum = fix_checksum(pre_checksum.as_bytes());
-    let mut msg = pre_checksum.into_bytes();
-    msg.extend_from_slice(format!("10={}\x01", cksum).as_bytes());
+    let cksum: u32 = msg.iter().chain(body.iter()).map(|&b| b as u32).sum();
+    msg.extend_from_slice(&body);
+    msg.extend_from_slice(b"10=");
+    push_u32_padded::<3>(&mut msg, cksum % 256);
+    msg.push(SOH);
     msg
+}
+
+/// Write a u32 as decimal digits (no zero padding, no alloc).
+#[inline]
+fn push_u32(buf: &mut Vec<u8>, mut val: u32) {
+    if val == 0 {
+        buf.push(b'0');
+        return;
+    }
+    let start = buf.len();
+    while val > 0 {
+        buf.push(b'0' + (val % 10) as u8);
+        val /= 10;
+    }
+    buf[start..].reverse();
+}
+
+/// Write a u32 as N zero-padded decimal digits (no alloc).
+#[inline]
+fn push_u32_padded<const N: usize>(buf: &mut Vec<u8>, val: u32) {
+    let mut digits = [b'0'; N];
+    let mut v = val;
+    for d in digits.iter_mut().rev() {
+        *d = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    buf.extend_from_slice(&digits);
 }
 
 /// Parse a SOH-delimited FIX message into {tag: value}.
@@ -109,27 +145,77 @@ pub fn fix_parse(data: &[u8]) -> HashMap<u32, String> {
 
 /// Fold 20-byte HMAC digest to 4 bytes → 8-char uppercase hex.
 pub fn xor_fold(h: &[u8]) -> String {
-    assert!(h.len() >= 20);
+    let r = xor_fold_bytes(h);
+    r.iter().map(|b| format!("{:02X}", b)).collect()
+}
+
+/// Fold 20-byte HMAC digest to 4 bytes (no heap allocation).
+#[inline]
+fn xor_fold_bytes(h: &[u8]) -> [u8; 4] {
+    debug_assert!(h.len() >= 20);
     let mut r = [0u8; 4];
     for (i, &b) in h[..20].iter().enumerate() {
         r[i % 4] ^= b;
     }
-    r.iter().map(|b| format!("{:02X}", b)).collect()
+    r
+}
+
+/// Compare 4 XOR-folded bytes against an 8-char hex string (case-insensitive, no alloc).
+#[inline]
+fn sig_hex_eq(expected: &[u8; 4], hex_ascii: &[u8]) -> bool {
+    if hex_ascii.len() != 8 {
+        return false;
+    }
+    for i in 0..4 {
+        let hi = hex_nibble(hex_ascii[i * 2]);
+        let lo = hex_nibble(hex_ascii[i * 2 + 1]);
+        if (hi << 4 | lo) != expected[i] {
+            return false;
+        }
+    }
+    true
+}
+
+/// Write 4 bytes as 8-char uppercase hex (no alloc).
+#[inline]
+fn push_hex_upper(buf: &mut Vec<u8>, bytes: &[u8; 4]) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in bytes {
+        buf.push(HEX[(b >> 4) as usize]);
+        buf.push(HEX[(b & 0xF) as usize]);
+    }
+}
+
+#[inline]
+fn hex_nibble(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'A'..=b'F' => b - b'A' + 10,
+        b'a'..=b'f' => b - b'a' + 10,
+        _ => 0xFF,
+    }
 }
 
 /// Find the byte position right after `tag=value\x01` in the message.
 fn find_after_tag(data: &[u8], tag_num: u32) -> Option<usize> {
-    let needle = format!("{}=", tag_num);
-    let needle_bytes = needle.as_bytes();
-    // Search for the needle
-    let idx = data
-        .windows(needle_bytes.len())
-        .position(|w| w == needle_bytes)?;
-    // Find SOH after the value
-    let soh = data[idx + needle_bytes.len()..]
-        .iter()
-        .position(|&b| b == SOH)?;
-    Some(idx + needle_bytes.len() + soh + 1)
+    // Fast path for common tags (avoids format! heap allocation)
+    match tag_num {
+        9 => find_after_tag_bytes(data, b"9="),
+        35 => find_after_tag_bytes(data, b"35="),
+        _ => {
+            let needle = format!("{}=", tag_num);
+            find_after_tag_bytes(data, needle.as_bytes())
+        }
+    }
+}
+
+/// Find byte position right after `needle value \x01`.
+#[inline]
+fn find_after_tag_bytes(data: &[u8], needle: &[u8]) -> Option<usize> {
+    let idx = data.windows(needle.len()).position(|w| w == needle)?;
+    let after = idx + needle.len();
+    let soh = data[after..].iter().position(|&b| b == SOH)?;
+    Some(after + soh + 1)
 }
 
 /// Sign a message with HMAC.
@@ -158,27 +244,32 @@ pub fn fix_sign(msg: &[u8], mac_key: &[u8], iv: &[u8]) -> (Vec<u8>, Vec<u8>) {
     mac.update(body);
     let hmac_res = mac.finalize().into_bytes();
 
-    // 3. XOR-fold → tag 8349
-    let sig = xor_fold(&hmac_res);
+    // 3. XOR-fold → 4 bytes, write as hex directly (no String alloc)
+    let folded = xor_fold_bytes(&hmac_res);
 
-    // 4. Rebuild message with signature
-    let mut signed_body = Vec::new();
-    signed_body.extend_from_slice(body);
-    signed_body.extend_from_slice(format!("8349={}\x01", sig).as_bytes());
-
-    // Header: everything up to and including first SOH (8=... SOH)
+    // 4. Rebuild message with signature (pre-allocate)
+    let sig_tag_len = 5 + 8 + 1; // "8349=" + 8 hex chars + SOH
+    let signed_body_len = body.len() + sig_tag_len;
     let hdr_end = msg.iter().position(|&b| b == SOH).unwrap() + 1;
     let header = &msg[..hdr_end];
 
-    let mut new_msg = Vec::new();
+    // Estimate: header + "9=NNNN\x01" + signed_body + "10=NNN\x01"
+    let mut new_msg = Vec::with_capacity(hdr_end + 8 + signed_body_len + 8);
     new_msg.extend_from_slice(header);
-    new_msg.extend_from_slice(format!("9={}\x01", signed_body.len()).as_bytes());
-    new_msg.extend_from_slice(&signed_body);
+    new_msg.extend_from_slice(b"9=");
+    push_u32(&mut new_msg, signed_body_len as u32);
+    new_msg.push(SOH);
+    new_msg.extend_from_slice(body);
+    new_msg.extend_from_slice(b"8349=");
+    push_hex_upper(&mut new_msg, &folded);
+    new_msg.push(SOH);
 
     if is_fix41 {
         // Add tag 10 checksum
         let cksum: u32 = new_msg.iter().map(|&b| b as u32).sum();
-        new_msg.extend_from_slice(format!("10={:03}\x01", cksum % 256).as_bytes());
+        new_msg.extend_from_slice(b"10=");
+        push_u32_padded::<3>(&mut new_msg, cksum % 256);
+        new_msg.push(SOH);
     }
 
     // 5. XOR distortion (8 positions using IV pairs)
@@ -201,12 +292,12 @@ pub fn fix_sign(msg: &[u8], mac_key: &[u8], iv: &[u8]) -> (Vec<u8>, Vec<u8>) {
     }
 
     // 6. IV chain
-    let mut new_iv = iv.to_vec();
+    let mut new_iv = [0u8; 16];
     for i in 0..16 {
-        new_iv[i] ^= hmac_res[i];
+        new_iv[i] = iv[i] ^ hmac_res[i];
     }
 
-    (new_msg, new_iv)
+    (new_msg, new_iv.to_vec())
 }
 
 /// Un-distort and verify a signed FIX message.
@@ -258,25 +349,24 @@ pub fn fix_unsign(msg: &[u8], mac_key: &[u8], iv: &[u8]) -> (Vec<u8>, Vec<u8>, b
     mac.update(iv);
     mac.update(body);
     let hmac_res = mac.finalize().into_bytes();
-    let expected = xor_fold(&hmac_res);
+    let expected = xor_fold_bytes(&hmac_res);
 
-    // Extract actual signature
+    // Extract actual signature and compare as bytes (no String alloc)
     let sig_start = t8349 + sig_needle.len();
     let sig_end = msg_bytes[sig_start..]
         .iter()
         .position(|&b| b == SOH)
         .map(|p| sig_start + p)
         .unwrap_or(msg_bytes.len());
-    let actual = String::from_utf8_lossy(&msg_bytes[sig_start..sig_end]).to_uppercase();
-    let sig_valid = expected == actual;
+    let sig_valid = sig_hex_eq(&expected, &msg_bytes[sig_start..sig_end]);
 
     // 3. IV chain
-    let mut new_iv = iv.to_vec();
+    let mut new_iv = [0u8; 16];
     for i in 0..16 {
-        new_iv[i] ^= hmac_res[i];
+        new_iv[i] = iv[i] ^ hmac_res[i];
     }
 
-    (msg_bytes, new_iv, sig_valid)
+    (msg_bytes, new_iv.to_vec(), sig_valid)
 }
 
 /// Read one complete FIX message from a reader.

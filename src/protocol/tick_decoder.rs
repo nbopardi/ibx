@@ -128,7 +128,7 @@ pub fn decode_ticks_35p(body: &[u8]) -> Vec<RawTick> {
     let bit_count = ((body[0] as usize) << 8) | (body[1] as usize);
     let payload = &body[2..];
     let mut reader = BitReader::new(payload, bit_count);
-    let mut ticks = Vec::new();
+    let mut ticks = Vec::with_capacity(8);
 
     while reader.remaining() > 32 {
         let cont = match reader.read_unsigned(1) {
