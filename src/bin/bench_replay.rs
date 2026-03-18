@@ -311,19 +311,66 @@ fn main() {
             let _ = fix_sign(&order_msg, &MAC_KEY, &INIT_IV);
         });
 
-        // Full order path: timestamp + format_price + fix_build + fix_sign
-        bench("full order: timestamp + build + sign", ITERATIONS, || {
+        // Full limit order: timestamp + build + sign
+        bench("full: limit order (16 fields) build+sign", ITERATIONS, || {
             let now = ibx::config::chrono_free_timestamp();
-            let price_str = "150.25";
             let fields: Vec<(u32, &str)> = vec![
                 (35, "D"), (52, &now), (11, "12345"), (1, "DU0000000"),
                 (21, "2"), (55, "SPY"), (54, "1"), (38, "100"),
-                (40, "2"), (44, price_str), (59, "0"), (60, &now),
+                (40, "2"), (44, "150.25"), (59, "0"), (60, &now),
                 (167, "STK"), (100, "SMART"), (15, "USD"), (204, "0"),
             ];
             let msg = fix_build(&fields, 42);
             let _ = fix_sign(&msg, &MAC_KEY, &INIT_IV);
         });
+
+        // Full market order (fewer fields, no price)
+        bench("full: market order (14 fields) build+sign", ITERATIONS, || {
+            let now = ibx::config::chrono_free_timestamp();
+            let fields: Vec<(u32, &str)> = vec![
+                (35, "D"), (52, &now), (11, "12345"), (1, "DU0000000"),
+                (21, "2"), (55, "SPY"), (54, "1"), (38, "1"),
+                (40, "1"), (59, "0"), (60, &now),
+                (167, "STK"), (100, "SMART"), (15, "USD"),
+            ];
+            let msg = fix_build(&fields, 42);
+            let _ = fix_sign(&msg, &MAC_KEY, &INIT_IV);
+        });
+
+        // Cancel order (5 fields, lightweight)
+        bench("full: cancel order (5 fields) build+sign", ITERATIONS, || {
+            let now = ibx::config::chrono_free_timestamp();
+            let fields: Vec<(u32, &str)> = vec![
+                (35, "F"), (52, &now), (11, "C12345"), (41, "12345"), (60, &now),
+            ];
+            let msg = fix_build(&fields, 42);
+            let _ = fix_sign(&msg, &MAC_KEY, &INIT_IV);
+        });
+
+        // Modify order (16+ fields, same as limit but replace msg type)
+        bench("full: modify order (16 fields) build+sign", ITERATIONS, || {
+            let now = ibx::config::chrono_free_timestamp();
+            let fields: Vec<(u32, &str)> = vec![
+                (35, "G"), (52, &now), (11, "12346"), (41, "12345"),
+                (1, "DU0000000"), (21, "2"), (55, "SPY"), (54, "1"),
+                (38, "100"), (40, "2"), (44, "151.00"), (59, "0"), (60, &now),
+                (167, "STK"), (100, "SMART"), (15, "USD"), (204, "0"),
+            ];
+            let msg = fix_build(&fields, 42);
+            let _ = fix_sign(&msg, &MAC_KEY, &INIT_IV);
+        });
+
+        // Channel enqueue (SPSC crossbeam)
+        let (order_tx, order_rx) = bounded::<u64>(65536);
+        let mut enqueued = 0u64;
+        bench("channel enqueue (crossbeam bounded)", ITERATIONS, || {
+            let _ = order_tx.try_send(enqueued);
+            enqueued += 1;
+            if enqueued % 60000 == 0 {
+                while order_rx.try_recv().is_ok() {}
+            }
+        });
+        while order_rx.try_recv().is_ok() {}
     }
     println!();
 
