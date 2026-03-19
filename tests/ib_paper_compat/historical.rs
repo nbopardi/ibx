@@ -14,7 +14,7 @@ pub(super) fn phase_historical_data(mut conns: Conns, gw: &Gateway, config: &Gat
     println!("--- Phase 11: Historical Data Bars (SPY, 1 day of 5-min bars) ---");
 
     ccp_keepalive(&mut conns.ccp);
-    let mut hmds = match connect_farm(
+    let hmds = match connect_farm(
         &config.host, "ushmds",
         &config.username, config.paper,
         &gw.server_session_id, &gw.session_token, &gw.hw_info, &gw.encoded,
@@ -26,180 +26,126 @@ pub(super) fn phase_historical_data(mut conns: Conns, gw: &Gateway, config: &Gat
         }
     };
 
+    // Step 1: Create HotLoop with HMDS connection
     let account_id = conns.account_id;
     let shared = Arc::new(SharedState::new());
-    let (bg_loop, bg_tx) = HotLoop::with_connections(
-        shared, None, account_id.clone(), conns.farm, conns.ccp, None, None,
+    let (hot_loop, control_tx) = HotLoop::with_connections(
+        shared.clone(), None, account_id.clone(), conns.farm, conns.ccp, Some(hmds), None,
     );
-    bg_tx.send(ControlCommand::Subscribe { con_id: 756733, symbol: "SPY".into() }).unwrap();
-    let bg_join = run_hot_loop(bg_loop);
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let secs_per_day = 86400u64;
-    let end_time = {
-        let days = now / secs_per_day;
-        let mut y = 1970i64;
-        let mut remaining = days as i64;
-        loop {
-            let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
-            if remaining < days_in_year { break; }
-            remaining -= days_in_year;
-            y += 1;
-        }
-        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-        let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        let mut m = 0;
-        for (i, &d) in month_days.iter().enumerate() {
-            if remaining < d as i64 { m = i + 1; break; }
-            remaining -= d as i64;
-        }
-        let day = remaining + 1;
-        let hour = (now % secs_per_day) / 3600;
-        let min = (now % 3600) / 60;
-        let sec = now % 60;
-        format!("{:04}{:02}{:02}-{:02}:{:02}:{:02}", y, m, day, hour, min, sec)
-    };
-
-    let req = HistoricalRequest {
-        query_id: "test1".to_string(),
+    // Step 2: Send FetchHistorical via ControlCommand
+    control_tx.send(ControlCommand::FetchHistorical {
+        req_id: 1100,
         con_id: 756733,
-        symbol: "SPY".to_string(),
-        sec_type: "CS",
-        exchange: "SMART",
-        data_type: BarDataType::Trades,
-        end_time,
-        duration: "1 d".to_string(),
-        bar_size: BarSize::Min5,
+        symbol: "SPY".into(),
+        end_date_time: now_ib_timestamp(),
+        duration: "1 D".into(),
+        bar_size: "5 mins".into(),
+        what_to_show: "TRADES".into(),
         use_rth: true,
-    };
+    }).unwrap();
+    let join = run_hot_loop(hot_loop);
 
-    let xml = historical::build_query_xml(&req);
-    hmds.send_fixcomp(&[
-        (fix::TAG_MSG_TYPE, "W"),
-        (historical::TAG_HISTORICAL_XML, &xml),
-    ]).expect("Failed to send historical request");
-
+    // Step 3: Wait for results in SharedState
     let mut all_bars = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut complete = false;
 
     while Instant::now() < deadline && !complete {
-        match hmds.try_recv() {
-            Ok(0) => { std::thread::sleep(Duration::from_millis(50)); continue; }
-            Err(e) => { println!("  HMDS recv error: {}", e); break; }
-            Ok(_) => {}
-        }
-
-        for frame in hmds.extract_frames() {
-            let data = match &frame {
-                Frame::FixComp(raw) => {
-                    let (unsigned, _) = hmds.unsign(raw);
-                    fixcomp::fixcomp_decompress(&unsigned)
-                }
-                Frame::Fix(raw) => vec![raw.clone()],
-                _ => continue,
-            };
-
-            for msg in data {
-                let tags = fix::fix_parse(&msg);
-                if let Some(xml_resp) = tags.get(&historical::TAG_HISTORICAL_XML) {
-                    if let Some(resp) = historical::parse_bar_response(xml_resp) {
-                        all_bars.extend(resp.bars);
-                        if resp.is_complete { complete = true; }
-                    }
-                }
+        let results = shared.drain_historical_data();
+        for (req_id, resp) in results {
+            if req_id == 1100 {
+                all_bars.extend(resp.bars);
+                if resp.is_complete { complete = true; }
             }
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
-    let mut bg_conns = shutdown_and_reclaim(&bg_tx, bg_join, account_id);
-    bg_conns.hmds = Some(hmds);
+    // Step 4: Verify specific values
+    let conns = shutdown_and_reclaim(&control_tx, join, account_id);
 
     println!("  Total bars received: {}", all_bars.len());
     if all_bars.is_empty() {
         println!("  SKIP: No historical bars received (HMDS may be unavailable)\n");
-        return bg_conns;
+        return conns;
     }
 
     let first = &all_bars[0];
-    assert!(first.open > 0.0, "Open price should be positive");
-    assert!(first.high >= first.low, "High should be >= Low");
-    assert!(first.volume > 0, "Volume should be positive");
+    assert!(first.open > 0.0, "Open price should be positive: {}", first.open);
+    assert!(first.high >= first.low, "High ({}) should be >= Low ({})", first.high, first.low);
+    assert!(first.volume > 0, "Volume should be positive: {}", first.volume);
+    for bar in &all_bars {
+        assert!(bar.high >= bar.low, "Bar {}: high ({}) < low ({})", bar.time, bar.high, bar.low);
+    }
     println!("  First bar: O={:.2} H={:.2} L={:.2} C={:.2} V={}",
         first.open, first.high, first.low, first.close, first.volume);
     println!("  PASS ({} bars)\n", all_bars.len());
-    bg_conns
+    conns
 }
 
 pub(super) fn phase_historical_daily_bars(mut conns: Conns, gw: &Gateway, config: &GatewayConfig) -> Conns {
     println!("--- Phase 76: Historical Daily Bars (SPY, 5 days of 1-day bars) ---");
 
     ccp_keepalive(&mut conns.ccp);
-    let mut hmds = match connect_farm(&config.host, "ushmds", &config.username, config.paper, &gw.server_session_id, &gw.session_token, &gw.hw_info, &gw.encoded) {
+    let hmds = match connect_farm(&config.host, "ushmds", &config.username, config.paper, &gw.server_session_id, &gw.session_token, &gw.hw_info, &gw.encoded) {
         Ok(c) => { println!("  HMDS reconnected"); c }
         Err(e) => { println!("  SKIP: ushmds reconnect failed: {}\n", e); return Conns { farm: conns.farm, ccp: conns.ccp, hmds: None, account_id: conns.account_id }; }
     };
 
+    // Step 1: Create HotLoop with HMDS connection
     let account_id = conns.account_id;
     let shared = Arc::new(SharedState::new());
-    let (bg_loop, bg_tx) = HotLoop::with_connections(shared, None, account_id.clone(), conns.farm, conns.ccp, None, None);
-    bg_tx.send(ControlCommand::Subscribe { con_id: 756733, symbol: "SPY".into() }).unwrap();
-    let bg_join = run_hot_loop(bg_loop);
+    let (hot_loop, control_tx) = HotLoop::with_connections(
+        shared.clone(), None, account_id.clone(), conns.farm, conns.ccp, Some(hmds), None,
+    );
 
-    let req = HistoricalRequest {
-        query_id: "daily1".to_string(), con_id: 756733, symbol: "SPY".to_string(),
-        sec_type: "CS", exchange: "SMART", data_type: BarDataType::Trades,
-        end_time: now_ib_timestamp(), duration: "5 d".to_string(), bar_size: BarSize::Day1, use_rth: true,
-    };
-    let xml = historical::build_query_xml(&req);
-    hmds.send_fixcomp(&[(fix::TAG_MSG_TYPE, "W"), (historical::TAG_HISTORICAL_XML, &xml)]).expect("Failed to send daily bar request");
+    // Step 2: Send FetchHistorical via ControlCommand
+    control_tx.send(ControlCommand::FetchHistorical {
+        req_id: 7600,
+        con_id: 756733,
+        symbol: "SPY".into(),
+        end_date_time: now_ib_timestamp(),
+        duration: "5 D".into(),
+        bar_size: "1 day".into(),
+        what_to_show: "TRADES".into(),
+        use_rth: true,
+    }).unwrap();
+    let join = run_hot_loop(hot_loop);
 
+    // Step 3: Wait for results in SharedState
     let mut all_bars = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut complete = false;
 
     while Instant::now() < deadline && !complete {
-        match hmds.try_recv() {
-            Ok(0) => { std::thread::sleep(Duration::from_millis(50)); continue; }
-            Err(e) => { println!("  HMDS recv error: {}", e); break; }
-            Ok(_) => {}
-        }
-        for frame in hmds.extract_frames() {
-            let data = match &frame {
-                Frame::FixComp(raw) => { let (u, _) = hmds.unsign(raw); fixcomp::fixcomp_decompress(&u) }
-                Frame::Fix(raw) => vec![raw.clone()],
-                _ => continue,
-            };
-            for msg in data {
-                let tags = fix::fix_parse(&msg);
-                if let Some(xml_resp) = tags.get(&historical::TAG_HISTORICAL_XML) {
-                    if let Some(resp) = historical::parse_bar_response(xml_resp) {
-                        all_bars.extend(resp.bars);
-                        if resp.is_complete { complete = true; }
-                    }
-                }
+        let results = shared.drain_historical_data();
+        for (req_id, resp) in results {
+            if req_id == 7600 {
+                all_bars.extend(resp.bars);
+                if resp.is_complete { complete = true; }
             }
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
-    let mut bg_conns = shutdown_and_reclaim(&bg_tx, bg_join, account_id);
-    bg_conns.hmds = Some(hmds);
+    // Step 4: Verify specific values
+    let conns = shutdown_and_reclaim(&control_tx, join, account_id);
 
     println!("  Total daily bars: {}", all_bars.len());
     if all_bars.is_empty() {
         println!("  SKIP: No daily bars received (HMDS may be unavailable)\n");
-        return bg_conns;
+        return conns;
     }
     assert!(all_bars.len() <= 5, "Should have at most 5 daily bars, got {}", all_bars.len());
     for bar in &all_bars {
-        assert!(bar.open > 0.0);
-        assert!(bar.high >= bar.low);
-        assert!(bar.volume > 0);
+        assert!(bar.open > 0.0, "Open should be positive: {}", bar.open);
+        assert!(bar.high >= bar.low, "High ({}) should be >= Low ({})", bar.high, bar.low);
+        assert!(bar.volume > 0, "Volume should be positive: {}", bar.volume);
         println!("  {} O={:.2} H={:.2} L={:.2} C={:.2} V={}", bar.time, bar.open, bar.high, bar.low, bar.close, bar.volume);
     }
     println!("  PASS ({} daily bars)\n", all_bars.len());
-    bg_conns
+    conns
 }
 
 pub(super) fn phase_cancel_historical(mut conns: Conns, gw: &Gateway, config: &GatewayConfig) -> Conns {
