@@ -1733,13 +1733,28 @@ impl EClient {
 
             // Drain market rules -> market_rule (already served from cache in req_market_rule)
 
-            // Account state -> updateAccountValue
+            // Account state -> updateAccountValue (all fields)
             if !self.account_id.get().map(|s| s.is_empty()).unwrap_or(true) {
                 let acct = shared.account();
-                let nlv = acct.net_liquidation as f64 / PRICE_SCALE_F;
-                if nlv > 0.0 {
-                    self.wrapper.call_method1(py, "update_account_value",
-                        ("NetLiquidation", format!("{:.2}", nlv).as_str(), "USD", self.account_id.get().map(|s| s.as_str()).unwrap_or("")))?;
+                let account_name = self.account_id.get().map(|s| s.as_str()).unwrap_or("");
+                let fields: &[(&str, i64)] = &[
+                    ("NetLiquidation", acct.net_liquidation),
+                    ("BuyingPower", acct.buying_power),
+                    ("MaintMarginReq", acct.margin_used),
+                    ("UnrealizedPnL", acct.unrealized_pnl),
+                    ("RealizedPnL", acct.realized_pnl),
+                    ("TotalCashValue", acct.total_cash_value),
+                    ("EquityWithLoanValue", acct.equity_with_loan),
+                    ("AvailableFunds", acct.available_funds),
+                    ("ExcessLiquidity", acct.excess_liquidity),
+                    ("DailyPnL", acct.daily_pnl),
+                ];
+                for &(key, val) in fields {
+                    if val != 0 {
+                        let fval = val as f64 / PRICE_SCALE_F;
+                        self.wrapper.call_method1(py, "update_account_value",
+                            (key, format!("{:.2}", fval).as_str(), "USD", account_name))?;
+                    }
                 }
             }
 
@@ -2291,13 +2306,23 @@ impl EClient {
             )?;
         }
 
-        // Account state -> update_account_value (NLV only if non-zero)
+        // Account state -> update_account_value (all fields)
         if !self.account_id.get().map(|s| s.is_empty()).unwrap_or(true) {
             let acct = shared.account();
-            let nlv = acct.net_liquidation as f64 / PRICE_SCALE_F;
-            if nlv > 0.0 {
-                self.wrapper.call_method1(py, "update_account_value",
-                    ("NetLiquidation", format!("{:.2}", nlv).as_str(), "USD", self.account_id.get().map(|s| s.as_str()).unwrap_or("")))?;
+            let account_name = self.account_id.get().map(|s| s.as_str()).unwrap_or("");
+            let fields: &[(&str, i64)] = &[
+                ("NetLiquidation", acct.net_liquidation),
+                ("BuyingPower", acct.buying_power),
+                ("MaintMarginReq", acct.margin_used),
+                ("UnrealizedPnL", acct.unrealized_pnl),
+                ("RealizedPnL", acct.realized_pnl),
+            ];
+            for &(key, val) in fields {
+                if val != 0 {
+                    let fval = val as f64 / PRICE_SCALE_F;
+                    self.wrapper.call_method1(py, "update_account_value",
+                        (key, format!("{:.2}", fval).as_str(), "USD", account_name))?;
+                }
             }
         }
 
