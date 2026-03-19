@@ -339,12 +339,20 @@ pub(super) fn phase_commission(conns: Conns) -> Conns {
         println!("  SKIP: No fill — market may not have liquidity\n");
         return conns;
     }
-    println!("  Buy: ${:.4} commission=${:.4}", buy_price as f64 / PRICE_SCALE as f64, buy_comm as f64 / PRICE_SCALE as f64);
-    println!("  Sell: ${:.4} commission=${:.4}", sell_price as f64 / PRICE_SCALE as f64, sell_comm as f64 / PRICE_SCALE as f64);
-    if buy_comm == 0 {
-        println!("  PASS (commission=0 — paper account does not report tag 12)\n");
+    let bp = buy_price as f64 / PRICE_SCALE as f64;
+    let sp = sell_price as f64 / PRICE_SCALE as f64;
+    let bc = buy_comm as f64 / PRICE_SCALE as f64;
+    let sc = sell_comm as f64 / PRICE_SCALE as f64;
+    println!("  Buy:  ${:.2} commission=${:.4}", bp, bc);
+    println!("  Sell: ${:.2} commission=${:.4}", sp, sc);
+    assert!(buy_price > 0, "Buy fill price should be positive");
+    assert!(sell_price > 0, "Sell fill price should be positive");
+    assert!((bp - sp).abs() / bp < 0.05, "Buy/sell prices should be within 5%: buy={} sell={}", bp, sp);
+    if buy_comm > 0 {
+        assert!(bc < 10.0, "Commission unreasonably high: ${:.4}", bc);
+        println!("  PASS (commission=${:.4})\n", bc);
     } else {
-        println!("  PASS (commission=${:.4})\n", buy_comm as f64 / PRICE_SCALE as f64);
+        println!("  PASS (commission=0 — paper account does not report tag 12)\n");
     }
     conns
 }

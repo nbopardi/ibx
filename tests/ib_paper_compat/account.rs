@@ -139,7 +139,7 @@ pub(super) fn phase_position_tracking(conns: Conns) -> Conns {
     let shared = Arc::new(SharedState::new());
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
     let (hot_loop, control_tx) = HotLoop::with_connections(
-        shared, Some(event_tx), account_id.clone(), conns.farm, conns.ccp, conns.hmds, None,
+        shared.clone(), Some(event_tx), account_id.clone(), conns.farm, conns.ccp, conns.hmds, None,
     );
 
     control_tx.send(ControlCommand::Subscribe { con_id: 756733, symbol: "SPY".into() }).unwrap();
@@ -195,10 +195,16 @@ pub(super) fn phase_position_tracking(conns: Conns) -> Conns {
 
     if phase < 1 {
         println!("  SKIP: No ticks received — market closed\n");
-    } else if got_position_update {
-        println!("  PASS\n");
+    } else if phase == 2 && got_position_update {
+        // After buy+sell round trip, position should return to 0 (or near it)
+        let pos = shared.position(0);
+        println!("  Final position: {}", pos);
+        assert!(pos.abs() <= 1, "Position after round trip should be 0 (±1 for timing), got {}", pos);
+        println!("  PASS (position returned to {})\n", pos);
+    } else if phase == 2 {
+        println!("  SKIP: Fills completed but no PositionUpdate events\n");
     } else {
-        println!("  SKIP: No PositionUpdate events received (fills completed but no position update)\n");
+        println!("  SKIP: Only reached phase {} (buy may not have filled)\n", phase);
     }
     conns
 }

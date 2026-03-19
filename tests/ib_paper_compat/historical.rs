@@ -469,17 +469,37 @@ pub(super) fn phase_historical_ticks(mut conns: Conns, gw: &Gateway, config: &Ga
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut tick_count = 0usize;
 
+    let mut last_ts = String::new();
+    let mut monotonic_violations = 0u32;
+
     while Instant::now() < deadline {
         let ticks = shared.drain_historical_ticks();
         for (req_id, data, what, done) in &ticks {
             if *req_id == 2001 {
-                let count = match data {
-                    HistoricalTickData::Last(v) => v.len(),
-                    HistoricalTickData::Midpoint(v) => v.len(),
-                    HistoricalTickData::BidAsk(v) => v.len(),
-                };
-                tick_count += count;
-                println!("  Received {} ticks (what={}, done={})", count, what, done);
+                match data {
+                    HistoricalTickData::Last(v) => {
+                        for tick in v {
+                            tick_count += 1;
+                            assert!(tick.price > 0.0, "Tick price should be positive: {}", tick.price);
+                            if !tick.time.is_empty() && tick.time < last_ts { monotonic_violations += 1; }
+                            if !tick.time.is_empty() { last_ts = tick.time.clone(); }
+                        }
+                    }
+                    HistoricalTickData::Midpoint(v) => {
+                        for tick in v {
+                            tick_count += 1;
+                            assert!(tick.price > 0.0, "Midpoint price should be positive: {}", tick.price);
+                        }
+                    }
+                    HistoricalTickData::BidAsk(v) => {
+                        for tick in v {
+                            tick_count += 1;
+                            assert!(tick.bid_price > 0.0, "Bid should be positive: {}", tick.bid_price);
+                            assert!(tick.ask_price >= tick.bid_price, "Ask ({}) should be >= Bid ({})", tick.ask_price, tick.bid_price);
+                        }
+                    }
+                }
+                println!("  Received ticks (what={}, done={}, total={})", what, done, tick_count);
                 if *done { break; }
             }
         }
@@ -492,7 +512,8 @@ pub(super) fn phase_historical_ticks(mut conns: Conns, gw: &Gateway, config: &Ga
     if tick_count == 0 {
         println!("  SKIP: No historical ticks received\n");
     } else {
-        println!("  PASS ({} ticks)\n", tick_count);
+        assert_eq!(monotonic_violations, 0, "Timestamps should be monotonically increasing");
+        println!("  PASS ({} ticks, timestamps monotonic)\n", tick_count);
     }
     conns
 }
@@ -721,9 +742,17 @@ pub(super) fn phase_news_article(mut conns: Conns, gw: &Gateway, config: &Gatewa
 
         while Instant::now() < deadline {
             let articles = shared.drain_news_articles();
-            for (req_id, _art_type, body) in &articles {
+            for (req_id, art_type, body) in &articles {
                 if *req_id == 6002 {
-                    println!("  Article body: {} bytes", body.len());
+                    println!("  Article: type={} len={}", art_type, body.len());
+                    assert!(!body.is_empty(), "Article body should not be empty");
+                    assert!(body.len() > 50, "Article body too short: {} bytes", body.len());
+                    // Type 0 = HTML, should contain tags
+                    if *art_type == 0 {
+                        assert!(body.contains('<') && body.contains('>'),
+                            "HTML article should contain tags: {}", &body[..body.len().min(100)]);
+                    }
+                    println!("  Preview: {}", &body[..body.len().min(120)]);
                     got_article = true;
                 }
             }

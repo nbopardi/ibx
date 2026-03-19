@@ -29,11 +29,16 @@ pub(super) fn phase_market_data(conns: Conns) -> Conns {
                 tick_count += 1;
                 if !first_tick {
                     let q = shared.quote(instrument);
-                    println!("  FIRST TICK: instrument={} bid={:.4} ask={:.4} last={:.4}",
-                        instrument,
-                        q.bid as f64 / PRICE_SCALE as f64,
-                        q.ask as f64 / PRICE_SCALE as f64,
-                        q.last as f64 / PRICE_SCALE as f64);
+                    let bid = q.bid as f64 / PRICE_SCALE as f64;
+                    let ask = q.ask as f64 / PRICE_SCALE as f64;
+                    let last = q.last as f64 / PRICE_SCALE as f64;
+                    println!("  FIRST TICK: instrument={} bid={:.2} ask={:.2} last={:.2}", instrument, bid, ask, last);
+                    // Value assertions
+                    if q.bid > 0 && q.ask > 0 {
+                        assert!(bid > 50.0 && bid < 1000.0, "AAPL bid out of range: {}", bid);
+                        assert!(ask > 50.0 && ask < 1000.0, "AAPL ask out of range: {}", ask);
+                        assert!(ask >= bid, "Crossed market: bid={} ask={}", bid, ask);
+                    }
                     first_tick = true;
                 }
             }
@@ -66,7 +71,7 @@ pub(super) fn phase_multi_instrument(conns: Conns) -> Conns {
     let shared = Arc::new(SharedState::new());
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
     let (hot_loop, control_tx) = HotLoop::with_connections(
-        shared, Some(event_tx), account_id.clone(), conns.farm, conns.ccp, conns.hmds, None,
+        shared.clone(), Some(event_tx), account_id.clone(), conns.farm, conns.ccp, conns.hmds, None,
     );
 
     control_tx.send(ControlCommand::Subscribe { con_id: 265598, symbol: "AAPL".into() }).unwrap();
@@ -100,11 +105,24 @@ pub(super) fn phase_multi_instrument(conns: Conns) -> Conns {
         tick_count += 1;
     }
 
+    // Check each instrument received distinct prices
+    let mut instruments_with_data = 0u32;
+    for id in 0..3u32 {
+        let q = shared.quote(id);
+        if q.bid > 0 || q.ask > 0 || q.last > 0 {
+            instruments_with_data += 1;
+            let bid = q.bid as f64 / PRICE_SCALE as f64;
+            let ask = q.ask as f64 / PRICE_SCALE as f64;
+            println!("  Instrument {}: bid={:.2} ask={:.2}", id, bid, ask);
+        }
+    }
+
     let conns = shutdown_and_reclaim(&control_tx, join, account_id);
     if tick_count <= 3 {
         println!("  SKIP: Only {} ticks — insufficient for multi-instrument test\n", tick_count);
     } else {
-        println!("  PASS ({} ticks)\n", tick_count);
+        assert!(instruments_with_data >= 2, "At least 2 of 3 instruments should have data, got {}", instruments_with_data);
+        println!("  PASS ({} ticks, {} instruments with data)\n", tick_count, instruments_with_data);
     }
     conns
 }
