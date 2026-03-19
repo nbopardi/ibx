@@ -123,44 +123,71 @@ fn order_lifecycle_place_then_cancel() {
 }
 
 /// Place order → rejection → error callback → no position change.
+/// End-to-end: FIX 35=8 reject → engine → SharedState → EClient → callbacks.
 #[test]
 fn order_lifecycle_rejection() {
-    let (client, _rx, shared) = test_client();
+    use ibx::protocol::fix::fix_build;
 
-    shared.push_order_update(OrderUpdate {
-        order_id: 60, instrument: 0, status: OrderStatus::Rejected,
-        filled_qty: 0, remaining_qty: 100, timestamp_ns: 0,
-    });
+    let shared = Arc::new(SharedState::new());
+    let mut engine = HotLoop::new(shared.clone(), None, None);
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let handle = std::thread::spawn(|| {});
+    let client = EClient::from_parts(shared.clone(), tx, handle, "DU123".into());
+
+    engine.context_mut().register_instrument(265598);
+    engine.context_mut().insert_order(ibx::types::Order::new(60, 0, Side::Buy, 100, 150 * PRICE_SCALE, b'2', b'0', 0));
+
+    // Inject rejection (35=8, 39=8)
+    engine.inject_ccp_message(&fix_build(&[
+        (35, "8"), (11, "60"), (39, "8"), (150, "8"),
+        (31, "0"), (32, "0"), (151, "100"),
+        (58, "Order rejected"), (103, "0"),
+    ], 1));
+
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     assert!(w.events.iter().any(|e| e.starts_with("order_status:60:Inactive")));
-    assert_eq!(shared.position(0), 0);
+    assert_eq!(engine.context_mut().position(0), 0);
 }
 
 /// Place order → partial fill → cancel → verify position reflects only the partial fill.
+/// End-to-end: FIX exec reports → engine → SharedState → EClient → callbacks.
 #[test]
 fn order_lifecycle_partial_fill_then_cancel() {
-    let (client, _rx, shared) = test_client();
+    use ibx::protocol::fix::fix_build;
+
+    let shared = Arc::new(SharedState::new());
+    let mut engine = HotLoop::new(shared.clone(), None, None);
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let handle = std::thread::spawn(|| {});
+    let client = EClient::from_parts(shared.clone(), tx, handle, "DU123".into());
     client.map_req_instrument(1, 0);
 
-    // Partial fill: 30 of 100
-    shared.push_fill(Fill {
-        instrument: 0, order_id: 70, side: Side::Buy,
-        price: 150 * PRICE_SCALE, qty: 30, remaining: 70,
-        commission: 0, timestamp_ns: 1000,
-    });
+    engine.context_mut().register_instrument(265598);
+    engine.context_mut().insert_order(ibx::types::Order::new(70, 0, Side::Buy, 100, 150 * PRICE_SCALE, b'2', b'0', 0));
+
+    // Partial fill: 30 of 100 (35=8, 39=1, 150=F)
+    engine.inject_ccp_message(&fix_build(&[
+        (35, "8"), (11, "70"), (17, "E1"), (39, "1"), (150, "F"),
+        (31, "150.0"), (32, "30"), (151, "70"),
+    ], 1));
+
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     assert!(w.events.iter().any(|e| e.starts_with("order_status:70:PartiallyFilled")));
+    assert_eq!(engine.context_mut().position(0), 30);
 
-    // Cancel remaining
-    shared.push_order_update(OrderUpdate {
-        order_id: 70, instrument: 0, status: OrderStatus::Cancelled,
-        filled_qty: 30, remaining_qty: 70, timestamp_ns: 2000,
-    });
+    // Cancel remaining (35=8, 39=4)
+    engine.inject_ccp_message(&fix_build(&[
+        (35, "8"), (11, "70"), (39, "4"), (150, "4"),
+        (31, "0"), (32, "0"), (151, "70"),
+    ], 2));
+
     w.events.clear();
     client.process_msgs(&mut w);
     assert!(w.events.iter().any(|e| e.starts_with("order_status:70:Cancelled")));
+    // Position remains at 30 (only the partial fill counts)
+    assert_eq!(engine.context_mut().position(0), 30);
 }
 
 /// Place order → modify → fill at new price.
@@ -284,29 +311,43 @@ fn order_lifecycle_algo_vwap_partial_fills() {
     assert_eq!(exec_count, 4);
 }
 
-/// Cancel reject: attempt to cancel already-filled order.
+/// Cancel reject: attempt to cancel a submitted order that the server refuses.
+/// End-to-end: FIX 35=8 ack + 35=9 cancel reject → engine → SharedState → EClient.
 #[test]
 fn order_lifecycle_cancel_reject_on_filled_order() {
-    let (client, _rx, shared) = test_client();
+    use ibx::protocol::fix::fix_build;
+
+    let shared = Arc::new(SharedState::new());
+    let mut engine = HotLoop::new(shared.clone(), None, None);
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let handle = std::thread::spawn(|| {});
+    let client = EClient::from_parts(shared.clone(), tx, handle, "DU123".into());
     client.map_req_instrument(1, 0);
 
-    // Order fills completely
-    shared.push_fill(Fill {
-        instrument: 0, order_id: 120, side: Side::Buy,
-        price: 150 * PRICE_SCALE, qty: 100, remaining: 0,
-        commission: 0, timestamp_ns: 1000,
-    });
+    engine.context_mut().register_instrument(265598);
+    engine.context_mut().insert_order(ibx::types::Order::new(120, 0, Side::Buy, 100, 150 * PRICE_SCALE, b'2', b'0', 0));
+
+    // Order submitted ack (35=8, 39=0) — order is live
+    engine.inject_ccp_message(&fix_build(&[
+        (35, "8"), (11, "120"), (39, "0"), (150, "0"),
+        (31, "0"), (32, "0"), (151, "100"),
+    ], 1));
+
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
-    assert!(w.events.iter().any(|e| e.starts_with("order_status:120:Filled")));
+    assert!(w.events.iter().any(|e| e.starts_with("order_status:120:Submitted")));
 
-    // Attempt to cancel → reject
-    shared.push_cancel_reject(CancelReject {
-        order_id: 120, instrument: 0, reject_type: 1, reason_code: 0, timestamp_ns: 2000,
-    });
+    // Cancel reject — server refuses the cancel (35=9)
+    engine.inject_ccp_message(&fix_build(&[
+        (35, "9"), (41, "120"), (434, "1"), (102, "3"),
+        (58, "Order in pending state"),
+    ], 2));
+
     w.events.clear();
     client.process_msgs(&mut w);
     assert!(w.events.iter().any(|e| e.starts_with("error:120:202:")));
+    // Order should still be active (cancel was rejected)
+    assert!(engine.context_mut().order(120).is_some());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
