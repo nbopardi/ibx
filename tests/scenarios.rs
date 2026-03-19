@@ -355,19 +355,27 @@ fn order_lifecycle_cancel_reject_on_filled_order() {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Subscribe → receive ticks → unsubscribe → verify no more ticks.
+/// End-to-end: engine quote → notify_tick → SharedState → EClient → callbacks.
 #[test]
 fn market_data_subscribe_ticks_unsubscribe() {
-    let (client, _rx, shared) = test_client();
+    let shared = Arc::new(SharedState::new());
+    let mut engine = HotLoop::new(shared.clone(), None, None);
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let handle = std::thread::spawn(|| {});
+    let client = EClient::from_parts(shared.clone(), tx, handle, "DU123".into());
     shared.set_instrument_count(1);
 
-    // Subscribe
+    // Subscribe via EClient (maps req_id 1 → instrument 0)
     client.req_mkt_data(1, &spy(), "", false, false);
 
-    // Simulate quote arriving
-    let mut q = Quote::default();
-    q.bid = 450 * PRICE_SCALE;
-    q.ask = 451 * PRICE_SCALE;
-    shared.push_quote(0, &q);
+    // Register instrument on engine and inject tick through the engine
+    engine.context_mut().register_instrument(756733);
+    {
+        let q = engine.context_mut().quote_mut(0);
+        q.bid = 450 * PRICE_SCALE;
+        q.ask = 451 * PRICE_SCALE;
+    }
+    engine.inject_tick(0);
 
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
@@ -376,9 +384,12 @@ fn market_data_subscribe_ticks_unsubscribe() {
     // Unsubscribe
     client.cancel_mkt_data(1);
 
-    // Push new quote — should NOT be dispatched
-    q.bid = 449 * PRICE_SCALE;
-    shared.push_quote(0, &q);
+    // Inject another tick through engine — should NOT be dispatched
+    {
+        let q = engine.context_mut().quote_mut(0);
+        q.bid = 449 * PRICE_SCALE;
+    }
+    engine.inject_tick(0);
     w.events.clear();
     client.process_msgs(&mut w);
     let bid_ticks: Vec<_> = w.events.iter().filter(|e| e.starts_with("tick_price:1:")).collect();
@@ -386,32 +397,37 @@ fn market_data_subscribe_ticks_unsubscribe() {
 }
 
 /// Subscribe multiple instruments → verify independent tick streams.
+/// End-to-end: engine quote_mut → inject_tick → SharedState → EClient → callbacks.
 #[test]
 fn market_data_multi_instrument_independent() {
-    let (client, _rx, shared) = test_client();
+    let shared = Arc::new(SharedState::new());
+    let mut engine = HotLoop::new(shared.clone(), None, None);
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let handle = std::thread::spawn(|| {});
+    let client = EClient::from_parts(shared.clone(), tx, handle, "DU123".into());
     shared.set_instrument_count(2);
 
-    // Manually map since we bypass the real engine
+    // Register two instruments on engine
+    engine.context_mut().register_instrument(756733);  // 0: SPY
+    engine.context_mut().register_instrument(265598);  // 1: AAPL
     client.map_req_instrument(1, 0);
     client.map_req_instrument(2, 1);
 
-    // Quote for instrument 0
-    let mut q0 = Quote::default();
-    q0.bid = 450 * PRICE_SCALE;
-    shared.push_quote(0, &q0);
-    // Quote for instrument 1
-    let mut q1 = Quote::default();
-    q1.bid = 150 * PRICE_SCALE;
-    shared.push_quote(1, &q1);
+    // Inject tick for instrument 0 through engine
+    engine.context_mut().quote_mut(0).bid = 450 * PRICE_SCALE;
+    engine.inject_tick(0);
+    // Inject tick for instrument 1 through engine
+    engine.context_mut().quote_mut(1).bid = 150 * PRICE_SCALE;
+    engine.inject_tick(1);
 
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     assert!(w.events.iter().any(|e| e.starts_with("tick_price:1:1:450")));
     assert!(w.events.iter().any(|e| e.starts_with("tick_price:2:1:150")));
 
-    // Update only instrument 1
-    q1.bid = 149 * PRICE_SCALE;
-    shared.push_quote(1, &q1);
+    // Update only instrument 1 through engine
+    engine.context_mut().quote_mut(1).bid = 149 * PRICE_SCALE;
+    engine.inject_tick(1);
     w.events.clear();
     client.process_msgs(&mut w);
 
@@ -423,23 +439,30 @@ fn market_data_multi_instrument_independent() {
 }
 
 /// Tick-by-tick: subscribe → trades + quotes → verify both dispatched.
+/// End-to-end: engine inject_tbt → SharedState → EClient → callbacks.
 #[test]
 fn market_data_tbt_trades_and_quotes() {
-    let (client, _rx, shared) = test_client();
+    let shared = Arc::new(SharedState::new());
+    let mut engine = HotLoop::new(shared.clone(), None, None);
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let handle = std::thread::spawn(|| {});
+    let client = EClient::from_parts(shared.clone(), tx, handle, "DU123".into());
     client.map_req_instrument(10, 0);
 
-    // TBT trade
-    shared.push_tbt_trade(TbtTrade {
+    engine.context_mut().register_instrument(265598);
+
+    // TBT trade through engine
+    engine.inject_tbt_trade(&TbtTrade {
         instrument: 0, price: 150 * PRICE_SCALE, size: 100,
         timestamp: 1700000001, exchange: "ARCA".into(), conditions: "".into(),
     });
-    // TBT quote
-    shared.push_tbt_quote(TbtQuote {
+    // TBT quote through engine
+    engine.inject_tbt_quote(&TbtQuote {
         instrument: 0, bid: 149 * PRICE_SCALE, ask: 151 * PRICE_SCALE,
         bid_size: 500, ask_size: 300, timestamp: 1700000002,
     });
-    // Second trade
-    shared.push_tbt_trade(TbtTrade {
+    // Second trade through engine
+    engine.inject_tbt_trade(&TbtTrade {
         instrument: 0, price: 151 * PRICE_SCALE, size: 200,
         timestamp: 1700000003, exchange: "NYSE".into(), conditions: "".into(),
     });
