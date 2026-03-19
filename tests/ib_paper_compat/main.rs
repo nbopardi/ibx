@@ -133,10 +133,10 @@ fn compat_suite() {
     conns = account::phase_pnl_subscription(conns);
     conns = account::phase_news_bulletins(conns);
 
-    contracts::phase_contract_details(&mut conns);
-    contracts::phase_contract_details_by_symbol(&mut conns);
+    conns = contracts::phase_contract_details(conns);
+    conns = contracts::phase_contract_details_by_symbol(conns);
     contracts::phase_trading_hours(&mut conns);
-    contracts::phase_matching_symbols(&mut conns);
+    conns = contracts::phase_matching_symbols(conns);
     conns = historical::phase_historical_data(conns, &gw, &config);
     conns = historical::phase_historical_daily_bars(conns, &gw, &config);
     conns = historical::phase_cancel_historical(conns, &gw, &config);
@@ -144,7 +144,7 @@ fn compat_suite() {
     conns = historical::phase_scanner_subscription(conns, &gw, &config);
     conns = historical::phase_historical_news(conns, &gw, &config);
     historical::phase_fundamental_data(&gw, &config);
-    contracts::phase_market_rule_id(&mut conns);
+    conns = contracts::phase_market_rule_id(conns);
 
     if needs_ticks {
         conns = market_data::phase_market_data(conns);
