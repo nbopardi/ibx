@@ -610,19 +610,32 @@ fn account_req_positions_reflects_fills() {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Request bars → multi-message response → historical_data_end fires.
+/// End-to-end: ControlCommand → engine pending → HMDS 35=W XML → SharedState → EClient.
 #[test]
 fn historical_data_multi_bar_complete() {
-    let (client, _rx, shared) = test_client();
+    let shared = Arc::new(SharedState::new());
+    let mut engine = HotLoop::new(shared.clone(), None, None);
+    let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded(16);
+    engine.set_control_rx(ctrl_rx);
+    let (client_tx, _client_rx) = crossbeam_channel::unbounded();
+    let handle = std::thread::spawn(|| {});
+    let client = EClient::from_parts(shared.clone(), client_tx, handle, "DU123".into());
 
-    // First batch (incomplete)
-    shared.push_historical_data(5, HistoricalResponse {
-        query_id: String::new(), timezone: String::new(),
-        bars: vec![
-            HistoricalBar { time: "20260101".into(), open: 100.0, high: 105.0, low: 99.0, close: 103.0, volume: 1000, wap: 102.0, count: 50 },
-            HistoricalBar { time: "20260102".into(), open: 103.0, high: 108.0, low: 102.0, close: 107.0, volume: 1200, wap: 105.0, count: 60 },
-        ],
-        is_complete: false,
-    });
+    // Register pending historical request via ControlCommand
+    ctrl_tx.send(ControlCommand::FetchHistorical {
+        req_id: 5, con_id: 756733, symbol: "SPY".into(),
+        end_date_time: "20260103 16:00:00".into(), duration: "3 D".into(),
+        bar_size: "1 day".into(), what_to_show: "TRADES".into(), use_rth: true,
+    }).unwrap();
+    engine.poll_once();
+
+    // First batch (incomplete) — inject HMDS response with matching query_id
+    let xml1 = "<ResultSetBar><id>hist_1000</id><eoq>false</eoq><tz>US/Eastern</tz>\
+        <Events><Open><time>20260101</time></Open>\
+        <Bar><time>20260101</time><open>100</open><close>103</close><high>105</high><low>99</low><weightedAvg>102</weightedAvg><volume>1000</volume><count>50</count></Bar>\
+        <Bar><time>20260102</time><open>103</open><close>107</close><high>108</high><low>102</low><weightedAvg>105</weightedAvg><volume>1200</volume><count>60</count></Bar>\
+        <Close><time>20260103</time></Close></Events></ResultSetBar>";
+    engine.inject_hmds_message(format!("35=W\x016118={}\x01", xml1).as_bytes());
 
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
@@ -630,13 +643,11 @@ fn historical_data_multi_bar_complete() {
     assert!(!w.events.iter().any(|e| e == "historical_data_end:5"));
 
     // Second batch (complete)
-    shared.push_historical_data(5, HistoricalResponse {
-        query_id: String::new(), timezone: String::new(),
-        bars: vec![
-            HistoricalBar { time: "20260103".into(), open: 107.0, high: 110.0, low: 106.0, close: 109.0, volume: 800, wap: 108.0, count: 40 },
-        ],
-        is_complete: true,
-    });
+    let xml2 = "<ResultSetBar><id>hist_1000</id><eoq>true</eoq><tz>US/Eastern</tz>\
+        <Events><Open><time>20260103</time></Open>\
+        <Bar><time>20260103</time><open>107</open><close>109</close><high>110</high><low>106</low><weightedAvg>108</weightedAvg><volume>800</volume><count>40</count></Bar>\
+        <Close><time>20260103</time></Close></Events></ResultSetBar>";
+    engine.inject_hmds_message(format!("35=W\x016118={}\x01", xml2).as_bytes());
 
     w.events.clear();
     client.process_msgs(&mut w);

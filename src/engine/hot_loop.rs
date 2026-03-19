@@ -228,6 +228,11 @@ impl HotLoop {
         &mut self.context
     }
 
+    /// Process pending control commands once. For testing.
+    pub fn poll_once(&mut self) {
+        self.poll_control_commands();
+    }
+
     /// Build a HotLoop with connections and control channel, without requiring a Gateway.
     pub fn with_connections(
         shared: Arc<SharedState>,
@@ -6525,5 +6530,51 @@ mod tests {
         assert_eq!(parsed.get(&35).map(|s| s.as_str()), Some("W"));
         let xml = parsed.get(&6118).unwrap();
         assert!(xml.contains("265598"), "should contain conId");
+    }
+
+    #[test]
+    fn wire_historical_roundtrip_command_to_response() {
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        engine.set_control_rx(rx);
+
+        // Send FetchHistorical to register pending entry
+        tx.send(ControlCommand::FetchHistorical {
+            req_id: 42, con_id: 265598, symbol: "AAPL".into(),
+            end_date_time: "20260318 16:00:00".into(), duration: "1 D".into(),
+            bar_size: "5 mins".into(), what_to_show: "TRADES".into(), use_rth: true,
+        }).unwrap();
+        engine.poll_control_commands();
+
+        // Verify pending entry exists
+        assert_eq!(engine.pending_historical.len(), 1, "should have 1 pending historical");
+        let (qid, rid) = &engine.pending_historical[0];
+        assert_eq!(*rid, 42);
+        let query_id = qid.clone();
+
+        // Inject HMDS response with matching query_id
+        let xml = format!(
+            "<ResultSetBar><id>{}</id><eoq>true</eoq><tz>US/Eastern</tz>\
+             <Events><Open><time>20260318-09:30:00</time></Open>\
+             <Bar><time>20260318-09:30:00</time><open>150</open><close>151</close>\
+             <high>152</high><low>149</low><weightedAvg>150.5</weightedAvg>\
+             <volume>1000000</volume><count>5000</count></Bar>\
+             <Close><time>20260318-16:00:00</time></Close></Events></ResultSetBar>",
+            query_id
+        );
+        let msg = format!("35=W\x016118={}\x01", xml);
+        engine.inject_hmds_message(msg.as_bytes());
+
+        // Verify SharedState received the data
+        let hist = shared.drain_historical_data();
+        assert_eq!(hist.len(), 1, "should have 1 historical response");
+        assert_eq!(hist[0].0, 42);
+        assert_eq!(hist[0].1.bars.len(), 1);
+        assert_eq!(hist[0].1.bars[0].close, 151.0);
+        assert!(hist[0].1.is_complete);
+
+        // Pending should be cleared (complete response)
+        assert!(engine.pending_historical.is_empty());
     }
 }
