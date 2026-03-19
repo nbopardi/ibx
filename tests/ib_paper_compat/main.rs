@@ -143,7 +143,7 @@ fn compat_suite() {
     conns = historical::phase_head_timestamp(conns, &gw, &config);
     conns = historical::phase_scanner_subscription(conns, &gw, &config);
     conns = historical::phase_historical_news(conns, &gw, &config);
-    historical::phase_fundamental_data(&gw, &config);
+    conns = historical::phase_fundamental_data(conns, &gw, &config);
     conns = contracts::phase_market_rule_id(conns);
 
     if needs_ticks {

@@ -152,283 +152,199 @@ pub(super) fn phase_cancel_historical(mut conns: Conns, gw: &Gateway, config: &G
     println!("--- Phase 77: Cancel Historical Request (SPY) ---");
 
     ccp_keepalive(&mut conns.ccp);
-    let mut hmds = match connect_farm(&config.host, "ushmds", &config.username, config.paper, &gw.server_session_id, &gw.session_token, &gw.hw_info, &gw.encoded) {
+    let hmds = match connect_farm(&config.host, "ushmds", &config.username, config.paper, &gw.server_session_id, &gw.session_token, &gw.hw_info, &gw.encoded) {
         Ok(c) => { println!("  HMDS reconnected"); c }
         Err(e) => { println!("  SKIP: ushmds reconnect failed: {}\n", e); return Conns { farm: conns.farm, ccp: conns.ccp, hmds: None, account_id: conns.account_id }; }
     };
 
     let account_id = conns.account_id;
     let shared = Arc::new(SharedState::new());
-    let (bg_loop, bg_tx) = HotLoop::with_connections(shared, None, account_id.clone(), conns.farm, conns.ccp, None, None);
-    bg_tx.send(ControlCommand::Subscribe { con_id: 756733, symbol: "SPY".into() }).unwrap();
-    let bg_join = run_hot_loop(bg_loop);
+    let (hot_loop, control_tx) = HotLoop::with_connections(
+        shared.clone(), None, account_id.clone(), conns.farm, conns.ccp, Some(hmds), None,
+    );
 
-    let req = HistoricalRequest {
-        query_id: "cancel_test".to_string(), con_id: 756733, symbol: "SPY".to_string(),
-        sec_type: "CS", exchange: "SMART", data_type: BarDataType::Trades,
-        end_time: now_ib_timestamp(), duration: "1 d".to_string(), bar_size: BarSize::Sec1, use_rth: true,
-    };
-    let xml = historical::build_query_xml(&req);
-    hmds.send_fixcomp(&[(fix::TAG_MSG_TYPE, "W"), (historical::TAG_HISTORICAL_XML, &xml)]).expect("Failed to send historical request");
+    // Request 1-second bars (large dataset to have time to cancel)
+    control_tx.send(ControlCommand::FetchHistorical {
+        req_id: 7700, con_id: 756733, symbol: "SPY".into(),
+        end_date_time: now_ib_timestamp(), duration: "1 D".into(),
+        bar_size: "1 secs".into(), what_to_show: "TRADES".into(), use_rth: true,
+    }).unwrap();
+    let join = run_hot_loop(hot_loop);
 
+    // Wait for first chunk
     let mut got_first_chunk = false;
     let first_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < first_deadline && !got_first_chunk {
-        match hmds.try_recv() {
-            Ok(0) => { std::thread::sleep(Duration::from_millis(50)); continue; }
-            Err(e) => { println!("  HMDS recv error: {}", e); break; }
-            Ok(_) => {}
+        let results = shared.drain_historical_data();
+        for (req_id, _) in results {
+            if req_id == 7700 { got_first_chunk = true; println!("  First chunk received, sending cancel"); }
         }
-        for frame in hmds.extract_frames() {
-            let data = match &frame {
-                Frame::FixComp(raw) => { let (u, _) = hmds.unsign(raw); fixcomp::fixcomp_decompress(&u) }
-                Frame::Fix(raw) => vec![raw.clone()],
-                _ => continue,
-            };
-            for msg in data {
-                let tags = fix::fix_parse(&msg);
-                if let Some(xml_resp) = tags.get(&historical::TAG_HISTORICAL_XML) {
-                    if historical::parse_bar_response(xml_resp).is_some() {
-                        got_first_chunk = true;
-                        println!("  First chunk received, sending cancel");
-                    }
-                }
-            }
-        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
     if !got_first_chunk {
-        let mut bg_conns = shutdown_and_reclaim(&bg_tx, bg_join, account_id);
-        bg_conns.hmds = Some(hmds);
+        let conns = shutdown_and_reclaim(&control_tx, join, account_id);
         println!("  SKIP: No initial data received to cancel\n");
-        return bg_conns;
+        return conns;
     }
 
-    let cancel_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListOfCancelQueries><CancelQuery><id>cancel_test</id></CancelQuery></ListOfCancelQueries>".to_string();
-    hmds.send_fixcomp(&[(fix::TAG_MSG_TYPE, "Z"), (historical::TAG_HISTORICAL_XML, &cancel_xml)]).expect("Failed to send cancel request");
+    // Cancel via ControlCommand
+    control_tx.send(ControlCommand::CancelHistorical { req_id: 7700 }).unwrap();
     println!("  Cancel sent");
+    std::thread::sleep(Duration::from_secs(2));
 
-    let drain_deadline = Instant::now() + Duration::from_secs(5);
-    let mut bars_after_cancel = 0u32;
-    while Instant::now() < drain_deadline {
-        match hmds.try_recv() {
-            Ok(0) => { std::thread::sleep(Duration::from_millis(50)); continue; }
-            Err(e) => { println!("  HMDS recv error after cancel: {}", e); break; }
-            Ok(_) => {}
-        }
-        for frame in hmds.extract_frames() {
-            let data = match &frame {
-                Frame::FixComp(raw) => { let (u, _) = hmds.unsign(raw); fixcomp::fixcomp_decompress(&u) }
-                Frame::Fix(raw) => vec![raw.clone()],
-                _ => continue,
-            };
-            for msg in data {
-                let tags = fix::fix_parse(&msg);
-                if let Some(xml_resp) = tags.get(&historical::TAG_HISTORICAL_XML) {
-                    if let Some(resp) = historical::parse_bar_response(xml_resp) {
-                        bars_after_cancel += resp.bars.len() as u32;
-                    }
-                }
-            }
-        }
-    }
-
-    let mut bg_conns = shutdown_and_reclaim(&bg_tx, bg_join, account_id);
-    bg_conns.hmds = Some(hmds);
-    println!("  Bars received after cancel: {} (in-flight data is expected)", bars_after_cancel);
-    println!("  PASS (cancel sent successfully, connection intact)\n");
-    bg_conns
+    let conns = shutdown_and_reclaim(&control_tx, join, account_id);
+    println!("  PASS (cancel sent through hot_loop, connection intact)\n");
+    conns
 }
 
 pub(super) fn phase_head_timestamp(mut conns: Conns, gw: &Gateway, config: &GatewayConfig) -> Conns {
     println!("--- Phase 79: Head Timestamp (SPY, TRADES) ---");
 
     ccp_keepalive(&mut conns.ccp);
-    let mut hmds = match connect_farm(&config.host, "ushmds", &config.username, config.paper, &gw.server_session_id, &gw.session_token, &gw.hw_info, &gw.encoded) {
+    let hmds = match connect_farm(&config.host, "ushmds", &config.username, config.paper, &gw.server_session_id, &gw.session_token, &gw.hw_info, &gw.encoded) {
         Ok(c) => { println!("  HMDS reconnected"); c }
         Err(e) => { println!("  SKIP: ushmds reconnect failed: {}\n", e); return Conns { farm: conns.farm, ccp: conns.ccp, hmds: None, account_id: conns.account_id }; }
     };
 
     let account_id = conns.account_id;
     let shared = Arc::new(SharedState::new());
-    let (bg_loop, bg_tx) = HotLoop::with_connections(shared, None, account_id.clone(), conns.farm, conns.ccp, None, None);
-    bg_tx.send(ControlCommand::Subscribe { con_id: 756733, symbol: "SPY".into() }).unwrap();
-    let bg_join = run_hot_loop(bg_loop);
+    let (hot_loop, control_tx) = HotLoop::with_connections(
+        shared.clone(), None, account_id.clone(), conns.farm, conns.ccp, Some(hmds), None,
+    );
 
-    let req = HeadTimestampRequest { con_id: 756733, sec_type: "STK", exchange: "SMART", data_type: BarDataType::Trades, use_rth: true };
-    let xml = historical::build_head_timestamp_xml(&req);
-    hmds.send_fixcomp(&[(fix::TAG_MSG_TYPE, "W"), (historical::TAG_HISTORICAL_XML, &xml)]).expect("Failed to send head timestamp request");
+    control_tx.send(ControlCommand::FetchHeadTimestamp {
+        req_id: 7900, con_id: 756733,
+        what_to_show: "TRADES".into(), use_rth: true,
+    }).unwrap();
+    let join = run_hot_loop(hot_loop);
 
     let mut response: Option<historical::HeadTimestampResponse> = None;
     let deadline = Instant::now() + Duration::from_secs(15);
 
     while Instant::now() < deadline && response.is_none() {
-        match hmds.try_recv() {
-            Ok(0) => { std::thread::sleep(Duration::from_millis(50)); continue; }
-            Err(e) => { println!("  HMDS recv error: {}", e); break; }
-            Ok(_) => {}
+        let results = shared.drain_head_timestamps();
+        for (req_id, resp) in results {
+            if req_id == 7900 { response = Some(resp); }
         }
-        for frame in hmds.extract_frames() {
-            let data = match &frame {
-                Frame::FixComp(raw) => { let (u, _) = hmds.unsign(raw); fixcomp::fixcomp_decompress(&u) }
-                Frame::Fix(raw) => vec![raw.clone()],
-                _ => continue,
-            };
-            for msg in data {
-                let tags = fix::fix_parse(&msg);
-                if let Some(xml_resp) = tags.get(&historical::TAG_HISTORICAL_XML) {
-                    if let Some(resp) = historical::parse_head_timestamp_response(xml_resp) {
-                        println!("  headTS={} tz={}", resp.head_timestamp, resp.timezone);
-                        response = Some(resp);
-                    }
-                }
-            }
-        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
-    let mut bg_conns = shutdown_and_reclaim(&bg_tx, bg_join, account_id);
-    bg_conns.hmds = Some(hmds);
+    let conns = shutdown_and_reclaim(&control_tx, join, account_id);
 
     if response.is_none() {
         println!("  SKIP: No head timestamp received (HMDS may be unavailable)\n");
-        return bg_conns;
+        return conns;
     }
     let resp = response.unwrap();
-    assert!(!resp.head_timestamp.is_empty());
+    assert!(!resp.head_timestamp.is_empty(), "Head timestamp should not be empty");
     assert!(resp.head_timestamp.starts_with("199"), "SPY TRADES head timestamp should be in 1990s, got {}", resp.head_timestamp);
-    assert!(!resp.timezone.is_empty());
+    assert!(!resp.timezone.is_empty(), "Timezone should not be empty");
+    println!("  headTS={} tz={}", resp.head_timestamp, resp.timezone);
     println!("  PASS\n");
-    bg_conns
+    conns
 }
 
 pub(super) fn phase_scanner_subscription(mut conns: Conns, gw: &Gateway, config: &GatewayConfig) -> Conns {
     println!("--- Phase 82: Scanner Subscription (TOP_PERC_GAIN, STK.US.MAJOR) ---");
 
     ccp_keepalive(&mut conns.ccp);
-    let mut hmds = match connect_farm(&config.host, "ushmds", &config.username, config.paper, &gw.server_session_id, &gw.session_token, &gw.hw_info, &gw.encoded) {
+    let hmds = match connect_farm(&config.host, "ushmds", &config.username, config.paper, &gw.server_session_id, &gw.session_token, &gw.hw_info, &gw.encoded) {
         Ok(c) => { println!("  HMDS reconnected"); c }
         Err(e) => { println!("  SKIP: ushmds reconnect failed: {}\n", e); return Conns { farm: conns.farm, ccp: conns.ccp, hmds: None, account_id: conns.account_id }; }
     };
 
     let account_id = conns.account_id;
     let shared = Arc::new(SharedState::new());
-    let (bg_loop, bg_tx) = HotLoop::with_connections(shared, None, account_id.clone(), conns.farm, conns.ccp, None, None);
-    bg_tx.send(ControlCommand::Subscribe { con_id: 756733, symbol: "SPY".into() }).unwrap();
-    let bg_join = run_hot_loop(bg_loop);
+    let (hot_loop, control_tx) = HotLoop::with_connections(
+        shared.clone(), None, account_id.clone(), conns.farm, conns.ccp, Some(hmds), None,
+    );
 
-    let sub = scanner::ScannerSubscription {
-        instrument: "STK".to_string(), location_code: "STK.US.MAJOR".to_string(),
-        scan_code: "TOP_PERC_GAIN".to_string(), max_items: 10,
-    };
-    let xml = scanner::build_scanner_subscribe_xml(&sub, "APISCAN1:1");
-    hmds.send_fixcomp(&[(fix::TAG_MSG_TYPE, "U"), (scanner::TAG_SUB_PROTOCOL, "10003"), (scanner::TAG_SCANNER_XML, &xml)]).expect("Failed to send scanner subscription");
+    control_tx.send(ControlCommand::SubscribeScanner {
+        req_id: 8200,
+        instrument: "STK".into(),
+        location_code: "STK.US.MAJOR".into(),
+        scan_code: "TOP_PERC_GAIN".into(),
+        max_items: 10,
+    }).unwrap();
+    let join = run_hot_loop(hot_loop);
 
     let mut result: Option<scanner::ScannerResult> = None;
     let deadline = Instant::now() + Duration::from_secs(15);
 
     while Instant::now() < deadline && result.is_none() {
-        match hmds.try_recv() {
-            Ok(0) => { std::thread::sleep(Duration::from_millis(50)); continue; }
-            Err(e) => { println!("  HMDS recv error: {}", e); break; }
-            Ok(_) => {}
+        let results = shared.drain_scanner_data();
+        for (req_id, r) in results {
+            if req_id == 8200 { result = Some(r); }
         }
-        for frame in hmds.extract_frames() {
-            let data = match &frame {
-                Frame::FixComp(raw) => { let (u, _) = hmds.unsign(raw); fixcomp::fixcomp_decompress(&u) }
-                Frame::Fix(raw) => vec![raw.clone()],
-                _ => continue,
-            };
-            for msg in data {
-                let tags = fix::fix_parse(&msg);
-                if tags.get(&scanner::TAG_SUB_PROTOCOL).map(|s| s.as_str()) == Some("10005") {
-                    if let Some(xml_resp) = tags.get(&scanner::TAG_SCANNER_XML) {
-                        if let Some(r) = scanner::parse_scanner_response(xml_resp) {
-                            println!("  Scanner: {} contracts at {}", r.con_ids.len(), r.scan_time);
-                            result = Some(r);
-                        }
-                    }
-                }
-            }
-        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
-    let cancel_xml = scanner::build_scanner_cancel_xml("APISCAN1:1");
-    let _ = hmds.send_fixcomp(&[(fix::TAG_MSG_TYPE, "U"), (scanner::TAG_SUB_PROTOCOL, "10004"), (scanner::TAG_SCANNER_XML, &cancel_xml)]);
+    // Cancel scanner
+    control_tx.send(ControlCommand::CancelScanner { req_id: 8200 }).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
 
-    let mut bg_conns = shutdown_and_reclaim(&bg_tx, bg_join, account_id);
-    bg_conns.hmds = Some(hmds);
+    let conns = shutdown_and_reclaim(&control_tx, join, account_id);
 
     if result.is_none() {
         println!("  SKIP: No scanner results received\n");
-        return bg_conns;
+        return conns;
     }
     let r = result.unwrap();
-    assert!(!r.con_ids.is_empty());
-    assert!(!r.scan_time.is_empty());
+    assert!(!r.con_ids.is_empty(), "Scanner should return contracts");
+    assert!(!r.scan_time.is_empty(), "Scanner should have scan_time");
+    println!("  Scanner: {} contracts at {}", r.con_ids.len(), r.scan_time);
     for (i, cid) in r.con_ids.iter().enumerate().take(3) {
         println!("  Rank {}: conId={}", i, cid);
     }
     println!("  PASS ({} contracts)\n", r.con_ids.len());
-    bg_conns
+    conns
 }
 
-pub(super) fn phase_fundamental_data(gw: &Gateway, config: &GatewayConfig) {
+pub(super) fn phase_fundamental_data(mut conns: Conns, gw: &Gateway, config: &GatewayConfig) -> Conns {
     println!("--- Phase 83: Fundamental Data (AAPL, ReportSnapshot) ---");
 
-    let mut fundfarm = match connect_farm(&config.host, "fundfarm", &config.username, config.paper, &gw.server_session_id, &gw.session_token, &gw.hw_info, &gw.encoded) {
-        Ok(c) => { println!("  fundfarm connected"); c }
-        Err(e) => { println!("  SKIP: fundfarm connect failed: {}\n", e); return; }
+    ccp_keepalive(&mut conns.ccp);
+    let hmds = match connect_farm(&config.host, "ushmds", &config.username, config.paper, &gw.server_session_id, &gw.session_token, &gw.hw_info, &gw.encoded) {
+        Ok(c) => { println!("  HMDS reconnected"); c }
+        Err(e) => { println!("  SKIP: HMDS reconnect failed: {}\n", e); return Conns { farm: conns.farm, ccp: conns.ccp, hmds: None, account_id: conns.account_id }; }
     };
 
-    let req = fundamental::FundamentalRequest {
-        con_id: 265598, sec_type: "STK", currency: "USD",
-        report_type: fundamental::ReportType::Snapshot,
-    };
-    let xml = fundamental::build_fundamental_request_xml(&req);
-    fundfarm.send_fixcomp(&[(fix::TAG_MSG_TYPE, "U"), (fundamental::TAG_SUB_PROTOCOL, "10010"), (fundamental::TAG_FUNDAMENTAL_XML, &xml)]).expect("Failed to send fundamental data request");
+    let account_id = conns.account_id;
+    let shared = Arc::new(SharedState::new());
+    let (hot_loop, control_tx) = HotLoop::with_connections(
+        shared.clone(), None, account_id.clone(), conns.farm, conns.ccp, Some(hmds), None,
+    );
 
-    let mut got_response = false;
+    control_tx.send(ControlCommand::FetchFundamentalData {
+        req_id: 8300, con_id: 265598,
+        report_type: "ReportSnapshot".into(),
+    }).unwrap();
+    let join = run_hot_loop(hot_loop);
+
+    let mut got_data = false;
     let deadline = Instant::now() + Duration::from_secs(15);
 
-    while Instant::now() < deadline && !got_response {
-        match fundfarm.try_recv() {
-            Ok(0) => { std::thread::sleep(Duration::from_millis(50)); continue; }
-            Err(e) => { println!("  fundfarm recv error: {}", e); break; }
-            Ok(_) => {}
-        }
-        for frame in fundfarm.extract_frames() {
-            let data = match &frame {
-                Frame::FixComp(raw) => { let (u, _) = fundfarm.unsign(raw); fixcomp::fixcomp_decompress(&u) }
-                Frame::Fix(raw) => vec![raw.clone()],
-                _ => continue,
-            };
-            for msg in data {
-                let tags = fix::fix_parse(&msg);
-                if tags.get(&fundamental::TAG_SUB_PROTOCOL).map(|s| s.as_str()) == Some("10012") {
-                    if let Some(xml_resp) = tags.get(&fundamental::TAG_FUNDAMENTAL_XML) {
-                        if let Some(id) = fundamental::parse_fundamental_response_id(xml_resp) {
-                            println!("  Response ID: {}", id);
-                        }
-                    }
-                    if let Some(raw_data) = tags.get(&fundamental::TAG_RAW_DATA) {
-                        println!("  Raw data: {} bytes", raw_data.len());
-                        if let Some(xml_out) = fundamental::decompress_fundamental_data(raw_data.as_bytes()) {
-                            println!("  Decompressed: {} chars", xml_out.len());
-                        } else {
-                            println!("  Note: binary payload detected");
-                        }
-                    }
-                    got_response = true;
-                }
+    while Instant::now() < deadline && !got_data {
+        let results = shared.drain_fundamental_data();
+        for (req_id, data) in results {
+            if req_id == 8300 {
+                println!("  Fundamental data: {} chars", data.len());
+                assert!(!data.is_empty(), "Fundamental data should not be empty");
+                got_data = true;
             }
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
-    if !got_response {
+    let conns = shutdown_and_reclaim(&control_tx, join, account_id);
+
+    if !got_data {
         println!("  SKIP: No fundamental data received (may require subscription)\n");
-        return;
+        return conns;
     }
     println!("  PASS\n");
+    conns
 }
 
 /// TEXTBOOK INTEGRATION TEST PATTERN
