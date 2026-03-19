@@ -9,7 +9,7 @@ use crate::protocol::connection::{Connection, Frame};
 use crate::protocol::fix;
 use crate::protocol::fixcomp;
 use crate::protocol::tick_decoder;
-use crate::types::{AlgoParams, CompletedOrder, ControlCommand, Fill, InstrumentId, NewsBulletin, OrderCondition, OrderRequest, PositionInfo, Price, Qty, Side, PRICE_SCALE, QTY_SCALE};
+use crate::types::{AlgoParams, CompletedOrder, ControlCommand, Fill, InstrumentId, NewsBulletin, OrderCondition, OrderRequest, PositionInfo, Price, Qty, Side, TbtQuote, TbtTrade, PRICE_SCALE, QTY_SCALE};
 use crossbeam_channel::{bounded, Receiver, Sender};
 
 /// Auth server heartbeat interval (10 seconds, configurable).
@@ -4135,6 +4135,17 @@ impl HotLoop {
     /// Inject a raw HMDS message for testing. Processes historical data, news, etc.
     pub fn inject_hmds_message(&mut self, msg: &[u8]) {
         self.process_hmds_message(msg);
+    }
+
+    /// Inject a TBT trade for testing. Pushes to SharedState and emits event.
+    pub fn inject_tbt_trade(&mut self, trade: &TbtTrade) {
+        self.shared.push_tbt_trade(trade.clone());
+        self.emit(Event::TbtTrade(trade.clone()));
+    }
+
+    /// Inject a TBT quote for testing. Pushes to SharedState.
+    pub fn inject_tbt_quote(&mut self, quote: &TbtQuote) {
+        self.shared.push_tbt_quote(quote.clone());
     }
 
     /// Inject a simulated tick for testing.
