@@ -41,7 +41,7 @@ pub struct HotLoop {
     /// Pending subscriptions: MDReqID → InstrumentId (awaiting 35=Q ack).
     md_req_to_instrument: Vec<(u32, InstrumentId)>,
     /// Active subscriptions: InstrumentId → MDReqIDs (for unsubscribe).
-    instrument_md_reqs: Vec<(InstrumentId, Vec<u32>)>,
+    instrument_md_reqs: Vec<(InstrumentId, crate::types::FarmSlot, Vec<u32>)>,
     /// SPSC channel receiver for control plane commands.
     control_rx: Option<Receiver<ControlCommand>>,
     /// Whether the hot loop should keep running.
@@ -275,6 +275,8 @@ impl HotLoop {
             //    → update market state in-place
             //    → push Event::Tick to shared state
             self.poll_market_data();
+            self.poll_secondary_farm(&crate::types::FarmSlot::CashFarm);
+            self.poll_secondary_farm(&crate::types::FarmSlot::UsFuture);
 
             // 1b. Busy-poll historical socket for tick-by-tick data (tick data)
             self.poll_hmds();
@@ -351,6 +353,48 @@ impl HotLoop {
         }
         msgs.clear();
         self.farm_msg_buf = msgs;
+    }
+
+    /// Poll a secondary farm connection (cashfarm, usfuture) for ticks.
+    fn poll_secondary_farm(&mut self, slot: &crate::types::FarmSlot) {
+        let conn = match slot {
+            crate::types::FarmSlot::CashFarm => self.cashfarm_conn.as_mut(),
+            crate::types::FarmSlot::UsFuture => self.usfuture_conn.as_mut(),
+            _ => return,
+        };
+        let conn = match conn {
+            Some(c) => c,
+            None => return,
+        };
+        match conn.try_recv() {
+            Ok(0) => return,
+            Err(e) => {
+                log::error!("{:?} connection lost: {}", slot, e);
+                return; // TODO: per-farm disconnect handling
+            }
+            Ok(_) => {}
+        }
+        let frames = conn.extract_frames();
+        let mut msgs = Vec::new();
+        for frame in &frames {
+            match frame {
+                Frame::FixComp(raw) => {
+                    let (unsigned, _) = conn.unsign(raw);
+                    msgs.extend(fixcomp::fixcomp_decompress(&unsigned));
+                }
+                Frame::Binary(raw) => {
+                    let (unsigned, _) = conn.unsign(raw);
+                    msgs.push(unsigned);
+                }
+                Frame::Fix(raw) => {
+                    let (unsigned, _) = conn.unsign(raw);
+                    msgs.push(unsigned);
+                }
+            }
+        }
+        for msg in &msgs {
+            self.process_farm_message(msg);
+        }
     }
 
     fn process_farm_message(&mut self, msg: &[u8]) {
@@ -542,9 +586,20 @@ impl HotLoop {
         }
     }
 
-    /// Send market data request (subscribe) for an instrument.
+    /// Select the farm connection for a given slot.
+    fn farm_conn_for_slot(&mut self, slot: crate::types::FarmSlot) -> Option<&mut Connection> {
+        match slot {
+            crate::types::FarmSlot::UsFarm => self.farm_conn.as_mut(),
+            crate::types::FarmSlot::CashFarm => self.cashfarm_conn.as_mut().or(self.farm_conn.as_mut()),
+            crate::types::FarmSlot::UsFuture => self.usfuture_conn.as_mut().or(self.farm_conn.as_mut()),
+            crate::types::FarmSlot::EuFarm => self.farm_conn.as_mut(), // TODO: add eufarm_conn
+            crate::types::FarmSlot::JFarm => self.farm_conn.as_mut(),  // TODO: add jfarm_conn
+        }
+    }
+
+    /// Send market data request (subscribe) for an instrument on the specified farm.
     /// Sends two entries: BidAsk (264=442) and Last (264=443), matching protocol.
-    fn send_mktdata_subscribe(&mut self, con_id: i64, instrument: InstrumentId) {
+    fn send_mktdata_subscribe(&mut self, con_id: i64, instrument: InstrumentId, farm: crate::types::FarmSlot) {
         let bid_ask_id = self.next_md_req_id;
         let last_id = self.next_md_req_id + 1;
         self.next_md_req_id += 2;
@@ -553,13 +608,13 @@ impl HotLoop {
         self.md_req_to_instrument.push((bid_ask_id, instrument));
         self.md_req_to_instrument.push((last_id, instrument));
 
-        // Track active subscriptions for this instrument
-        match self.instrument_md_reqs.iter_mut().find(|(id, _)| *id == instrument) {
-            Some((_, reqs)) => { reqs.push(bid_ask_id); reqs.push(last_id); }
-            None => self.instrument_md_reqs.push((instrument, vec![bid_ask_id, last_id])),
+        // Track active subscriptions for this instrument (with farm slot)
+        match self.instrument_md_reqs.iter_mut().find(|(id, _, _)| *id == instrument) {
+            Some((_, _, reqs)) => { reqs.push(bid_ask_id); reqs.push(last_id); }
+            None => self.instrument_md_reqs.push((instrument, farm, vec![bid_ask_id, last_id])),
         }
 
-        if let Some(conn) = self.farm_conn.as_mut() {
+        if let Some(conn) = self.farm_conn_for_slot(farm) {
             let bid_ask_str = bid_ask_id.to_string();
             let last_str = last_id.to_string();
             let con_id_str = (con_id as u32).to_string();
@@ -596,17 +651,17 @@ impl HotLoop {
 
     /// Send market data request (unsubscribe) for all active subscriptions of an instrument.
     fn send_mktdata_unsubscribe(&mut self, instrument: InstrumentId) {
-        let reqs: Vec<u32> = match self.instrument_md_reqs.iter()
-            .position(|(id, _)| *id == instrument)
+        let (farm, reqs) = match self.instrument_md_reqs.iter()
+            .position(|(id, _, _)| *id == instrument)
         {
             Some(idx) => {
-                let (_, reqs) = self.instrument_md_reqs.remove(idx);
-                reqs
+                let (_, farm, reqs) = self.instrument_md_reqs.remove(idx);
+                (farm, reqs)
             }
             None => return,
         };
 
-        let conn = match self.farm_conn.as_mut() {
+        let conn = match self.farm_conn_for_slot(farm) {
             Some(c) => c,
             None => return,
         };
@@ -2559,12 +2614,13 @@ impl HotLoop {
 
         for cmd in cmds {
             match cmd {
-                ControlCommand::Subscribe { con_id, symbol, .. } => {
+                ControlCommand::Subscribe { con_id, symbol, exchange, sec_type } => {
+                    let farm = crate::types::farm_for_instrument(&exchange, &sec_type);
                     let id = self.context.market.register(con_id);
                     self.context.market.set_symbol(id, symbol);
                     self.shared.set_instrument_count(self.context.market.count());
                     self.shared.bump_register_gen();
-                    self.send_mktdata_subscribe(con_id, id);
+                    self.send_mktdata_subscribe(con_id, id, farm);
                 }
                 ControlCommand::Unsubscribe { instrument } => {
                     self.send_mktdata_unsubscribe(instrument);
@@ -2682,7 +2738,7 @@ impl HotLoop {
                 ControlCommand::Shutdown => {
                     // Unsubscribe all active market data before stopping
                     let instruments: Vec<InstrumentId> = self.instrument_md_reqs
-                        .iter().map(|(id, _)| *id).collect();
+                        .iter().map(|(id, _, _)| *id).collect();
                     for instrument in instruments {
                         self.send_mktdata_unsubscribe(instrument);
                     }
@@ -3142,7 +3198,7 @@ impl HotLoop {
         self.md_req_to_instrument.clear();
         self.instrument_md_reqs.clear();
         for (instrument, con_id) in active {
-            self.send_mktdata_subscribe(con_id, instrument);
+            self.send_mktdata_subscribe(con_id, instrument, crate::types::FarmSlot::UsFarm);
         }
         log::info!("Farm reconnected, re-subscribed {} instruments", self.instrument_md_reqs.len());
     }
@@ -4811,7 +4867,7 @@ mod tests {
         // Should track active subscription
         assert_eq!(engine.instrument_md_reqs.len(), 1);
         assert_eq!(engine.instrument_md_reqs[0].0, 0);
-        assert_eq!(engine.instrument_md_reqs[0].1, vec![1, 2]);
+        assert_eq!(engine.instrument_md_reqs[0].2, vec![1, 2]);
         // Next req_id should be 3
         assert_eq!(engine.next_md_req_id, 3);
     }
@@ -4916,7 +4972,7 @@ mod tests {
         engine.context_mut().market.register(265598);
 
         // Manually populate tracking (simulating prior subscribe)
-        engine.instrument_md_reqs.push((0, vec![1, 2]));
+        engine.instrument_md_reqs.push((0, crate::types::FarmSlot::UsFarm, vec![1, 2]));
 
         engine.send_mktdata_unsubscribe(0);
 
@@ -4938,8 +4994,8 @@ mod tests {
         engine.context_mut().market.register(272093); // instrument 1
 
         // Simulate prior subscriptions
-        engine.instrument_md_reqs.push((0, vec![1]));
-        engine.instrument_md_reqs.push((1, vec![2]));
+        engine.instrument_md_reqs.push((0, crate::types::FarmSlot::UsFarm, vec![1]));
+        engine.instrument_md_reqs.push((1, crate::types::FarmSlot::UsFarm, vec![2]));
         engine.farm_disconnected = true;
 
         // Reconnect with no actual connection (unit test)
@@ -5184,7 +5240,7 @@ mod tests {
         // Each subscribe allocates 2 req_ids (BidAsk + Last)
         assert_eq!(engine.next_md_req_id, 5); // started at 1, allocated 2+2
         assert_eq!(engine.instrument_md_reqs.len(), 1); // one instrument
-        assert_eq!(engine.instrument_md_reqs[0].1.len(), 4); // four req_ids (2 per subscribe)
+        assert_eq!(engine.instrument_md_reqs[0].2.len(), 4); // four req_ids (2 per subscribe)
     }
 
     #[test]
@@ -5202,7 +5258,7 @@ mod tests {
 
         // Setup: subscribe first
         engine.context_mut().market.register(265598);
-        engine.instrument_md_reqs.push((0, vec![1]));
+        engine.instrument_md_reqs.push((0, crate::types::FarmSlot::UsFarm, vec![1]));
 
         // Now unsubscribe
         tx.send(ControlCommand::Unsubscribe { instrument: 0 }).unwrap();
@@ -5780,7 +5836,7 @@ mod tests {
         engine.context_mut().quote_mut(id).bid = 150 * PRICE_SCALE;
         engine.context_mut().quote_mut(id).ask = 151 * PRICE_SCALE;
         engine.md_req_to_instrument.push((1, id));
-        engine.instrument_md_reqs.push((id, vec![1, 2]));
+        engine.instrument_md_reqs.push((id, crate::types::FarmSlot::UsFarm, vec![1, 2]));
 
         engine.handle_farm_disconnect();
 
