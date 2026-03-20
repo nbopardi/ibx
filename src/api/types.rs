@@ -593,7 +593,16 @@ impl ContractDetails {
         let c = Contract {
             con_id: def.con_id as i64,
             symbol: def.symbol.clone(),
-            sec_type: format!("{:?}", def.sec_type),
+            sec_type: match def.sec_type {
+                crate::control::contracts::SecurityType::Stock => "STK",
+                crate::control::contracts::SecurityType::Option => "OPT",
+                crate::control::contracts::SecurityType::Future => "FUT",
+                crate::control::contracts::SecurityType::Forex => "CASH",
+                crate::control::contracts::SecurityType::Index => "IND",
+                crate::control::contracts::SecurityType::Bond => "BOND",
+                crate::control::contracts::SecurityType::Warrant => "WAR",
+                _ => "STK",
+            }.to_string(),
             exchange: def.exchange.clone(),
             primary_exchange: def.primary_exchange.clone(),
             currency: def.currency.clone(),

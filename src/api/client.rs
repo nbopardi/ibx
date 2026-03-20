@@ -491,7 +491,13 @@ impl EClient {
     pub fn req_all_open_orders(&self, wrapper: &mut impl Wrapper) {
         for (order_id, info) in self.shared.drain_open_orders() {
             if !matches!(info.order_state.status.as_str(), "Filled" | "Cancelled" | "Inactive") {
-                wrapper.open_order(order_id as i64, &info.contract, &info.order, &info.order_state);
+                // Enrich contract with secdef cache at read time (may have arrived after exec report)
+                let contract = if info.contract.con_id != 0 {
+                    self.shared.get_contract(info.contract.con_id).unwrap_or(info.contract)
+                } else {
+                    info.contract
+                };
+                wrapper.open_order(order_id as i64, &contract, &info.order, &info.order_state);
             }
         }
         wrapper.open_order_end();
@@ -512,7 +518,13 @@ impl EClient {
             if let Some(info) = self.shared.get_order_info(order.order_id) {
                 let mut state = info.order_state;
                 state.status = status_str.into();
-                wrapper.completed_order(&info.contract, &info.order, &state);
+                // Enrich contract with secdef cache at read time
+                let contract = if info.contract.con_id != 0 {
+                    self.shared.get_contract(info.contract.con_id).unwrap_or(info.contract)
+                } else {
+                    info.contract
+                };
+                wrapper.completed_order(&contract, &info.order, &state);
             } else {
                 let contract = Contract::default();
                 let api_order = Order { order_id: order.order_id as i64, ..Default::default() };
@@ -760,7 +772,13 @@ impl EClient {
                 ex.shares = fill.qty as f64;
                 ex.price = price_f;
                 ex.order_id = fill.order_id as i64;
-                (info.contract, ex)
+                // Enrich contract with secdef cache at read time
+                let contract = if info.contract.con_id != 0 {
+                    self.shared.get_contract(info.contract.con_id).unwrap_or(info.contract)
+                } else {
+                    info.contract
+                };
+                (contract, ex)
             } else {
                 (Contract::default(), Execution {
                     side: side_str.into(),
@@ -1066,10 +1084,8 @@ impl EClient {
                     if !tags.is_empty() && !tags.iter().any(|t| t == tag) {
                         continue;
                     }
-                    if val != 0.0 {
-                        let val_str = format!("{:.2}", val);
-                        wrapper.account_summary(req_id, &self.account_id, tag, &val_str, "USD");
-                    }
+                    let val_str = format!("{:.2}", val);
+                    wrapper.account_summary(req_id, &self.account_id, tag, &val_str, "USD");
                 }
                 wrapper.account_summary_end(req_id);
             }
