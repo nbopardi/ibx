@@ -2454,13 +2454,20 @@ impl HotLoop {
                 _ => "DAY",
             };
 
-            let action = if let Some(order) = self.context.order(clord_id) {
-                match order.side {
-                    Side::Buy => "BUY",
-                    Side::Sell => "SELL",
-                    Side::ShortSell => "SSHORT",
-                }
-            } else { "" };
+            // Use FIX tag 54 (Side) directly — more reliable than context lookup
+            // which may not have the order for init-burst messages
+            let action = match parsed.get(&54).map(|s| s.as_str()) {
+                Some("1") => "BUY",
+                Some("2") => "SELL",
+                Some("5") => "SSHORT",
+                _ => if let Some(order) = self.context.order(clord_id) {
+                    match order.side {
+                        Side::Buy => "BUY",
+                        Side::Sell => "SELL",
+                        Side::ShortSell => "SSHORT",
+                    }
+                } else { "" },
+            };
 
             let status_str = match status {
                 crate::types::OrderStatus::PendingSubmit => "PendingSubmit",
