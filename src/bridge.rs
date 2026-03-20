@@ -18,6 +18,17 @@ use crate::control::news::NewsHeadline;
 use crate::control::histogram::HistogramEntry;
 use crate::control::contracts::MarketRule;
 use crate::types::*;
+use crate::api::types as api;
+
+/// Enriched order info from CCP execution reports, for open_order / completed_order callbacks.
+#[derive(Clone, Debug)]
+pub struct RichOrderInfo {
+    pub contract: api::Contract,
+    pub order: api::Order,
+    pub order_state: api::OrderState,
+    /// Last execution details from this order's exec reports.
+    pub last_exec: api::Execution,
+}
 
 /// Events emitted by the IB engine.
 #[derive(Debug, Clone)]
@@ -122,6 +133,12 @@ pub struct SharedState {
     historical_schedules: Mutex<Vec<(u32, HistoricalScheduleResponse)>>,
     completed_orders: Mutex<Vec<CompletedOrder>>,
     market_rules: Mutex<Vec<MarketRule>>,
+    /// Enriched order info from CCP exec reports (order_id → RichOrderInfo).
+    /// Used by open_order / completed_order / exec_details callbacks.
+    order_cache: Mutex<HashMap<u64, RichOrderInfo>>,
+    /// Contract cache from CCP exec reports (con_id → api::Contract).
+    /// Used to enrich position and execution callbacks.
+    contract_cache: Mutex<HashMap<i64, api::Contract>>,
     /// Position info (conId → PositionInfo) for reqPositions and P&L.
     position_infos: Mutex<HashMap<i64, PositionInfo>>,
     positions: [AtomicU64; MAX_INSTRUMENTS],
@@ -161,6 +178,8 @@ impl SharedState {
             historical_schedules: Mutex::new(Vec::with_capacity(4)),
             completed_orders: Mutex::new(Vec::with_capacity(64)),
             market_rules: Mutex::new(Vec::new()),
+            order_cache: Mutex::new(HashMap::new()),
+            contract_cache: Mutex::new(HashMap::new()),
             position_infos: Mutex::new(HashMap::new()),
             positions: std::array::from_fn(|_| AtomicU64::new(0)),
             account: Mutex::new(AccountState::default()),
@@ -323,6 +342,22 @@ impl SharedState {
         self.market_rules.lock().unwrap().iter().find(|r| r.rule_id == rule_id).cloned()
     }
 
+    /// Drain all enriched open orders (for open_order callbacks).
+    pub fn drain_open_orders(&self) -> Vec<(u64, RichOrderInfo)> {
+        let mut lock = self.order_cache.lock().unwrap();
+        lock.drain().collect()
+    }
+
+    /// Get enriched order info by order_id.
+    pub fn get_order_info(&self, order_id: u64) -> Option<RichOrderInfo> {
+        self.order_cache.lock().unwrap().get(&order_id).cloned()
+    }
+
+    /// Get cached contract by con_id.
+    pub fn get_contract(&self, con_id: i64) -> Option<api::Contract> {
+        self.contract_cache.lock().unwrap().get(&con_id).cloned()
+    }
+
     /// Get all position infos (for reqPositions).
     pub fn position_infos(&self) -> Vec<PositionInfo> {
         self.position_infos.lock().unwrap().values().copied().collect()
@@ -454,6 +489,14 @@ impl SharedState {
                 lock.push(rule);
             }
         }
+    }
+
+    #[doc(hidden)] pub fn push_order_info(&self, order_id: u64, info: RichOrderInfo) {
+        self.order_cache.lock().unwrap().insert(order_id, info);
+    }
+
+    #[doc(hidden)] pub fn cache_contract(&self, con_id: i64, contract: api::Contract) {
+        self.contract_cache.lock().unwrap().insert(con_id, contract);
     }
 
     #[doc(hidden)] pub fn set_position_info(&self, info: PositionInfo) {

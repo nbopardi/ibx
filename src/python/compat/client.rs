@@ -17,6 +17,32 @@ use super::contract::{Contract, ContractDescription, Order, TagValue};
 use super::tick_types::*;
 use super::super::types::PRICE_SCALE_F;
 
+/// Stored order info for open_order / completed_order callbacks.
+#[derive(Clone)]
+struct StoredOrder {
+    contract: Contract,
+    order: Order,
+    status: String,
+    filled: f64,
+    remaining: f64,
+    instrument: u32,
+}
+
+/// Stored execution info for exec_details callbacks.
+#[derive(Clone)]
+struct StoredExecution {
+    req_id: i64,
+    contract: Contract,
+    exec_id: String,
+    side: String,
+    price: f64,
+    shares: f64,
+    time: String,
+    order_id: u64,
+    cum_qty: f64,
+    avg_price: f64,
+}
+
 /// ibapi-compatible EClient class.
 /// Wraps the internal engine and dispatches events to an EWrapper subclass.
 ///
@@ -54,14 +80,16 @@ pub struct EClient {
     last_pnl: Mutex<[i64; 3]>,
     /// Market data type preference (1=live, 2=frozen, 3=delayed, 4=delayed-frozen).
     market_data_type: AtomicI32,
-    /// Track open orders: order_id → (status, instrument, filled, remaining).
-    open_orders: Mutex<HashMap<u64, (String, u32, f64, f64)>>,
-    /// Track executions: (req_id, contract_con_id, exec_id, side, price, qty, time).
-    executions: Mutex<Vec<(i64, i64, String, String, f64, f64, String)>>,
+    /// Track open orders: order_id → StoredOrder (contract + order + status).
+    open_orders: Mutex<HashMap<u64, StoredOrder>>,
+    /// Track executions with full details.
+    executions: Mutex<Vec<StoredExecution>>,
     /// Whether news bulletins subscription is active.
     bulletin_subscribed: AtomicBool,
     /// News provider codes for per-contract news ticks (e.g. "BRFG*BRFUPDN").
     news_providers: Mutex<String>,
+    /// Cache of con_id → Contract for enriching position/execution callbacks.
+    contract_cache: Mutex<HashMap<i64, Contract>>,
 }
 
 #[pymethods]
@@ -89,6 +117,7 @@ impl EClient {
             executions: Mutex::new(Vec::new()),
             bulletin_subscribed: AtomicBool::new(false),
             news_providers: Mutex::new("BRFG*BRFUPDN".to_string()),
+            contract_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -215,6 +244,7 @@ impl EClient {
         let instrument_id = Self::wait_for_registration(shared, reg_gen);
         self.req_to_instrument.lock().unwrap().insert(req_id, instrument_id);
         self.instrument_to_req.lock().unwrap().insert(instrument_id, req_id);
+        self.contract_cache.lock().unwrap().insert(contract.con_id, contract.clone());
 
         let _ = (snapshot, regulatory_snapshot, mkt_data_options);
 
@@ -429,9 +459,24 @@ impl EClient {
         let shared = self.shared.get()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
         let positions = shared.position_infos();
+        let cache = self.contract_cache.lock().unwrap();
         for pi in &positions {
-            let mut c = super::contract::Contract::default();
-            c.con_id = pi.con_id;
+            let c = cache.get(&pi.con_id).cloned().unwrap_or_else(|| {
+                // Fall back to shared contract cache (enriched from CCP exec reports)
+                shared.get_contract(pi.con_id).map(|ac| {
+                    let mut c = super::contract::Contract::default();
+                    c.con_id = ac.con_id;
+                    c.symbol = ac.symbol;
+                    c.sec_type = ac.sec_type;
+                    c.exchange = ac.exchange;
+                    c.currency = ac.currency;
+                    c
+                }).unwrap_or_else(|| {
+                    let mut c = super::contract::Contract::default();
+                    c.con_id = pi.con_id;
+                    c
+                })
+            });
             let c_py = Py::new(py, c)?.into_any();
             let avg_cost = pi.avg_cost as f64 / PRICE_SCALE_F;
             self.wrapper.call_method(
@@ -575,6 +620,20 @@ impl EClient {
 
         tx.send(ControlCommand::Order(req))
             .map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
+
+        // Store order info for req_open_orders / req_completed_orders
+        let mut stored_order = order.clone();
+        stored_order.order_id = oid as i64;
+        self.open_orders.lock().unwrap().insert(oid, StoredOrder {
+            contract: contract.clone(),
+            order: stored_order,
+            status: "PendingSubmit".to_string(),
+            filled: 0.0,
+            remaining: api_order.total_quantity,
+            instrument,
+        });
+        self.contract_cache.lock().unwrap().insert(contract.con_id, contract.clone());
+
         Ok(())
     }
 
@@ -648,16 +707,55 @@ impl EClient {
 
     /// Request all open orders for this client.
     fn req_open_orders(&self, py: Python<'_>) -> PyResult<()> {
-        let orders: Vec<(u64, String, u32, f64, f64)> = {
+        // Merge local open_orders with enriched data from shared order cache
+        let orders: Vec<(u64, StoredOrder)> = {
             let map = self.open_orders.lock().unwrap();
-            map.iter().map(|(&oid, &(ref status, inst, filled, remaining))| {
-                (oid, status.clone(), inst, filled, remaining)
-            }).collect()
+            map.iter()
+                .filter(|(_, so)| !matches!(so.status.as_str(), "Filled" | "Cancelled" | "Inactive"))
+                .map(|(&oid, so)| (oid, so.clone()))
+                .collect()
         };
-        for (order_id, status, _inst, filled, remaining) in &orders {
+        // Also merge in any orders from shared cache not in our local map
+        if let Some(shared) = self.shared.get() {
+            for (oid, info) in shared.drain_open_orders() {
+                if !matches!(info.order_state.status.as_str(), "Filled" | "Cancelled" | "Inactive") {
+                    // Update local contract cache from enriched data
+                    if info.contract.con_id != 0 {
+                        self.contract_cache.lock().unwrap().insert(info.contract.con_id, Contract {
+                            con_id: info.contract.con_id,
+                            symbol: info.contract.symbol.clone(),
+                            sec_type: info.contract.sec_type.clone(),
+                            exchange: info.contract.exchange.clone(),
+                            currency: info.contract.currency.clone(),
+                            ..Default::default()
+                        });
+                    }
+                    // Enrich local stored order if present
+                    if let Some(so) = self.open_orders.lock().unwrap().get_mut(&oid) {
+                        if so.order.account.is_empty() {
+                            so.order.account = info.order.account.clone();
+                        }
+                        if so.order.perm_id == 0 {
+                            so.order.perm_id = info.order.perm_id;
+                        }
+                    }
+                }
+            }
+        }
+        for (order_id, so) in &orders {
+            let c_py = Py::new(py, so.contract.clone())?.into_any();
+            let o_py = Py::new(py, so.order.clone())?.into_any();
+            let state = pyo3::types::PyDict::new(py);
+            state.set_item("status", so.status.as_str())?;
+            state.set_item("completedTime", "")?;
+            self.wrapper.call_method(
+                py, "open_order",
+                (*order_id as i64, &c_py, &o_py, state.as_any()),
+                None,
+            )?;
             self.wrapper.call_method(
                 py, "order_status",
-                (*order_id as i64, status.as_str(), *filled, *remaining,
+                (*order_id as i64, so.status.as_str(), so.filled, so.remaining,
                  0.0f64, 0i64, 0i64, 0.0f64, 0i64, "", 0.0f64),
                 None,
             )?;
@@ -675,20 +773,33 @@ impl EClient {
     /// Request execution reports.
     #[pyo3(signature = (req_id, _exec_filter=None))]
     fn req_executions(&self, py: Python<'_>, req_id: i64, _exec_filter: Option<PyObject>) -> PyResult<()> {
-        let execs: Vec<(i64, i64, String, String, f64, f64, String)> = {
+        let execs: Vec<StoredExecution> = {
             self.executions.lock().unwrap().clone()
         };
-        for (_, con_id, exec_id, side, price, qty, time) in &execs {
-            let mut c = super::contract::Contract::default();
-            c.con_id = *con_id;
-            let c_py = Py::new(py, c)?.into_any();
+        let acct_name = self.account_id.get().map(|s| s.as_str()).unwrap_or("");
+        for se in &execs {
+            let c_py = Py::new(py, se.contract.clone())?.into_any();
 
             let exec_obj = pyo3::types::PyDict::new(py);
-            exec_obj.set_item("execId", exec_id.as_str())?;
-            exec_obj.set_item("side", side.as_str())?;
-            exec_obj.set_item("price", *price)?;
-            exec_obj.set_item("shares", *qty)?;
-            exec_obj.set_item("time", time.as_str())?;
+            exec_obj.set_item("execId", se.exec_id.as_str())?;
+            exec_obj.set_item("time", se.time.as_str())?;
+            exec_obj.set_item("acctNumber", acct_name)?;
+            exec_obj.set_item("exchange", se.contract.exchange.as_str())?;
+            exec_obj.set_item("side", se.side.as_str())?;
+            exec_obj.set_item("shares", se.shares)?;
+            exec_obj.set_item("price", se.price)?;
+            exec_obj.set_item("permId", 0i64)?;
+            exec_obj.set_item("clientId", 0i64)?;
+            exec_obj.set_item("orderId", se.order_id as i64)?;
+            exec_obj.set_item("liquidation", 0i64)?;
+            exec_obj.set_item("cumQty", se.cum_qty)?;
+            exec_obj.set_item("avgPrice", se.avg_price)?;
+            exec_obj.set_item("orderRef", "")?;
+            exec_obj.set_item("evRule", "")?;
+            exec_obj.set_item("evMultiplier", 0.0f64)?;
+            exec_obj.set_item("modelCode", "")?;
+            exec_obj.set_item("lastLiquidity", 0i64)?;
+            exec_obj.set_item("pendingPriceRevision", false)?;
 
             self.wrapper.call_method(
                 py, "exec_details",
@@ -1265,20 +1376,49 @@ impl EClient {
         let _ = api_only;
         if let Some(shared) = self.shared.get() {
             let completed = shared.drain_completed_orders();
-            for order in &completed {
-                let status_str = match order.status {
+            for co in &completed {
+                let status_str = match co.status {
                     crate::types::OrderStatus::Filled => "Filled",
                     crate::types::OrderStatus::Cancelled => "Cancelled",
                     crate::types::OrderStatus::Rejected => "Inactive",
                     _ => "Unknown",
                 };
-                // Fire completed_order callback with minimal contract/order/state info
-                let contract = py.None();
-                let order_obj = py.None();
+                // Look up stored order info: local open_orders first, then shared enriched cache
+                let stored = self.open_orders.lock().unwrap().get(&co.order_id).cloned();
                 let state = pyo3::types::PyDict::new(py);
                 state.set_item("status", status_str)?;
                 state.set_item("completedTime", "")?;
-                self.wrapper.call_method1(py, "completed_order", (&contract, &order_obj, state.as_any()))?;
+                if let Some(so) = stored {
+                    let c_py = Py::new(py, so.contract)?.into_any();
+                    let o_py = Py::new(py, so.order)?.into_any();
+                    self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, state.as_any()))?;
+                } else if let Some(info) = shared.get_order_info(co.order_id) {
+                    let c = Contract {
+                        con_id: info.contract.con_id,
+                        symbol: info.contract.symbol,
+                        sec_type: info.contract.sec_type,
+                        exchange: info.contract.exchange,
+                        currency: info.contract.currency,
+                        ..Default::default()
+                    };
+                    let mut o = Order::default();
+                    o.order_id = info.order.order_id;
+                    o.action = info.order.action;
+                    o.total_quantity = info.order.total_quantity;
+                    o.order_type = info.order.order_type;
+                    o.lmt_price = info.order.lmt_price;
+                    o.aux_price = info.order.aux_price;
+                    o.tif = info.order.tif;
+                    o.account = info.order.account;
+                    o.perm_id = info.order.perm_id;
+                    let c_py = Py::new(py, c)?.into_any();
+                    let o_py = Py::new(py, o)?.into_any();
+                    self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, state.as_any()))?;
+                } else {
+                    let c_py = Py::new(py, Contract::default())?.into_any();
+                    let o_py = Py::new(py, Order::default())?.into_any();
+                    self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, state.as_any()))?;
+                }
             }
             self.wrapper.call_method0(py, "completed_orders_end")?;
         }
@@ -1331,19 +1471,32 @@ impl EClient {
                 // Track execution for req_executions
                 let exec_id = format!("{}.{}", fill.order_id, fill.timestamp_ns);
                 let now_str = format!("{}", fill.timestamp_ns);
-                self.executions.lock().unwrap().push((
-                    req_id, 0i64, exec_id, side_str.to_string(), price, fill.qty as f64, now_str,
-                ));
+                // Get contract from stored order if available
+                let exec_contract = self.open_orders.lock().unwrap()
+                    .get(&fill.order_id).map(|so| so.contract.clone())
+                    .unwrap_or_default();
+                self.executions.lock().unwrap().push(StoredExecution {
+                    req_id,
+                    contract: exec_contract,
+                    exec_id,
+                    side: side_str.to_string(),
+                    price,
+                    shares: fill.qty as f64,
+                    time: now_str,
+                    order_id: fill.order_id,
+                    cum_qty: fill.qty as f64,
+                    avg_price: price,
+                });
 
                 // Update open order tracking
                 {
                     let mut orders = self.open_orders.lock().unwrap();
                     if fill.remaining == 0 {
                         orders.remove(&fill.order_id);
-                    } else {
-                        orders.insert(fill.order_id, (
-                            status.to_string(), fill.instrument, fill.qty as f64, fill.remaining as f64,
-                        ));
+                    } else if let Some(so) = orders.get_mut(&fill.order_id) {
+                        so.status = status.to_string();
+                        so.filled = fill.qty as f64;
+                        so.remaining = fill.remaining as f64;
                     }
                 }
 
@@ -1374,13 +1527,20 @@ impl EClient {
                     let mut orders = self.open_orders.lock().unwrap();
                     match update.status {
                         OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected => {
-                            orders.remove(&update.order_id);
+                            // Don't remove — req_completed_orders needs the stored data.
+                            // Mark as terminal status instead.
+                            if let Some(so) = orders.get_mut(&update.order_id) {
+                                so.status = status.to_string();
+                                so.filled = update.filled_qty as f64;
+                                so.remaining = update.remaining_qty as f64;
+                            }
                         }
                         _ => {
-                            orders.insert(update.order_id, (
-                                status.to_string(), update.instrument,
-                                update.filled_qty as f64, update.remaining_qty as f64,
-                            ));
+                            if let Some(so) = orders.get_mut(&update.order_id) {
+                                so.status = status.to_string();
+                                so.filled = update.filled_qty as f64;
+                                so.remaining = update.remaining_qty as f64;
+                            }
                         }
                     }
                 }
@@ -1819,6 +1979,20 @@ impl EClient {
                 if let Some((req_id, ref tags)) = summary_req {
                     let acct = shared.account();
                     let acct_name = self.account_id.get().map(|s| s.as_str()).unwrap_or("");
+                    // String tags (non-numeric)
+                    let string_tags: Vec<(&str, &str, &str)> = vec![
+                        ("AccountType", "INDIVIDUAL", ""),
+                    ];
+                    for (tag, val, currency) in &string_tags {
+                        if tags.is_empty() || tags.iter().any(|t| t == tag) {
+                            self.wrapper.call_method(
+                                py, "account_summary",
+                                (req_id, acct_name, *tag, *val, *currency),
+                                None,
+                            )?;
+                        }
+                    }
+                    // Numeric tags
                     let tag_values: Vec<(&str, f64)> = vec![
                         ("NetLiquidation", acct.net_liquidation as f64 / PRICE_SCALE_F),
                         ("TotalCashValue", acct.total_cash_value as f64 / PRICE_SCALE_F),
@@ -1838,14 +2012,12 @@ impl EClient {
                     ];
                     for (tag, val) in &tag_values {
                         if tags.is_empty() || tags.iter().any(|t| t == tag) {
-                            if *val != 0.0 {
-                                let val_str = format!("{:.2}", val);
-                                self.wrapper.call_method(
-                                    py, "account_summary",
-                                    (req_id, acct_name, *tag, val_str.as_str(), "USD"),
-                                    None,
-                                )?;
-                            }
+                            let val_str = format!("{:.2}", val);
+                            self.wrapper.call_method(
+                                py, "account_summary",
+                                (req_id, acct_name, *tag, val_str.as_str(), "USD"),
+                                None,
+                            )?;
                         }
                     }
                     self.wrapper.call_method1(py, "account_summary_end", (req_id,))?;
@@ -2112,20 +2284,52 @@ impl EClient {
 
             let exec_id = format!("{}.{}", fill.order_id, fill.timestamp_ns);
             let now_str = format!("{}", fill.timestamp_ns);
-            self.executions.lock().unwrap().push((
-                req_id, 0i64, exec_id.clone(), side_str.to_string(), price, fill.qty as f64, now_str,
-            ));
+            // Try local open_orders first, then fall back to shared order cache → contract cache
+            let exec_contract = self.open_orders.lock().unwrap()
+                .get(&fill.order_id).map(|so| so.contract.clone())
+                .or_else(|| {
+                    shared.get_order_info(fill.order_id).map(|info| {
+                        Contract {
+                            con_id: info.contract.con_id,
+                            symbol: info.contract.symbol.clone(),
+                            sec_type: info.contract.sec_type.clone(),
+                            exchange: info.contract.exchange.clone(),
+                            currency: info.contract.currency.clone(),
+                            ..Default::default()
+                        }
+                    })
+                })
+                .unwrap_or_default();
+            self.executions.lock().unwrap().push(StoredExecution {
+                req_id,
+                contract: exec_contract.clone(),
+                exec_id: exec_id.clone(),
+                side: side_str.to_string(),
+                price,
+                shares: fill.qty as f64,
+                time: now_str.clone(),
+                order_id: fill.order_id,
+                cum_qty: fill.qty as f64,
+                avg_price: price,
+            });
 
             // exec_details callback
+            let acct_name = self.account_id.get().map(|s| s.as_str()).unwrap_or("");
+            let c_py = Py::new(py, exec_contract)?.into_any();
             let exec_dict = pyo3::types::PyDict::new(py);
             exec_dict.set_item("execId", exec_id.as_str())?;
+            exec_dict.set_item("time", now_str.as_str())?;
+            exec_dict.set_item("acctNumber", acct_name)?;
             exec_dict.set_item("side", side_str)?;
             exec_dict.set_item("price", price)?;
             exec_dict.set_item("shares", fill.qty as f64)?;
-            exec_dict.set_item("time", fill.timestamp_ns.to_string().as_str())?;
-            let mut c = super::contract::Contract::default();
-            c.con_id = 0;
-            let c_py = Py::new(py, c)?.into_any();
+            exec_dict.set_item("orderId", fill.order_id as i64)?;
+            exec_dict.set_item("cumQty", fill.qty as f64)?;
+            exec_dict.set_item("avgPrice", price)?;
+            exec_dict.set_item("permId", 0i64)?;
+            exec_dict.set_item("clientId", 0i64)?;
+            exec_dict.set_item("liquidation", 0i64)?;
+            exec_dict.set_item("lastLiquidity", 0i64)?;
             self.wrapper.call_method(
                 py, "exec_details",
                 (req_id, &c_py, exec_dict.as_any()),
@@ -2136,10 +2340,10 @@ impl EClient {
                 let mut orders = self.open_orders.lock().unwrap();
                 if fill.remaining == 0 {
                     orders.remove(&fill.order_id);
-                } else {
-                    orders.insert(fill.order_id, (
-                        status.to_string(), fill.instrument, fill.qty as f64, fill.remaining as f64,
-                    ));
+                } else if let Some(so) = orders.get_mut(&fill.order_id) {
+                    so.status = status.to_string();
+                    so.filled = fill.qty as f64;
+                    so.remaining = fill.remaining as f64;
                 }
             }
         }
@@ -2352,6 +2556,20 @@ impl EClient {
             if let Some((req_id, ref tags)) = summary_req {
                 let acct = shared.account();
                 let acct_name = self.account_id.get().map(|s| s.as_str()).unwrap_or("");
+                // String tags (non-numeric)
+                let string_tags: Vec<(&str, &str, &str)> = vec![
+                    ("AccountType", "INDIVIDUAL", ""),
+                ];
+                for (tag, val, currency) in &string_tags {
+                    if tags.is_empty() || tags.iter().any(|t| t == tag) {
+                        self.wrapper.call_method(
+                            py, "account_summary",
+                            (req_id, acct_name, *tag, *val, *currency),
+                            None,
+                        )?;
+                    }
+                }
+                // Numeric tags
                 let tag_values: Vec<(&str, f64)> = vec![
                     ("NetLiquidation", acct.net_liquidation as f64 / PRICE_SCALE_F),
                     ("TotalCashValue", acct.total_cash_value as f64 / PRICE_SCALE_F),
@@ -2371,14 +2589,12 @@ impl EClient {
                 ];
                 for (tag, val) in &tag_values {
                     if tags.is_empty() || tags.iter().any(|t| t == tag) {
-                        if *val != 0.0 {
-                            let val_str = format!("{:.2}", val);
-                            self.wrapper.call_method(
-                                py, "account_summary",
-                                (req_id, acct_name, *tag, val_str.as_str(), "USD"),
-                                None,
-                            )?;
-                        }
+                        let val_str = format!("{:.2}", val);
+                        self.wrapper.call_method(
+                            py, "account_summary",
+                            (req_id, acct_name, *tag, val_str.as_str(), "USD"),
+                            None,
+                        )?;
                     }
                 }
                 self.wrapper.call_method1(py, "account_summary_end", (req_id,))?;

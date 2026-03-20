@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::bridge::{Event, SharedState};
+use crate::bridge::{Event, RichOrderInfo, SharedState};
+use crate::api::types as api;
 use crate::engine::context::Context;
 use crate::config::{chrono_free_timestamp, unix_to_ib_datetime};
 use crate::protocol::connection::{Connection, Frame};
@@ -2216,6 +2217,30 @@ impl HotLoop {
                 // SecurityDefinition response
                 if let Some(def) = crate::control::contracts::parse_secdef_response(msg) {
                     let is_last = crate::control::contracts::secdef_response_is_last(msg);
+                    // Enrich contract cache with secdef data (exchange, localSymbol, tradingClass)
+                    if def.con_id != 0 {
+                        let sec_type_str = match def.sec_type {
+                            crate::control::contracts::SecurityType::Stock => "STK",
+                            crate::control::contracts::SecurityType::Option => "OPT",
+                            crate::control::contracts::SecurityType::Future => "FUT",
+                            crate::control::contracts::SecurityType::Forex => "CASH",
+                            crate::control::contracts::SecurityType::Index => "IND",
+                            crate::control::contracts::SecurityType::Bond => "BOND",
+                            crate::control::contracts::SecurityType::Warrant => "WAR",
+                            _ => "STK",
+                        };
+                        self.shared.cache_contract(def.con_id as i64, api::Contract {
+                            con_id: def.con_id as i64,
+                            symbol: def.symbol.clone(),
+                            sec_type: sec_type_str.to_string(),
+                            exchange: def.exchange.clone(),
+                            currency: def.currency.clone(),
+                            local_symbol: def.local_symbol.clone(),
+                            primary_exchange: def.primary_exchange.clone(),
+                            trading_class: def.trading_class.clone(),
+                            ..Default::default()
+                        });
+                    }
                     // Match to pending request (use first pending)
                     if let Some(&req_id) = self.pending_secdef.first() {
                         self.shared.push_contract_details(req_id, def.clone());
@@ -2361,6 +2386,195 @@ impl HotLoop {
                 self.shared.push_order_update(update);
                 self.emit(Event::OrderUpdate(update));
             }
+        }
+
+        // ── Enrich order/contract caches from FIX tags already in parsed ──
+        {
+            let account = parsed.get(&1).cloned().unwrap_or_default();
+            let symbol = parsed.get(&55).cloned().unwrap_or_default();
+            let exchange = parsed.get(&207).cloned().unwrap_or_default();
+            let sec_type = parsed.get(&167).cloned().unwrap_or_default();
+            let currency = parsed.get(&15).cloned().unwrap_or_default();
+            let con_id: i64 = parsed.get(&6008).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let local_symbol = parsed.get(&6035).cloned().unwrap_or_default();
+            let _routing_exchange = parsed.get(&6004).cloned().unwrap_or_default();
+            let perm_id: i64 = parsed.get(&37).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let total_qty: f64 = parsed.get(&38).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let ord_type_tag = parsed.get(&40).map(|s| s.as_str()).unwrap_or("");
+            let limit_price: f64 = parsed.get(&44).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let tif_tag = parsed.get(&59).map(|s| s.as_str()).unwrap_or("");
+            let stop_px: f64 = parsed.get(&99).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let outside_rth = parsed.get(&6433).map(|s| s == "1").unwrap_or(false);
+            let clearing_intent = parsed.get(&6419).cloned().unwrap_or_default();
+            let auto_cancel_date = parsed.get(&6596).cloned().unwrap_or_default();
+            let exec_exchange = parsed.get(&30).cloned().unwrap_or_default();
+            let transact_time = parsed.get(&60).cloned().unwrap_or_default();
+            let avg_px: f64 = parsed.get(&6).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let cum_qty: f64 = parsed.get(&14).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let last_liq: i32 = parsed.get(&851).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+            let sec_type_str = match sec_type.as_str() {
+                "CS" | "COMMON" => "STK",
+                "FUT" => "FUT",
+                "OPT" => "OPT",
+                "FOR" | "CASH" => "CASH",
+                "IND" => "IND",
+                "FOP" => "FOP",
+                "WAR" => "WAR",
+                "BAG" => "BAG",
+                "BOND" => "BOND",
+                "CMDTY" => "CMDTY",
+                "NEWS" => "NEWS",
+                "FUND" => "FUND",
+                _ => &sec_type,
+            };
+
+            let order_type_str = match ord_type_tag {
+                "1" => "MKT",
+                "2" => "LMT",
+                "3" => "STP",
+                "4" => "STP LMT",
+                "P" => "TRAIL",
+                "5" => "MOC",
+                "B" => "LOC",
+                "J" => "MIT",
+                "K" => "MTL",
+                "R" => "REL",
+                _ => ord_type_tag,
+            };
+
+            let tif_str = match tif_tag {
+                "0" => "DAY",
+                "1" => "GTC",
+                "3" => "IOC",
+                "4" => "FOK",
+                "2" => "OPG",
+                "6" => "GTD",
+                "8" => "AUC",
+                _ => "DAY",
+            };
+
+            let action = if let Some(order) = self.context.order(clord_id) {
+                match order.side {
+                    Side::Buy => "BUY",
+                    Side::Sell => "SELL",
+                    Side::ShortSell => "SSHORT",
+                }
+            } else { "" };
+
+            let status_str = match status {
+                crate::types::OrderStatus::PendingSubmit => "PendingSubmit",
+                crate::types::OrderStatus::Submitted => "Submitted",
+                crate::types::OrderStatus::Filled => "Filled",
+                crate::types::OrderStatus::PartiallyFilled => "PreSubmitted",
+                crate::types::OrderStatus::Cancelled => "Cancelled",
+                crate::types::OrderStatus::Rejected => "Inactive",
+                crate::types::OrderStatus::Uncertain => "Unknown",
+            };
+
+            // Merge exec report fields with secdef-cached contract (for tradingClass etc.)
+            let contract = if con_id != 0 {
+                if let Some(mut cached) = self.shared.get_contract(con_id) {
+                    if !symbol.is_empty() { cached.symbol = symbol.clone(); }
+                    if !sec_type_str.is_empty() { cached.sec_type = sec_type_str.to_string(); }
+                    if !exchange.is_empty() { cached.exchange = exchange.clone(); }
+                    if !currency.is_empty() { cached.currency = currency.clone(); }
+                    if !local_symbol.is_empty() { cached.local_symbol = local_symbol.clone(); }
+                    cached
+                } else {
+                    api::Contract {
+                        con_id,
+                        symbol: symbol.clone(),
+                        sec_type: sec_type_str.to_string(),
+                        exchange: exchange.clone(),
+                        currency: currency.clone(),
+                        local_symbol: local_symbol.clone(),
+                        ..Default::default()
+                    }
+                }
+            } else {
+                api::Contract {
+                    symbol: symbol.clone(),
+                    sec_type: sec_type_str.to_string(),
+                    exchange: exchange.clone(),
+                    currency: currency.clone(),
+                    local_symbol: local_symbol.clone(),
+                    ..Default::default()
+                }
+            };
+
+            let order = api::Order {
+                order_id: clord_id as i64,
+                action: action.to_string(),
+                total_quantity: total_qty,
+                order_type: order_type_str.to_string(),
+                lmt_price: limit_price,
+                aux_price: stop_px,
+                tif: tif_str.to_string(),
+                account: account.clone(),
+                perm_id,
+                filled_quantity: leaves_qty as f64,
+                outside_rth,
+                clearing_intent,
+                auto_cancel_date,
+                submitter: self.account_id.clone(),
+                ..Default::default()
+            };
+
+            // For terminal statuses, capture completedTime from FIX tag 52 (SendingTime)
+            let completed_time = if matches!(status,
+                crate::types::OrderStatus::Filled |
+                crate::types::OrderStatus::Cancelled |
+                crate::types::OrderStatus::Rejected
+            ) {
+                parsed.get(&52).cloned().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let completed_status = match status {
+                crate::types::OrderStatus::Filled => "Filled".to_string(),
+                crate::types::OrderStatus::Cancelled => "Cancelled".to_string(),
+                crate::types::OrderStatus::Rejected => {
+                    parsed.get(&58).cloned().unwrap_or_else(|| "Rejected".to_string())
+                }
+                _ => String::new(),
+            };
+
+            let order_state = api::OrderState {
+                status: status_str.to_string(),
+                commission,
+                completed_time,
+                completed_status,
+                ..Default::default()
+            };
+
+            let last_exec = api::Execution {
+                exec_id: exec_id.to_string(),
+                time: transact_time,
+                acct_number: account,
+                exchange: exec_exchange,
+                side: if let Some(o) = self.context.order(clord_id) {
+                    match o.side { Side::Buy => "BOT", Side::Sell | Side::ShortSell => "SLD" }.to_string()
+                } else { String::new() },
+                shares: last_shares as f64,
+                price: last_px,
+                order_id: clord_id as i64,
+                cum_qty,
+                avg_price: avg_px,
+                last_liquidity: last_liq,
+                ..Default::default()
+            };
+
+            if con_id != 0 {
+                self.shared.cache_contract(con_id, contract.clone());
+            }
+
+            self.shared.push_order_info(clord_id, RichOrderInfo {
+                contract,
+                order,
+                order_state,
+                last_exec,
+            });
         }
 
         // Archive and remove fully terminal orders

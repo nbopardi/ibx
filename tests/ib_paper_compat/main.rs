@@ -131,6 +131,14 @@ fn compat_suite() {
 
     // ── Completed orders, PnL, news bulletins (early — before flaky network phases) ──
     conns = account::phase_completed_orders(conns);
+    conns = account::phase_enriched_order_cache(conns);
+    conns = account::phase_enriched_open_orders(conns);
+    conns = account::phase_enriched_positions(conns);
+    if needs_ticks {
+        conns = account::phase_enriched_exec_details(conns);
+    } else {
+        println!("--- Phase 133: Enriched exec_details ---\n  SKIP: {:?} — needs fills\n", session);
+    }
     conns = account::phase_pnl_subscription(conns);
     conns = account::phase_news_bulletins(conns);
 

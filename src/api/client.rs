@@ -477,11 +477,24 @@ impl EClient {
     pub fn req_positions(&self, wrapper: &mut impl Wrapper) {
         let positions = self.shared.position_infos();
         for pi in &positions {
-            let c = Contract { con_id: pi.con_id, ..Default::default() };
+            let c = self.shared.get_contract(pi.con_id)
+                .unwrap_or_else(|| Contract { con_id: pi.con_id, ..Default::default() });
             let avg_cost = pi.avg_cost as f64 / PRICE_SCALE_F;
             wrapper.position(&self.account_id, &c, pi.position as f64, avg_cost);
         }
         wrapper.position_end();
+    }
+
+    // ── Open Orders ──
+
+    /// Request all open orders. Matches `reqAllOpenOrders` / `reqOpenOrders` in C++.
+    pub fn req_all_open_orders(&self, wrapper: &mut impl Wrapper) {
+        for (order_id, info) in self.shared.drain_open_orders() {
+            if !matches!(info.order_state.status.as_str(), "Filled" | "Cancelled" | "Inactive") {
+                wrapper.open_order(order_id as i64, &info.contract, &info.order, &info.order_state);
+            }
+        }
+        wrapper.open_order_end();
     }
 
     // ── Completed Orders ──
@@ -496,13 +509,19 @@ impl EClient {
                 OrderStatus::Rejected => "Inactive",
                 _ => "Unknown",
             };
-            let contract = Contract::default();
-            let api_order = Order { order_id: order.order_id as i64, ..Default::default() };
-            let state = crate::api::types::OrderState {
-                status: status_str.into(),
-                ..Default::default()
-            };
-            wrapper.completed_order(&contract, &api_order, &state);
+            if let Some(info) = self.shared.get_order_info(order.order_id) {
+                let mut state = info.order_state;
+                state.status = status_str.into();
+                wrapper.completed_order(&info.contract, &info.order, &state);
+            } else {
+                let contract = Contract::default();
+                let api_order = Order { order_id: order.order_id as i64, ..Default::default() };
+                let state = crate::api::types::OrderState {
+                    status: status_str.into(),
+                    ..Default::default()
+                };
+                wrapper.completed_order(&contract, &api_order, &state);
+            }
         }
         wrapper.completed_orders_end();
     }
@@ -719,6 +738,15 @@ impl EClient {
     /// Drain all SharedState queues and dispatch to the Wrapper.
     /// Call this in a loop — it is the Rust equivalent of C++ `EReader::processMsgs()`.
     pub fn process_msgs(&self, wrapper: &mut impl Wrapper) {
+        // Open orders from enriched cache → open_order callbacks
+        for (order_id, info) in self.shared.drain_open_orders() {
+            let state = &info.order_state;
+            // Only deliver non-terminal orders as open_order
+            if !matches!(state.status.as_str(), "Filled" | "Cancelled" | "Inactive") {
+                wrapper.open_order(order_id as i64, &info.contract, &info.order, state);
+            }
+        }
+
         // Fills → order_status + exec_details
         for fill in self.shared.drain_fills() {
             let price_f = fill.price as f64 / PRICE_SCALE_F;
@@ -728,20 +756,29 @@ impl EClient {
                 price_f, 0, 0, price_f, 0, "", 0.0,
             );
 
-            // exec_details
+            // exec_details — use enriched contract + execution from cache
             let side_str = match fill.side {
                 Side::Buy => "BOT",
                 Side::Sell => "SLD",
                 Side::ShortSell => "SLD",
             };
-            let exec = Execution {
-                side: side_str.into(),
-                shares: fill.qty as f64,
-                price: price_f,
-                order_id: fill.order_id as i64,
-                ..Default::default()
+            let (c, exec) = if let Some(info) = self.shared.get_order_info(fill.order_id) {
+                let mut ex = info.last_exec;
+                // Override with fill-specific data
+                ex.side = side_str.into();
+                ex.shares = fill.qty as f64;
+                ex.price = price_f;
+                ex.order_id = fill.order_id as i64;
+                (info.contract, ex)
+            } else {
+                (Contract::default(), Execution {
+                    side: side_str.into(),
+                    shares: fill.qty as f64,
+                    price: price_f,
+                    order_id: fill.order_id as i64,
+                    ..Default::default()
+                })
             };
-            let c = Contract::default(); // minimal — conId not available from Fill
             let req_id = self.instrument_to_req.lock().unwrap()
                 .get(&fill.instrument).copied().unwrap_or(-1);
             wrapper.exec_details(req_id, &c, &exec);
