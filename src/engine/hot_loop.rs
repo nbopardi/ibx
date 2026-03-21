@@ -2528,7 +2528,7 @@ impl HotLoop {
             };
 
             // Fall back to context order for fields missing from FIX exec report
-            let (fb_action, fb_tif) = if let Some(ctx_order) = self.context.order(clord_id) {
+            let (fb_action, fb_tif, fb_ord_type) = if let Some(ctx_order) = self.context.order(clord_id) {
                 let a = match ctx_order.side {
                     crate::types::Side::Buy => "BUY",
                     crate::types::Side::Sell | crate::types::Side::ShortSell => "SELL",
@@ -2537,16 +2537,20 @@ impl HotLoop {
                     b'0' => "DAY", b'1' => "GTC", b'3' => "IOC", b'4' => "FOK",
                     b'7' => "OPG", b'6' => "GTD", _ => "",
                 };
-                (a, t)
+                let o = match ctx_order.ord_type {
+                    b'1' => "MKT", b'2' => "LMT", b'3' => "STP", b'4' => "STP LMT",
+                    b'P' => "TRAIL", _ => "",
+                };
+                (a, t, o)
             } else {
-                ("", "")
+                ("", "", "")
             };
 
             let order = api::Order {
                 order_id: clord_id as i64,
                 action: if action.is_empty() { fb_action.to_string() } else { action.to_string() },
                 total_quantity: total_qty,
-                order_type: order_type_str.to_string(),
+                order_type: if order_type_str.is_empty() { fb_ord_type.to_string() } else { order_type_str.to_string() },
                 lmt_price: limit_price,
                 aux_price: stop_px,
                 tif: if tif_str.is_empty() { fb_tif.to_string() } else { tif_str.to_string() },

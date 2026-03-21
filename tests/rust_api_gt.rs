@@ -76,6 +76,8 @@ enum Cb {
     NewsArticle { req_id: i64, article_type: i32 },
     AccountValue { key: String, value: String, currency: String, account: String },
     AccountDownloadEnd { account: String },
+    NewsBulletin { msg_id: i64, msg_type: i32, message: String },
+    PnlSingle { req_id: i64, pos: f64 },
 }
 
 #[derive(Clone, Debug)]
@@ -334,6 +336,12 @@ impl Wrapper for RecWrapper {
     }
     fn account_download_end(&mut self, account: &str) {
         self.push(Cb::AccountDownloadEnd { account: account.into() });
+    }
+    fn update_news_bulletin(&mut self, msg_id: i64, msg_type: i32, message: &str, _: &str) {
+        self.push(Cb::NewsBulletin { msg_id, msg_type, message: message.into() });
+    }
+    fn pnl_single(&mut self, req_id: i64, pos: f64, _: f64, _: f64, _: f64, _: f64) {
+        self.push(Cb::PnlSingle { req_id, pos });
     }
     fn market_rule(&mut self, id: i64, increments: &[PriceIncrement]) {
         self.push(Cb::MarketRule { id, count: increments.len() });
@@ -1001,8 +1009,102 @@ fn api_gt_suite() {
         }
     }
 
-    // ── Cleanup ──
-    client.disconnect();
+    // ── 20. News Bulletins (subscribe + cancel) ──
+    {
+        print!("  req_news_bulletins + cancel... ");
+        wrapper.drain();
+        client.req_news_bulletins(true);
+        poll(&client, &mut wrapper, Duration::from_secs(2));
+        let cbs_before = wrapper.drain();
+        let bulletins_before: Vec<_> = cbs_before.iter().filter(|c| matches!(c, Cb::NewsBulletin { .. })).collect();
+
+        client.cancel_news_bulletins();
+        poll(&client, &mut wrapper, Duration::from_secs(1));
+        let cbs_after = wrapper.drain();
+        let bulletins_after: Vec<_> = cbs_after.iter().filter(|c| matches!(c, Cb::NewsBulletin { .. })).collect();
+
+        // After cancel, no more bulletins should arrive
+        if bulletins_after.is_empty() {
+            println!("PASS (before={}, after_cancel=0)", bulletins_before.len());
+            pass_count += 1;
+        } else {
+            println!("FAIL ({} bulletins after cancel)", bulletins_after.len());
+            fail_count += 1;
+        }
+    }
+
+    // ── 21. PnL Single ──
+    {
+        print!("  req_pnl_single (SPY)... ");
+        wrapper.drain();
+        client.req_pnl_single(500, &client.account_id, "", 756733);
+        poll(&client, &mut wrapper, Duration::from_secs(3));
+        let cbs = wrapper.drain();
+        client.cancel_pnl_single(500);
+
+        let ps: Vec<_> = cbs.iter().filter_map(|c| if let Cb::PnlSingle { pos, .. } = c { Some(*pos) } else { None }).collect();
+
+        if ps.is_empty() {
+            println!("SKIP (no pnl_single — may need position in SPY)");
+            skip_count += 1;
+        } else {
+            println!("PASS (pos={})", ps[0]);
+            pass_count += 1;
+        }
+    }
+
+    // ── 22. Cancel methods (verify no crash) ──
+    {
+        print!("  cancel methods batch... ");
+        // Subscribe to scanner, verify data, cancel, verify no more data
+        wrapper.drain();
+        client.req_scanner_subscription(600, "STK", "STK.US.MAJOR", "TOP_PERC_GAIN", 5);
+        poll_until(&client, &mut wrapper,
+            |cbs| cbs.iter().any(|c| matches!(c, Cb::ScannerDataEnd { .. } | Cb::Error { .. })),
+            Duration::from_secs(15));
+        let cbs = wrapper.drain();
+        let scanner_got_data = cbs.iter().any(|c| matches!(c, Cb::ScannerDataEnd { .. }));
+        client.cancel_scanner_subscription(600);
+        // After cancel, polling should yield no more scanner data for this req_id
+        poll(&client, &mut wrapper, Duration::from_secs(1));
+        let after_cancel = wrapper.drain();
+        let scanner_after = after_cancel.iter().any(|c| matches!(c, Cb::ScannerData { req_id: 600, .. } | Cb::ScannerDataEnd { req_id: 600 }));
+
+        // Now fire all other cancel methods with unused req_ids — verify no crash
+        client.cancel_historical_data(999);
+        client.cancel_pnl(999);
+        client.cancel_pnl_single(999);
+        client.cancel_account_summary(999);
+        client.cancel_news_bulletins();
+        client.cancel_fundamental_data(999);
+        client.cancel_histogram_data(999);
+
+        if scanner_got_data && !scanner_after {
+            println!("PASS (scanner cancel verified, 7 other cancels ok)");
+            pass_count += 1;
+        } else if !scanner_got_data {
+            // Scanner didn't return data, but cancels still didn't crash
+            println!("PASS (scanner unavailable, 8 cancels ok)");
+            pass_count += 1;
+        } else {
+            println!("FAIL (scanner data after cancel)");
+            fail_count += 1;
+        }
+    }
+
+    // ── 23. Disconnect + verify ──
+    {
+        print!("  disconnect... ");
+        client.disconnect();
+        let still_connected = client.is_connected();
+        if !still_connected {
+            println!("PASS (is_connected=false)");
+            pass_count += 1;
+        } else {
+            println!("FAIL (is_connected still true)");
+            fail_count += 1;
+        }
+    }
 
     println!("\n=== Results: {} PASS, {} FAIL, {} SKIP ({:.1}s) ===",
         pass_count, fail_count, skip_count, suite_start.elapsed().as_secs_f64());
