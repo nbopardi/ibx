@@ -13,6 +13,8 @@ pub struct HistogramRequest {
     pub use_rth: bool,
     /// Time period, e.g. "1 week", "3 days", "1 month".
     pub period: String,
+    /// End time for the histogram query (HMDS requires 2 of startTime/endTime/timeLength).
+    pub end_time: String,
 }
 
 /// A single histogram entry (price level and count at that level).
@@ -26,8 +28,9 @@ pub struct HistogramEntry {
 pub fn build_histogram_request_xml(req: &HistogramRequest) -> String {
     let rth = if req.use_rth { "true" } else { "false" };
 
-    // Convert period: "1 week" → "1 W", "3 days" → "3 D"
-    let time_length = convert_period(&req.period);
+    // Convert period: "1 week" → "1 w", "3 days" → "3 d"
+    // HMDS requires lowercase duration units
+    let time_length = convert_period(&req.period).to_lowercase();
 
     let id = format!(
         "histogramQuery;;{}@BEST Histogram;;0;;{rth};;0;;U",
@@ -45,6 +48,7 @@ pub fn build_histogram_request_xml(req: &HistogramRequest) -> String {
          <secType>CS</secType>\
          <type>HistogramData</type>\
          <data>Last</data>\
+         <endTime>{end_time}</endTime>\
          <timeLength>{time_length}</timeLength>\
          <source>API</source>\
          <needTotalValue>false</needTotalValue>\
@@ -53,6 +57,7 @@ pub fn build_histogram_request_xml(req: &HistogramRequest) -> String {
          </Query>\
          </ListOfQueries>",
         con_id = req.con_id,
+        end_time = req.end_time,
     )
 }
 
@@ -82,8 +87,7 @@ fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 /// The response contains `<Tick>` elements with `<price>` and `<size>` children
 /// inside an `<Events>` block.
 pub fn parse_histogram_response(xml: &str) -> Option<Vec<HistogramEntry>> {
-    // Histogram responses may use various root tags; just look for Tick elements
-    if !xml.contains("<Tick>") {
+    if !xml.contains("<ResultSetHistogram>") {
         return None;
     }
 
@@ -112,22 +116,26 @@ pub fn parse_histogram_response(xml: &str) -> Option<Vec<HistogramEntry>> {
     Some(entries)
 }
 
-/// Convert human-readable period to query time length format.
-/// "1 week" → "1 W", "3 days" → "3 D", "2 months" → "2 M"
+/// Convert human-readable period to HMDS timeLength format.
+/// HMDS accepts: S (seconds), D (days), M (months), Y (years) — NOT W (weeks).
+/// Weeks are converted to days: "1 week" → "7 D", "2 weeks" → "14 D".
 fn convert_period(period: &str) -> String {
     let parts: Vec<&str> = period.trim().split_whitespace().collect();
     if parts.len() != 2 {
         return period.to_string();
     }
-    let unit = match parts[1].to_lowercase().as_str() {
-        "second" | "seconds" | "secs" | "sec" | "s" => "S",
-        "day" | "days" | "d" => "D",
-        "week" | "weeks" | "w" => "W",
-        "month" | "months" | "m" => "M",
-        "year" | "years" | "y" => "Y",
-        _ => return period.to_string(),
+    let num: u32 = match parts[0].parse() {
+        Ok(n) => n,
+        Err(_) => return period.to_string(),
     };
-    format!("{} {}", parts[0], unit)
+    match parts[1].to_lowercase().as_str() {
+        "second" | "seconds" | "secs" | "sec" | "s" => format!("{} S", num),
+        "day" | "days" | "d" => format!("{} D", num),
+        "week" | "weeks" | "w" => format!("{} D", num * 7),
+        "month" | "months" | "m" => format!("{} M", num),
+        "year" | "years" | "y" => format!("{} Y", num),
+        _ => period.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -136,7 +144,8 @@ mod tests {
 
     #[test]
     fn convert_period_variants() {
-        assert_eq!(convert_period("1 week"), "1 W");
+        assert_eq!(convert_period("1 week"), "7 D");
+        assert_eq!(convert_period("2 weeks"), "14 D");
         assert_eq!(convert_period("3 days"), "3 D");
         assert_eq!(convert_period("2 months"), "2 M");
         assert_eq!(convert_period("1 year"), "1 Y");
@@ -151,18 +160,18 @@ mod tests {
             con_id: 265598,
             use_rth: true,
             period: "1 week".to_string(),
+            end_time: "20260320-21:00:00".to_string(),
         };
         let xml = build_histogram_request_xml(&req);
         assert!(xml.contains("<type>HistogramData</type>"));
         assert!(xml.contains("<contractID>265598</contractID>"));
         assert!(xml.contains("<useRTH>true</useRTH>"));
-        assert!(xml.contains("<timeLength>1 W</timeLength>"));
+        assert!(xml.contains("<timeLength>7 d</timeLength>"));
         assert!(xml.contains("<data>Last</data>"));
         assert!(xml.contains("<exchange>BEST</exchange>"));
+        assert!(xml.contains("<endTime>20260320-21:00:00</endTime>"));
         // No <step> tag
         assert!(!xml.contains("<step>"));
-        // No <endTime> tag
-        assert!(!xml.contains("<endTime>"));
     }
 
     #[test]
@@ -171,10 +180,11 @@ mod tests {
             con_id: 100,
             use_rth: false,
             period: "3 days".to_string(),
+            end_time: "20260320-21:00:00".to_string(),
         };
         let xml = build_histogram_request_xml(&req);
         assert!(xml.contains("<useRTH>false</useRTH>"));
-        assert!(xml.contains("<timeLength>3 D</timeLength>"));
+        assert!(xml.contains("<timeLength>3 d</timeLength>"));
     }
 
     #[test]
@@ -183,6 +193,7 @@ mod tests {
             con_id: 265598,
             use_rth: true,
             period: "1 week".to_string(),
+            end_time: "20260320-21:00:00".to_string(),
         };
         let msg = build_histogram_fix_request(&req, 1);
         let tags = fix::fix_parse(&msg);
@@ -219,8 +230,9 @@ mod tests {
             <eoq>true</eoq>
             <Events></Events>
         </ResultSetHistogram>"#;
-        // No <Tick> elements → returns None
-        assert!(parse_histogram_response(xml).is_none());
+        // Valid histogram response with no data → empty vec
+        let entries = parse_histogram_response(xml).unwrap();
+        assert!(entries.is_empty());
     }
 
     #[test]

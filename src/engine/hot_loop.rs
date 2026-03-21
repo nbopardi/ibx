@@ -3607,6 +3607,9 @@ impl HotLoop {
                             log::info!("HMDS TBT ticker_id assigned: {}", ticker_id_str);
                         }
                     }
+                    else {
+                        log::debug!("HMDS unmatched W response (len={}): {:?}", xml_tag.len(), xml_tag);
+                    }
                 }
             }
             "U" => {
@@ -4293,6 +4296,7 @@ impl HotLoop {
             con_id,
             use_rth,
             period: period.to_string(),
+            end_time: chrono_free_timestamp(),
         };
         let xml = crate::control::histogram::build_histogram_request_xml(&req);
         let query_id = format!("hg_{}", self.next_hmds_query_id);
@@ -4359,9 +4363,17 @@ impl HotLoop {
     fn send_schedule_request(&mut self, req_id: u32, con_id: i64, end_date_time: &str, duration: &str, use_rth: bool) {
         let qid = self.next_hmds_query_id;
         self.next_hmds_query_id += 1;
+        // HMDS requires lowercase duration units
+        let duration = duration.to_lowercase();
+        // Default to "now" if empty (same pattern as historical bars)
+        let end_date_time = if end_date_time.is_empty() {
+            chrono_free_timestamp()
+        } else {
+            end_date_time.to_string()
+        };
 
         let query_id = format!("sched_{}", qid);
-        let xml = crate::control::historical::build_schedule_xml(&query_id, con_id, end_date_time, duration, use_rth);
+        let xml = crate::control::historical::build_schedule_xml(&query_id, con_id, &end_date_time, &duration, use_rth);
 
         if let Some(conn) = self.hmds_conn.as_mut() {
             let ts = chrono_free_timestamp();

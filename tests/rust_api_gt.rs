@@ -68,6 +68,12 @@ enum Cb {
     ScannerParameters,
     HistoricalSchedule { req_id: i64, tz: String },
     MarketRule { id: i64, count: usize },
+    ScannerData { req_id: i64, rank: i32, contract: ContractSnapshot },
+    ScannerDataEnd { req_id: i64 },
+    FundamentalData { req_id: i64, has_data: bool },
+    HistoricalNews { req_id: i64, provider_code: String, article_id: String, headline: String },
+    HistoricalNewsEnd { req_id: i64, has_more: bool },
+    NewsArticle { req_id: i64, article_type: i32 },
 }
 
 #[derive(Clone, Debug)]
@@ -303,6 +309,24 @@ impl Wrapper for RecWrapper {
     fn historical_schedule(&mut self, req_id: i64, _: &str, _: &str, tz: &str, _: &[(String, String, String)]) {
         self.push(Cb::HistoricalSchedule { req_id, tz: tz.into() });
     }
+    fn scanner_data(&mut self, req_id: i64, rank: i32, details: &ContractDetails, _: &str, _: &str, _: &str, _: &str) {
+        self.push(Cb::ScannerData { req_id, rank, contract: snap_contract(&details.contract) });
+    }
+    fn scanner_data_end(&mut self, req_id: i64) {
+        self.push(Cb::ScannerDataEnd { req_id });
+    }
+    fn fundamental_data(&mut self, req_id: i64, data: &str) {
+        self.push(Cb::FundamentalData { req_id, has_data: !data.is_empty() });
+    }
+    fn historical_news(&mut self, req_id: i64, _: &str, provider_code: &str, article_id: &str, headline: &str) {
+        self.push(Cb::HistoricalNews { req_id, provider_code: provider_code.into(), article_id: article_id.into(), headline: headline.into() });
+    }
+    fn historical_news_end(&mut self, req_id: i64, has_more: bool) {
+        self.push(Cb::HistoricalNewsEnd { req_id, has_more });
+    }
+    fn news_article(&mut self, req_id: i64, article_type: i32, _: &str) {
+        self.push(Cb::NewsArticle { req_id, article_type });
+    }
     fn market_rule(&mut self, id: i64, increments: &[PriceIncrement]) {
         self.push(Cb::MarketRule { id, count: increments.len() });
     }
@@ -325,6 +349,11 @@ fn get_config() -> Option<EClientConfig> {
 
 fn spy() -> Contract {
     Contract { con_id: 756733, symbol: "SPY".into(), sec_type: "STK".into(),
+               exchange: "SMART".into(), currency: "USD".into(), ..Default::default() }
+}
+
+fn aapl() -> Contract {
+    Contract { con_id: 265598, symbol: "AAPL".into(), sec_type: "STK".into(),
                exchange: "SMART".into(), currency: "USD".into(), ..Default::default() }
 }
 
@@ -729,6 +758,194 @@ fn api_gt_suite() {
         } else {
             println!("PASS ({} ticks)", ticks.len());
             pass_count += 1;
+        }
+    }
+
+    // ── 11. Historical Ticks (GT) ──
+    {
+        print!("  req_historical_ticks (SPY TRADES)... ");
+        wrapper.drain();
+        client.req_historical_ticks(440, &spy(), "20260320 09:30:00", "", 1000, "TRADES", true);
+        poll_until(&client, &mut wrapper,
+            |cbs| cbs.iter().any(|c| matches!(c, Cb::HistoricalTicks { done: true, .. })),
+            Duration::from_secs(15));
+        let cbs = wrapper.drain();
+
+        let ht: Vec<_> = cbs.iter().filter_map(|c| if let Cb::HistoricalTicks { done, .. } = c { Some(*done) } else { None }).collect();
+
+        if ht.is_empty() {
+            println!("SKIP (no historicalTicks — HMDS connection may be down)");
+            skip_count += 1;
+        } else {
+            let gt = load_gt("32_reqHistoricalTicks.json");
+            let gt_count = gt["responses"][0]["args"]["ticks"].as_array().map(|a| a.len()).unwrap_or(0);
+            let gt_done = gt["responses"][0]["args"]["done"].as_bool().unwrap_or(false);
+            if ht[0] && gt_done {
+                println!("PASS (done=true, GT had {} ticks)", gt_count);
+                pass_count += 1;
+            } else {
+                println!("FAIL (done={} vs GT done={})", ht[0], gt_done);
+                fail_count += 1;
+            }
+        }
+    }
+
+    // ── 12. Scanner Parameters (GT) ──
+    {
+        print!("  req_scanner_parameters... ");
+        wrapper.drain();
+        client.req_scanner_parameters();
+        poll_until(&client, &mut wrapper,
+            |cbs| cbs.iter().any(|c| matches!(c, Cb::ScannerParameters)),
+            Duration::from_secs(15));
+        let cbs = wrapper.drain();
+
+        if cbs.iter().any(|c| matches!(c, Cb::ScannerParameters)) {
+            println!("PASS (XML received)");
+            pass_count += 1;
+        } else {
+            println!("FAIL (no scannerParameters callback)");
+            fail_count += 1;
+        }
+    }
+
+    // ── 13. Historical Schedule ──
+    {
+        print!("  req_historical_schedule (SPY 1 M)... ");
+        wrapper.drain();
+        client.req_historical_schedule(450, &spy(), "", "1 M", true);
+        poll_until(&client, &mut wrapper,
+            |cbs| cbs.iter().any(|c| matches!(c, Cb::HistoricalSchedule { .. })),
+            Duration::from_secs(15));
+        let cbs = wrapper.drain();
+
+        let hs: Vec<_> = cbs.iter().filter_map(|c| if let Cb::HistoricalSchedule { tz, .. } = c { Some(tz.clone()) } else { None }).collect();
+
+        if hs.is_empty() {
+            println!("SKIP (no historicalSchedule — HMDS connection may be down)");
+            skip_count += 1;
+        } else if hs[0].is_empty() {
+            println!("FAIL (timezone empty)");
+            fail_count += 1;
+        } else {
+            println!("PASS (tz={})", hs[0]);
+            pass_count += 1;
+        }
+    }
+
+    // ── 14. Scanner Subscription ──
+    {
+        print!("  req_scanner_subscription (TOP_PERC_GAIN)... ");
+        wrapper.drain();
+        client.req_scanner_subscription(460, "STK", "STK.US.MAJOR", "TOP_PERC_GAIN", 10);
+        poll_until(&client, &mut wrapper,
+            |cbs| cbs.iter().any(|c| matches!(c, Cb::ScannerDataEnd { .. } | Cb::Error { .. })),
+            Duration::from_secs(20));
+        let cbs = wrapper.drain();
+        client.cancel_scanner_subscription(460);
+
+        let sd: Vec<_> = cbs.iter().filter(|c| matches!(c, Cb::ScannerData { .. })).collect();
+        let has_end = cbs.iter().any(|c| matches!(c, Cb::ScannerDataEnd { .. }));
+        let errors: Vec<_> = cbs.iter().filter_map(|c| if let Cb::Error { msg, .. } = c { Some(msg.clone()) } else { None }).collect();
+
+        if has_end {
+            println!("PASS ({} results)", sd.len());
+            pass_count += 1;
+        } else if !errors.is_empty() {
+            println!("SKIP (error: {})", errors[0]);
+            skip_count += 1;
+        } else {
+            println!("SKIP (no scannerDataEnd — scanner may be unavailable)");
+            skip_count += 1;
+        }
+    }
+
+    // ── 15. Fundamental Data ──
+    {
+        print!("  req_fundamental_data (AAPL ReportSnapshot)... ");
+        wrapper.drain();
+        client.req_fundamental_data(470, &aapl(), "ReportSnapshot");
+        poll_until(&client, &mut wrapper,
+            |cbs| cbs.iter().any(|c| matches!(c, Cb::FundamentalData { .. } | Cb::Error { .. })),
+            Duration::from_secs(15));
+        let cbs = wrapper.drain();
+
+        let fd: Vec<_> = cbs.iter().filter_map(|c| if let Cb::FundamentalData { has_data, .. } = c { Some(*has_data) } else { None }).collect();
+        let errors: Vec<_> = cbs.iter().filter_map(|c| if let Cb::Error { msg, .. } = c { Some(msg.clone()) } else { None }).collect();
+
+        if !fd.is_empty() {
+            if fd[0] { println!("PASS (data received)"); pass_count += 1; }
+            else { println!("FAIL (empty data)"); fail_count += 1; }
+        } else if !errors.is_empty() {
+            println!("SKIP (error: {})", errors[0]);
+            skip_count += 1;
+        } else {
+            println!("FAIL (no response)");
+            fail_count += 1;
+        }
+    }
+
+    // ── 16. Historical News ──
+    let mut news_article_info: Option<(String, String)> = None;
+    {
+        print!("  req_historical_news (AAPL)... ");
+        wrapper.drain();
+        client.req_historical_news(480, 265598, "BRFG+DJNL+BRFUPDN+BZ+FLY", "", "", 5);
+        poll_until(&client, &mut wrapper,
+            |cbs| cbs.iter().any(|c| matches!(c, Cb::HistoricalNewsEnd { .. } | Cb::Error { .. })),
+            Duration::from_secs(15));
+        let cbs = wrapper.drain();
+
+        let news: Vec<_> = cbs.iter().filter_map(|c| if let Cb::HistoricalNews { provider_code, article_id, headline, .. } = c {
+            Some((provider_code.clone(), article_id.clone(), headline.clone()))
+        } else { None }).collect();
+        let has_end = cbs.iter().any(|c| matches!(c, Cb::HistoricalNewsEnd { .. }));
+        let errors: Vec<_> = cbs.iter().filter_map(|c| if let Cb::Error { msg, .. } = c { Some(msg.clone()) } else { None }).collect();
+
+        if has_end {
+            if news.is_empty() {
+                println!("PASS (0 articles, end marker received)");
+            } else {
+                println!("PASS ({} articles)", news.len());
+                news_article_info = Some((news[0].0.clone(), news[0].1.clone()));
+            }
+            pass_count += 1;
+        } else if !errors.is_empty() {
+            println!("SKIP (error: {})", errors[0]);
+            skip_count += 1;
+        } else {
+            println!("FAIL (no historicalNewsEnd)");
+            fail_count += 1;
+        }
+    }
+
+    // ── 17. News Article ──
+    {
+        if let Some((ref provider, ref article_id)) = news_article_info {
+            print!("  req_news_article ({}/{})... ", provider, article_id);
+            wrapper.drain();
+            client.req_news_article(490, provider, article_id);
+            poll_until(&client, &mut wrapper,
+                |cbs| cbs.iter().any(|c| matches!(c, Cb::NewsArticle { .. } | Cb::Error { .. })),
+                Duration::from_secs(15));
+            let cbs = wrapper.drain();
+
+            let na: Vec<_> = cbs.iter().filter_map(|c| if let Cb::NewsArticle { article_type, .. } = c { Some(*article_type) } else { None }).collect();
+            let errors: Vec<_> = cbs.iter().filter_map(|c| if let Cb::Error { msg, .. } = c { Some(msg.clone()) } else { None }).collect();
+
+            if !na.is_empty() {
+                println!("PASS (type={})", na[0]);
+                pass_count += 1;
+            } else if !errors.is_empty() {
+                println!("SKIP (error: {})", errors[0]);
+                skip_count += 1;
+            } else {
+                println!("FAIL (no newsArticle response)");
+                fail_count += 1;
+            }
+        } else {
+            println!("  req_news_article... SKIP (no article_id from historical_news)");
+            skip_count += 1;
         }
     }
 
