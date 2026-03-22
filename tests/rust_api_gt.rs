@@ -48,7 +48,7 @@ enum Cb {
     SymbolSamples { req_id: i64, descriptions: Vec<ContractDescSnapshot> },
     TickPrice { req_id: i64, tick_type: i32, price: f64 },
     TickSize { req_id: i64, tick_type: i32, size: f64 },
-    OrderStatus { order_id: i64, status: String, filled: f64, remaining: f64 },
+    OrderStatus { order_id: i64, status: String, filled: f64, remaining: f64, why_held: String },
     OpenOrder { order_id: i64, contract: ContractSnapshot, order: OrderSnapshot, state: OrderStateSnapshot },
     OpenOrderEnd,
     CompletedOrder { contract: ContractSnapshot, order: OrderSnapshot, state: OrderStateSnapshot },
@@ -200,9 +200,9 @@ impl Wrapper for RecWrapper {
     }
     fn order_status(
         &mut self, order_id: i64, status: &str, filled: f64, remaining: f64,
-        _: f64, _: i64, _: i64, _: f64, _: i64, _: &str, _: f64,
+        _: f64, _: i64, _: i64, _: f64, _: i64, why_held: &str, _: f64,
     ) {
-        self.push(Cb::OrderStatus { order_id, status: status.into(), filled, remaining });
+        self.push(Cb::OrderStatus { order_id, status: status.into(), filled, remaining, why_held: why_held.into() });
     }
     fn open_order(&mut self, order_id: i64, contract: &ibx::api::types::Contract, order: &ibx::api::types::Order, state: &OrderState) {
         self.push(Cb::OpenOrder {
@@ -1126,7 +1126,154 @@ fn api_gt_suite() {
         }
     }
 
-    // ── 24. Disconnect + verify ──
+    // ── 24. reqGlobalCancel ──
+    {
+        print!("  req_global_cancel... ");
+        wrapper.drain();
+
+        // Ensure secdef cache is populated for SPY
+        client.req_contract_details(9998, &spy());
+        poll_until(&client, &mut wrapper, |cbs| cbs.iter().any(|c| matches!(c, Cb::ContractDetailsEnd { .. })), Duration::from_secs(10));
+        wrapper.drain();
+
+        // Place a GTC limit order far from market
+        let oid = client.next_order_id();
+        let order = Order {
+            action: "BUY".into(),
+            total_quantity: 1.0,
+            order_type: "LMT".into(),
+            lmt_price: 1.0,
+            tif: "GTC".into(),
+            outside_rth: true,
+            ..Default::default()
+        };
+        client.place_order(oid, &spy(), &order).expect("place_order failed");
+
+        // Wait for Submitted
+        poll_until(&client, &mut wrapper, |cbs| {
+            cbs.iter().any(|c| matches!(c, Cb::OrderStatus { status, .. } if status == "Submitted"))
+        }, Duration::from_secs(15));
+        wrapper.drain();
+
+        // Global cancel
+        client.req_global_cancel();
+
+        // Wait for Cancelled
+        poll_until(&client, &mut wrapper, |cbs| {
+            cbs.iter().any(|c| matches!(c, Cb::OrderStatus { status, .. } if status == "Cancelled" || status == "Inactive"))
+        }, Duration::from_secs(15));
+        let cbs = wrapper.drain();
+
+        let cancelled = cbs.iter().any(|c| matches!(c, Cb::OrderStatus { status, .. } if status == "Cancelled" || status == "Inactive"));
+        if cancelled {
+            println!("PASS (order cancelled via global cancel)");
+            pass_count += 1;
+        } else {
+            println!("FAIL (order not cancelled)");
+            fail_count += 1;
+        }
+    }
+
+    // ── 25. What-if preview ──
+    {
+        print!("  place_order (what-if)... ");
+        wrapper.drain();
+
+        let oid = client.next_order_id();
+        let order = Order {
+            action: "BUY".into(),
+            total_quantity: 100.0,
+            order_type: "LMT".into(),
+            lmt_price: 150.0,
+            what_if: true,
+            ..Default::default()
+        };
+        client.place_order(oid, &spy(), &order).expect("place_order what-if failed");
+
+        // What-if response arrives as OrderStatus with "PreSubmitted" and margin info in why_held
+        poll_until(&client, &mut wrapper, |cbs| {
+            cbs.iter().any(|c| matches!(c, Cb::OrderStatus { status, .. } if status == "PreSubmitted"))
+        }, Duration::from_secs(15));
+        let cbs = wrapper.drain();
+
+        let whatif: Vec<_> = cbs.iter().filter_map(|c| {
+            if let Cb::OrderStatus { status, why_held, .. } = c {
+                if status == "PreSubmitted" && why_held.contains("WhatIf") { Some(why_held.clone()) }
+                else { None }
+            } else { None }
+        }).collect();
+
+        if whatif.is_empty() {
+            println!("SKIP (no what-if response — server may not support)");
+            skip_count += 1;
+        } else {
+            // Verify margin data is present
+            let has_init = whatif[0].contains("initMargin=");
+            let has_maint = whatif[0].contains("maintMargin=");
+            let has_comm = whatif[0].contains("commission=");
+            if has_init && has_maint && has_comm {
+                println!("PASS ({})", whatif[0]);
+                pass_count += 1;
+            } else {
+                println!("FAIL (missing margin fields: {})", whatif[0]);
+                fail_count += 1;
+            }
+        }
+    }
+
+    // ── 26. Adaptive order ──
+    {
+        print!("  place_order (adaptive LMT GTC)... ");
+        wrapper.drain();
+
+        let oid = client.next_order_id();
+        let order = Order {
+            action: "BUY".into(),
+            total_quantity: 1.0,
+            order_type: "LMT".into(),
+            lmt_price: 1.0,
+            tif: "GTC".into(),
+            outside_rth: true,
+            algo_strategy: "Adaptive".into(),
+            algo_params: vec![TagValue { tag: "adaptivePriority".into(), value: "Normal".into() }],
+            ..Default::default()
+        };
+        client.place_order(oid, &spy(), &order).expect("place_order adaptive failed");
+
+        // Wait for Submitted or PreSubmitted
+        poll_until(&client, &mut wrapper, |cbs| {
+            cbs.iter().any(|c| matches!(c, Cb::OrderStatus { status, .. }
+                if status == "Submitted" || status == "PreSubmitted"))
+        }, Duration::from_secs(15));
+
+        let cbs = wrapper.drain();
+        let accepted = cbs.iter().any(|c| matches!(c, Cb::OrderStatus { status, .. }
+            if status == "Submitted" || status == "PreSubmitted"));
+
+        // Cancel the adaptive order
+        client.cancel_order(oid, "");
+        poll_until(&client, &mut wrapper, |cbs| {
+            cbs.iter().any(|c| matches!(c, Cb::OrderStatus { status, .. } if status == "Cancelled" || status == "Inactive"))
+        }, Duration::from_secs(15));
+        wrapper.drain();
+
+        if accepted {
+            println!("PASS (adaptive order accepted + cancelled)");
+            pass_count += 1;
+        } else {
+            // Check for errors
+            let errors: Vec<_> = cbs.iter().filter_map(|c| if let Cb::Error { msg, .. } = c { Some(msg.clone()) } else { None }).collect();
+            if !errors.is_empty() {
+                println!("SKIP (error: {})", errors[0]);
+                skip_count += 1;
+            } else {
+                println!("FAIL (no order_status received)");
+                fail_count += 1;
+            }
+        }
+    }
+
+    // ── 27. Disconnect + verify ──
     {
         print!("  disconnect... ");
         client.disconnect();

@@ -1503,7 +1503,7 @@ impl EClient {
                 self.executions.lock().unwrap().push(StoredExecution {
                     req_id,
                     contract: exec_contract,
-                    exec_id,
+                    exec_id: exec_id.clone(),
                     side: side_str.to_string(),
                     price,
                     shares: fill.qty as f64,
@@ -1525,7 +1525,17 @@ impl EClient {
                     }
                 }
 
-                let _ = commission;
+                // Dispatch commission_report
+                let report = super::contract::CommissionReport {
+                    exec_id,
+                    commission,
+                    currency: "USD".to_string(),
+                    realized_pnl: f64::MAX,
+                    yield_amount: f64::MAX,
+                    yield_redemption_date: String::new(),
+                };
+                let report_py = Py::new(py, report)?.into_any();
+                self.wrapper.call_method1(py, "commission_report", (&report_py,))?;
             }
 
             // Drain order updates -> orderStatus
@@ -2087,6 +2097,9 @@ impl EClient {
             py.allow_threads(|| std::thread::sleep(std::time::Duration::from_millis(1)));
         }
 
+        // Signal disconnection to wrapper
+        self.wrapper.call_method0(py, "connection_closed")?;
+
         Ok(())
     }
 
@@ -2403,6 +2416,19 @@ impl EClient {
                     so.remaining = fill.remaining as f64;
                 }
             }
+
+            // Dispatch commission_report
+            let commission = fill.commission as f64 / PRICE_SCALE_F;
+            let report = super::contract::CommissionReport {
+                exec_id: exec_id.clone(),
+                commission,
+                currency: "USD".to_string(),
+                realized_pnl: f64::MAX,
+                yield_amount: f64::MAX,
+                yield_redemption_date: String::new(),
+            };
+            let report_py = Py::new(py, report)?.into_any();
+            self.wrapper.call_method1(py, "commission_report", (&report_py,))?;
         }
 
         // Drain order updates -> order_status

@@ -2002,6 +2002,33 @@ impl ContractDetails {
     }
 }
 
+// ── CommissionReport ──
+
+/// ibapi-compatible CommissionReport class.
+#[pyclass]
+#[derive(Clone, Debug, Default)]
+pub struct CommissionReport {
+    #[pyo3(get, set)]
+    pub exec_id: String,
+    #[pyo3(get, set)]
+    pub commission: f64,
+    #[pyo3(get, set)]
+    pub currency: String,
+    #[pyo3(get, set)]
+    pub realized_pnl: f64,
+    #[pyo3(get, set)]
+    pub yield_amount: f64,
+    #[pyo3(get, set)]
+    pub yield_redemption_date: String,
+}
+
+#[pymethods]
+impl CommissionReport {
+    #[new]
+    #[pyo3(signature = ())]
+    fn new() -> Self { Self::default() }
+}
+
 // ── ContractDescription ──
 
 /// ibapi-compatible ContractDescription class for symbol search results.
@@ -2051,6 +2078,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BarData>()?;
     m.add_class::<ContractDetails>()?;
     m.add_class::<ContractDescription>()?;
+    m.add_class::<CommissionReport>()?;
     Ok(())
 }
 

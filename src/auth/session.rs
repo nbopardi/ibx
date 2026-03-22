@@ -115,10 +115,10 @@ pub fn recv_secure<R: Read>(
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid msg type"))?;
 
-    if msg_type == NS_SECURE_ERROR {
+    if msg_type == NS_SECURE_ERROR || msg_type == ns::NS_ERROR_RESPONSE {
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("Secure error: {}", parts[2..].join(";")),
+            format!("Auth error: {}", parts[2..].join(";")),
         ));
     }
     if msg_type == NS_REDIRECT {
@@ -684,7 +684,17 @@ mod tests {
         let mut cursor = io::Cursor::new(frame);
         let mut channel = SecureChannel::new();
         let err = recv_secure(&mut cursor, &mut channel).unwrap_err();
-        assert!(err.to_string().contains("Secure error"));
+        assert!(err.to_string().contains("Auth error"));
+    }
+
+    #[test]
+    fn recv_ns_error_response_519() {
+        let frame = build_ns_frame("50;519;1;malformed user name;");
+        let mut cursor = io::Cursor::new(frame);
+        let mut channel = SecureChannel::new();
+        let err = recv_secure(&mut cursor, &mut channel).unwrap_err();
+        assert!(err.to_string().contains("Auth error"));
+        assert!(err.to_string().contains("malformed user name"));
     }
 
     #[test]
