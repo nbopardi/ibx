@@ -258,6 +258,8 @@ impl EClient {
             req_id: req_id as u32,
             con_id: contract.con_id,
             symbol: contract.symbol.clone(),
+            exchange: contract.exchange.clone(),
+            sec_type: contract.sec_type.clone(),
             end_date_time: end_date_time.into(),
             duration: duration.into(),
             bar_size: bar_size.into(),
@@ -294,6 +296,7 @@ impl EClient {
             sec_type: contract.sec_type.clone(),
             exchange: contract.exchange.clone(),
             currency: contract.currency.clone(),
+            maturity: contract.last_trade_date_or_contract_month.clone(),
         });
     }
 

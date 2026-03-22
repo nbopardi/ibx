@@ -929,6 +929,8 @@ pub enum ControlCommand {
         req_id: u32,
         con_id: i64,
         symbol: String,
+        exchange: String,
+        sec_type: String,
         end_date_time: String,
         duration: String,
         bar_size: String,
@@ -952,6 +954,7 @@ pub enum ControlCommand {
         sec_type: String,
         exchange: String,
         currency: String,
+        maturity: String,
     },
     /// Cancel a head timestamp request.
     CancelHeadTimestamp { req_id: u32 },
