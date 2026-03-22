@@ -72,6 +72,8 @@ pub struct EClient {
     last_quotes: Mutex<HashMap<u32, [i64; 12]>>,
     /// Snapshot req_ids — deliver first ticks then auto-cancel.
     snapshot_reqs: Mutex<HashSet<i64>>,
+    /// Req_ids that have already received a market_data_type callback.
+    mdt_sent: Mutex<HashSet<i64>>,
     /// P&L subscription reqId (None = not subscribed).
     pnl_req_id: Mutex<Option<i64>>,
     /// Single-position P&L subscriptions: reqId → conId.
@@ -115,6 +117,7 @@ impl EClient {
             instrument_to_req: Mutex::new(HashMap::new()),
             last_quotes: Mutex::new(HashMap::new()),
             snapshot_reqs: Mutex::new(HashSet::new()),
+            mdt_sent: Mutex::new(HashSet::new()),
             pnl_req_id: Mutex::new(None),
             pnl_single_reqs: Mutex::new(HashMap::new()),
             account_summary_req: Mutex::new(None),
@@ -268,6 +271,7 @@ impl EClient {
         if let Some(instrument) = self.req_to_instrument.lock().unwrap().remove(&req_id) {
             self.instrument_to_req.lock().unwrap().remove(&instrument);
             self.last_quotes.lock().unwrap().remove(&instrument);
+            self.mdt_sent.lock().unwrap().remove(&req_id);
             let tx = self.control_tx.get()
                 .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
             tx.send(ControlCommand::Unsubscribe { instrument })
@@ -1616,6 +1620,13 @@ impl EClient {
                 let attrib = TickAttrib::default();
                 let attrib_obj = Py::new(py, attrib)?.into_any();
 
+                // Fire market_data_type once per subscription on first tick delivery
+                let any_data = fields.iter().any(|&f| f != 0);
+                if any_data && self.mdt_sent.lock().unwrap().insert(req_id) {
+                    let mdt = self.market_data_type.load(Ordering::Relaxed);
+                    self.wrapper.call_method1(py, "market_data_type", (req_id, mdt))?;
+                }
+
                 if fields[0] != last[0] {
                     self.wrapper.call_method1(py, "tick_price", (req_id, TICK_BID, fields[0] as f64 / PRICE_SCALE_F, &attrib_obj))?;
                 }
@@ -1648,6 +1659,12 @@ impl EClient {
                 }
                 if fields[10] != last[10] {
                     self.wrapper.call_method1(py, "tick_price", (req_id, TICK_OPEN, fields[10] as f64 / PRICE_SCALE_F, &attrib_obj))?;
+                }
+                // tick_string: LAST_TIMESTAMP as epoch seconds
+                if fields[11] != last[11] && fields[11] != 0 {
+                    let ts_secs = fields[11] / 1_000_000_000;
+                    let ts_str = ts_secs.to_string();
+                    self.wrapper.call_method1(py, "tick_string", (req_id, TICK_LAST_TIMESTAMP, ts_str.as_str()))?;
                 }
 
                 // Update last quotes
@@ -2482,6 +2499,13 @@ impl EClient {
             let attrib = TickAttrib::default();
             let attrib_obj = Py::new(py, attrib)?.into_any();
 
+            // Fire market_data_type once per subscription on first tick delivery
+            let any_data = fields.iter().any(|&f| f != 0);
+            if any_data && self.mdt_sent.lock().unwrap().insert(req_id) {
+                let mdt = self.market_data_type.load(Ordering::Relaxed);
+                self.wrapper.call_method1(py, "market_data_type", (req_id, mdt))?;
+            }
+
             let mut delivered = false;
             if fields[0] != last[0] {
                 self.wrapper.call_method1(py, "tick_price", (req_id, TICK_BID, fields[0] as f64 / PRICE_SCALE_F, &attrib_obj))?;
@@ -2526,6 +2550,12 @@ impl EClient {
             if fields[10] != last[10] {
                 self.wrapper.call_method1(py, "tick_price", (req_id, TICK_OPEN, fields[10] as f64 / PRICE_SCALE_F, &attrib_obj))?;
                 delivered = true;
+            }
+            // tick_string: LAST_TIMESTAMP as epoch seconds
+            if fields[11] != last[11] && fields[11] != 0 {
+                let ts_secs = fields[11] / 1_000_000_000;
+                let ts_str = ts_secs.to_string();
+                self.wrapper.call_method1(py, "tick_string", (req_id, TICK_LAST_TIMESTAMP, ts_str.as_str()))?;
             }
             self.last_quotes.lock().unwrap().insert(iid, fields);
 
