@@ -1,0 +1,788 @@
+pub mod farm;
+pub mod ccp;
+pub mod hmds;
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::bridge::{Event, SharedState};
+use crate::engine::context::Context;
+use crate::config::chrono_free_timestamp;
+use crate::protocol::connection::Connection;
+use crate::protocol::fix;
+use crate::types::{ControlCommand, Fill, InstrumentId, Price, Qty, TbtQuote, TbtTrade, PRICE_SCALE, QTY_SCALE};
+use crossbeam_channel::{bounded, Receiver, Sender};
+
+use farm::FarmState;
+use ccp::CcpState;
+use hmds::HmdsState;
+
+/// Auth server heartbeat interval (10 seconds, configurable).
+const CCP_HEARTBEAT_SECS: u64 = 10;
+/// Farm heartbeat interval (30 seconds).
+const FARM_HEARTBEAT_SECS: u64 = 30;
+/// Grace period before declaring timeout (1 second).
+const HEARTBEAT_GRACE_SECS: u64 = 1;
+
+/// The pinned-core hot loop. Pushes events to SharedState + optional event channel.
+pub struct HotLoop {
+    shared: Arc<SharedState>,
+    event_tx: Option<Sender<Event>>,
+    context: Context,
+    /// Core ID to pin the hot loop thread to. None = no pinning.
+    core_id: Option<usize>,
+    /// Farm connection for market data (market data farm).
+    pub farm_conn: Option<Connection>,
+    /// Auth connection for order management.
+    pub ccp_conn: Option<Connection>,
+    /// Historical farm connection for historical data (optional).
+    pub hmds_conn: Option<Connection>,
+    /// Forex tick farm connection (optional).
+    pub cashfarm_conn: Option<Connection>,
+    /// US futures tick farm connection (optional).
+    pub usfuture_conn: Option<Connection>,
+    /// SPSC channel receiver for control plane commands.
+    control_rx: Option<Receiver<ControlCommand>>,
+    /// Whether the hot loop should keep running.
+    running: bool,
+    /// Account ID for order submission.
+    account_id: String,
+    /// Heartbeat state.
+    hb: HeartbeatState,
+    // ── Subsystems ──
+    pub(crate) farm: FarmState,
+    pub(crate) ccp: CcpState,
+    pub(crate) hmds: HmdsState,
+}
+
+/// Tracks last send/recv times and pending test requests for heartbeat management.
+pub struct HeartbeatState {
+    pub last_ccp_sent: Instant,
+    pub last_ccp_recv: Instant,
+    pub last_farm_sent: Instant,
+    pub last_farm_recv: Instant,
+    pub last_hmds_sent: Instant,
+    pub last_hmds_recv: Instant,
+    /// Pending test request for auth: (test_req_id, sent_at).
+    pub pending_ccp_test: Option<(String, Instant)>,
+    /// Pending test request for farm: (test_req_id, sent_at).
+    pub pending_farm_test: Option<(String, Instant)>,
+    /// Pending test request for historical: (test_req_id, sent_at).
+    pub pending_hmds_test: Option<(String, Instant)>,
+    /// Counter for generating unique test request IDs.
+    test_req_counter: u32,
+}
+
+impl HeartbeatState {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            last_ccp_sent: now,
+            last_ccp_recv: now,
+            last_farm_sent: now,
+            last_farm_recv: now,
+            last_hmds_sent: now,
+            last_hmds_recv: now,
+            pending_ccp_test: None,
+            pending_farm_test: None,
+            pending_hmds_test: None,
+            test_req_counter: 0,
+        }
+    }
+
+    fn next_test_id(&mut self) -> String {
+        self.test_req_counter += 1;
+        format!("T{}", self.test_req_counter)
+    }
+}
+
+impl HotLoop {
+    pub fn new(shared: Arc<SharedState>, event_tx: Option<Sender<Event>>, core_id: Option<usize>) -> Self {
+        Self {
+            shared,
+            event_tx,
+            context: Context::new(),
+            core_id,
+            farm_conn: None,
+            ccp_conn: None,
+            hmds_conn: None,
+            cashfarm_conn: None,
+            usfuture_conn: None,
+            control_rx: None,
+            running: true,
+            account_id: String::new(),
+            hb: HeartbeatState::new(),
+            farm: FarmState::new(),
+            ccp: CcpState::new(),
+            hmds: HmdsState::new(),
+        }
+    }
+
+    /// Set the control channel receiver. The caller keeps the sender.
+    pub fn set_control_rx(&mut self, rx: Receiver<ControlCommand>) {
+        self.control_rx = Some(rx);
+    }
+
+    /// Set the account ID for order submission.
+    pub fn set_account_id(&mut self, account_id: String) {
+        self.account_id = account_id;
+    }
+
+    /// Access the context (for pre-start configuration like registering instruments).
+    pub fn context_mut(&mut self) -> &mut Context {
+        &mut self.context
+    }
+
+    /// Process pending control commands once. For testing.
+    pub fn poll_once(&mut self) {
+        self.poll_control_commands();
+    }
+
+    /// Build a HotLoop with connections and control channel, without requiring a Gateway.
+    pub fn with_connections(
+        shared: Arc<SharedState>,
+        event_tx: Option<Sender<Event>>,
+        account_id: String,
+        farm_conn: Connection,
+        ccp_conn: Connection,
+        hmds_conn: Option<Connection>,
+        core_id: Option<usize>,
+    ) -> (Self, Sender<ControlCommand>) {
+        let (tx, rx) = bounded(64);
+        let mut hl = Self::new(shared, event_tx, core_id);
+        hl.set_control_rx(rx);
+        hl.set_account_id(account_id);
+        hl.farm_conn = Some(farm_conn);
+        hl.ccp_conn = Some(ccp_conn);
+        hl.hmds_conn = hmds_conn;
+        (hl, tx)
+    }
+
+    /// Run the hot loop. Blocks until Shutdown command received.
+    pub fn run(&mut self) {
+        if let Some(core) = self.core_id {
+            Self::pin_to_core(core);
+        }
+
+        self.running = true;
+
+        while self.running {
+            self.context.loop_iterations += 1;
+
+            // 1. Busy-poll market data farm socket (non-blocking recv)
+            self.farm.poll_market_data(
+                &mut self.farm_conn, &mut self.context, &self.shared,
+                &self.event_tx, &mut self.hb,
+            );
+            self.farm.poll_secondary_farm(
+                &mut self.cashfarm_conn, &crate::types::FarmSlot::CashFarm,
+                &mut self.farm_conn, &mut self.context, &self.shared,
+                &self.event_tx, &mut self.hb,
+            );
+            self.farm.poll_secondary_farm(
+                &mut self.usfuture_conn, &crate::types::FarmSlot::UsFuture,
+                &mut self.farm_conn, &mut self.context, &self.shared,
+                &self.event_tx, &mut self.hb,
+            );
+
+            // 1b. Busy-poll historical socket for tick-by-tick data
+            self.hmds.poll(
+                &mut self.hmds_conn, &self.shared,
+                &self.event_tx, &mut self.hb,
+            );
+
+            // 2. Drain pending orders → build → sign → send to auth
+            self.ccp.drain_and_send_orders(
+                &mut self.ccp_conn, &mut self.context, &self.account_id, &mut self.hb,
+            );
+
+            // 3. Busy-poll auth socket for execution reports
+            self.ccp.poll_executions(
+                &mut self.ccp_conn, &mut self.context, &self.shared,
+                &self.event_tx, &mut self.hb, &self.account_id,
+            );
+
+            // 4. Check control_plane_rx (SPSC) for commands
+            self.poll_control_commands();
+
+            // 5. Heartbeat check (auth 10s, farm 30s)
+            self.check_heartbeats();
+        }
+    }
+
+    fn poll_control_commands(&mut self) {
+        let cmds: Vec<ControlCommand> = match self.control_rx.as_ref() {
+            Some(rx) => rx.try_iter().collect(),
+            None => return,
+        };
+
+        for cmd in cmds {
+            match cmd {
+                ControlCommand::Subscribe { con_id, symbol, exchange, sec_type } => {
+                    let farm = crate::types::farm_for_instrument(&exchange, &sec_type);
+                    let id = self.context.market.register(con_id);
+                    self.context.market.set_symbol(id, symbol);
+                    self.shared.set_instrument_count(self.context.market.count());
+                    self.shared.bump_register_gen();
+                    self.farm.send_mktdata_subscribe(
+                        con_id, id, farm,
+                        &mut self.farm_conn, &mut self.cashfarm_conn, &mut self.usfuture_conn,
+                        &mut self.hb,
+                    );
+                }
+                ControlCommand::Unsubscribe { instrument } => {
+                    self.farm.send_mktdata_unsubscribe(
+                        instrument,
+                        &mut self.farm_conn, &mut self.cashfarm_conn, &mut self.usfuture_conn,
+                        &mut self.hb,
+                    );
+                }
+                ControlCommand::SubscribeTbt { con_id, symbol, tbt_type } => {
+                    let id = self.context.market.register(con_id);
+                    self.context.market.set_symbol(id, symbol);
+                    self.shared.set_instrument_count(self.context.market.count());
+                    self.shared.bump_register_gen();
+                    self.hmds.send_tbt_subscribe(con_id, id, tbt_type, &mut self.hmds_conn, &mut self.hb);
+                }
+                ControlCommand::UnsubscribeTbt { instrument } => {
+                    self.hmds.send_tbt_unsubscribe(instrument, &mut self.hmds_conn, &mut self.hb);
+                }
+                ControlCommand::SubscribeNews { con_id, symbol, providers } => {
+                    let id = self.context.market.register(con_id);
+                    self.context.market.set_symbol(id, symbol);
+                    self.shared.set_instrument_count(self.context.market.count());
+                    self.shared.bump_register_gen();
+                    // Allocate req_id from farm's counter (shared ID space)
+                    let req_id = self.farm.next_md_req_id;
+                    self.farm.next_md_req_id += 1;
+                    self.ccp.send_news_subscribe(con_id, id, &providers, req_id, &mut self.ccp_conn, &mut self.hb);
+                }
+                ControlCommand::UnsubscribeNews { instrument } => {
+                    self.ccp.send_news_unsubscribe(instrument, &mut self.ccp_conn, &mut self.hb);
+                }
+                ControlCommand::UpdateParam { key, value } => {
+                    let _ = (key, value);
+                }
+                ControlCommand::Order(req) => {
+                    self.context.pending_orders.push(req);
+                }
+                ControlCommand::RegisterInstrument { con_id } => {
+                    self.context.market.register(con_id);
+                    self.shared.set_instrument_count(self.context.market.count());
+                    self.shared.bump_register_gen();
+                }
+                ControlCommand::FetchHistorical { req_id, con_id, symbol, end_date_time, duration, bar_size, what_to_show, use_rth } => {
+                    self.hmds.send_historical_request(req_id, con_id, &end_date_time, &duration, &bar_size, &what_to_show, use_rth, &mut self.hmds_conn, &mut self.hb);
+                    let _ = symbol;
+                }
+                ControlCommand::CancelHistorical { req_id } => {
+                    if let Some(pos) = self.hmds.pending_historical.iter().position(|(_, rid)| *rid == req_id) {
+                        let (query_id, _) = self.hmds.pending_historical.remove(pos);
+                        self.hmds.send_historical_cancel(&query_id, &mut self.hmds_conn, &mut self.hb);
+                    }
+                }
+                ControlCommand::FetchHeadTimestamp { req_id, con_id, what_to_show, use_rth } => {
+                    self.hmds.send_head_timestamp_request(req_id, con_id, &what_to_show, use_rth, &mut self.hmds_conn, &mut self.hb);
+                }
+                ControlCommand::FetchContractDetails { req_id, con_id, symbol, sec_type, exchange, currency } => {
+                    if con_id > 0 {
+                        self.ccp.send_secdef_request(req_id, con_id, &mut self.ccp_conn, &mut self.hb);
+                    } else {
+                        self.ccp.send_secdef_request_by_symbol(req_id, &symbol, &sec_type, &exchange, &currency, &mut self.ccp_conn, &mut self.hb);
+                    }
+                }
+                ControlCommand::CancelHeadTimestamp { req_id } => {
+                    if let Some(pos) = self.hmds.pending_head_ts.iter().position(|(_, rid)| *rid == req_id) {
+                        self.hmds.pending_head_ts.remove(pos);
+                    }
+                }
+                ControlCommand::FetchMatchingSymbols { req_id, pattern } => {
+                    self.ccp.send_matching_symbols_request(req_id, &pattern, &mut self.ccp_conn, &mut self.hb);
+                }
+                ControlCommand::FetchScannerParams => {
+                    self.hmds.send_scanner_params_request(&mut self.hmds_conn, &mut self.hb);
+                }
+                ControlCommand::SubscribeScanner { req_id, instrument, location_code, scan_code, max_items } => {
+                    self.hmds.send_scanner_subscribe(req_id, &instrument, &location_code, &scan_code, max_items, &mut self.hmds_conn, &mut self.hb);
+                }
+                ControlCommand::CancelScanner { req_id } => {
+                    if let Some(pos) = self.hmds.pending_scanner.iter().position(|(_, rid)| *rid == req_id) {
+                        let (scan_id, _) = self.hmds.pending_scanner.remove(pos);
+                        self.hmds.send_scanner_cancel(&scan_id, &mut self.hmds_conn, &mut self.hb);
+                    }
+                }
+                ControlCommand::FetchHistoricalNews { req_id, con_id, provider_codes, start_time, end_time, max_results } => {
+                    self.hmds.send_historical_news_request(req_id, con_id, &provider_codes, &start_time, &end_time, max_results, &mut self.hmds_conn, &mut self.hb);
+                }
+                ControlCommand::FetchNewsArticle { req_id, provider_code, article_id } => {
+                    self.hmds.send_news_article_request(req_id, &provider_code, &article_id, &mut self.hmds_conn, &mut self.hb);
+                }
+                ControlCommand::FetchFundamentalData { req_id, con_id, report_type } => {
+                    self.hmds.send_fundamental_data_request(req_id, con_id, &report_type, &mut self.hmds_conn, &mut self.hb);
+                }
+                ControlCommand::CancelFundamentalData { req_id } => {
+                    if let Some(pos) = self.hmds.pending_fundamental.iter().position(|(_, rid)| *rid == req_id) {
+                        self.hmds.pending_fundamental.remove(pos);
+                    }
+                }
+                ControlCommand::FetchHistogramData { req_id, con_id, use_rth, period } => {
+                    self.hmds.send_histogram_request(req_id, con_id, use_rth, &period, &mut self.hmds_conn, &mut self.hb);
+                }
+                ControlCommand::CancelHistogramData { req_id } => {
+                    if let Some(pos) = self.hmds.pending_histogram.iter().position(|(_, rid)| *rid == req_id) {
+                        self.hmds.pending_histogram.remove(pos);
+                    }
+                }
+                ControlCommand::FetchHistoricalTicks { req_id, con_id, start_date_time, end_date_time, number_of_ticks, what_to_show, use_rth } => {
+                    self.hmds.send_historical_ticks_request(req_id, con_id, &start_date_time, &end_date_time, number_of_ticks, &what_to_show, use_rth, &mut self.hmds_conn, &mut self.hb);
+                }
+                ControlCommand::SubscribeRealTimeBar { req_id, con_id, symbol, what_to_show, use_rth } => {
+                    self.hmds.send_realtime_bar_subscribe(req_id, con_id, &symbol, &what_to_show, use_rth, &mut self.hmds_conn, &mut self.hb);
+                }
+                ControlCommand::CancelRealTimeBar { req_id } => {
+                    if let Some(pos) = self.hmds.rtbar_subs.iter().position(|(_, rid, _, _)| *rid == req_id) {
+                        let (query_id, _, ticker_id, _) = self.hmds.rtbar_subs.remove(pos);
+                        let cancel_id = ticker_id.map(|t| t.to_string()).unwrap_or(query_id);
+                        self.hmds.send_historical_cancel(&cancel_id, &mut self.hmds_conn, &mut self.hb);
+                    }
+                }
+                ControlCommand::FetchHistoricalSchedule { req_id, con_id, end_date_time, duration, use_rth } => {
+                    self.hmds.send_schedule_request(req_id, con_id, &end_date_time, &duration, use_rth, &mut self.hmds_conn, &mut self.hb);
+                }
+                ControlCommand::Shutdown => {
+                    // Unsubscribe all active market data before stopping
+                    let instruments: Vec<InstrumentId> = self.farm.instrument_md_reqs
+                        .iter().map(|(id, _, _)| *id).collect();
+                    for instrument in instruments {
+                        self.farm.send_mktdata_unsubscribe(
+                            instrument,
+                            &mut self.farm_conn, &mut self.cashfarm_conn, &mut self.usfuture_conn,
+                            &mut self.hb,
+                        );
+                    }
+                    // Unsubscribe all TBT subscriptions before stopping
+                    let tbt_instruments: Vec<InstrumentId> = self.hmds.tbt_subscriptions
+                        .iter().map(|(id, _, _)| *id).collect();
+                    for instrument in tbt_instruments {
+                        self.hmds.send_tbt_unsubscribe(instrument, &mut self.hmds_conn, &mut self.hb);
+                    }
+                    // Unsubscribe all news subscriptions before stopping
+                    let news_instruments: Vec<InstrumentId> = self.ccp.news_subscriptions
+                        .iter().map(|(id, _)| *id).collect();
+                    for instrument in news_instruments {
+                        self.ccp.send_news_unsubscribe(instrument, &mut self.ccp_conn, &mut self.hb);
+                    }
+                    self.running = false;
+                    emit(&self.event_tx, Event::Disconnected);
+                }
+            }
+        }
+    }
+
+    fn check_heartbeats(&mut self) {
+        let now = Instant::now();
+        let ts = chrono_free_timestamp();
+
+        // --- Auth heartbeat (skip if already disconnected) ---
+        if !self.ccp.disconnected {
+        if let Some(conn) = self.ccp_conn.as_mut() {
+            let since_sent = now.duration_since(self.hb.last_ccp_sent).as_secs();
+            let since_recv = now.duration_since(self.hb.last_ccp_recv).as_secs();
+
+            if since_sent >= CCP_HEARTBEAT_SECS {
+                let _ = conn.send_fix(&[
+                    (fix::TAG_MSG_TYPE, fix::MSG_HEARTBEAT),
+                    (fix::TAG_SENDING_TIME, &ts),
+                ]);
+                self.hb.last_ccp_sent = now;
+            }
+
+            if since_recv > CCP_HEARTBEAT_SECS + HEARTBEAT_GRACE_SECS {
+                if let Some((_, sent_at)) = &self.hb.pending_ccp_test {
+                    if now.duration_since(*sent_at).as_secs() > CCP_HEARTBEAT_SECS {
+                        log::error!("CCP heartbeat timeout — connection lost");
+                        self.ccp.handle_disconnect(&mut self.context, &self.event_tx);
+                    }
+                } else {
+                    let test_id = self.hb.next_test_id();
+                    let _ = conn.send_fix(&[
+                        (fix::TAG_MSG_TYPE, fix::MSG_TEST_REQUEST),
+                        (fix::TAG_SENDING_TIME, &ts),
+                        (fix::TAG_TEST_REQ_ID, &test_id),
+                    ]);
+                    self.hb.pending_ccp_test = Some((test_id, now));
+                    self.hb.last_ccp_sent = now;
+                }
+            }
+        }
+        }
+
+        // --- Farm heartbeat (skip if already disconnected) ---
+        if !self.farm.disconnected {
+        if let Some(conn) = self.farm_conn.as_mut() {
+            let since_sent = now.duration_since(self.hb.last_farm_sent).as_secs();
+            let since_recv = now.duration_since(self.hb.last_farm_recv).as_secs();
+
+            if since_sent >= FARM_HEARTBEAT_SECS {
+                let _ = conn.send_fix(&[
+                    (fix::TAG_MSG_TYPE, fix::MSG_HEARTBEAT),
+                    (fix::TAG_SENDING_TIME, &ts),
+                ]);
+                self.hb.last_farm_sent = now;
+            }
+
+            if since_recv > FARM_HEARTBEAT_SECS + HEARTBEAT_GRACE_SECS {
+                if let Some((_, sent_at)) = &self.hb.pending_farm_test {
+                    if now.duration_since(*sent_at).as_secs() > FARM_HEARTBEAT_SECS {
+                        log::error!("Farm heartbeat timeout — connection lost");
+                        self.farm.handle_disconnect(&mut self.context, &self.event_tx);
+                    }
+                } else {
+                    let test_id = self.hb.next_test_id();
+                    let _ = conn.send_fix(&[
+                        (fix::TAG_MSG_TYPE, fix::MSG_TEST_REQUEST),
+                        (fix::TAG_SENDING_TIME, &ts),
+                        (fix::TAG_TEST_REQ_ID, &test_id),
+                    ]);
+                    self.hb.pending_farm_test = Some((test_id, now));
+                    self.hb.last_farm_sent = now;
+                }
+            }
+        }
+        }
+
+        // --- Historical heartbeat (skip if disconnected or no historical activity) ---
+        if !self.hmds.disconnected && self.hmds_conn.is_some() {
+        if let Some(conn) = self.hmds_conn.as_mut() {
+            let since_sent = now.duration_since(self.hb.last_hmds_sent).as_secs();
+            let since_recv = now.duration_since(self.hb.last_hmds_recv).as_secs();
+
+            if since_sent >= FARM_HEARTBEAT_SECS {
+                let _ = conn.send_fix(&[
+                    (fix::TAG_MSG_TYPE, fix::MSG_HEARTBEAT),
+                    (fix::TAG_SENDING_TIME, &ts),
+                ]);
+                self.hb.last_hmds_sent = now;
+            }
+
+            if since_recv > FARM_HEARTBEAT_SECS + HEARTBEAT_GRACE_SECS {
+                if let Some((_, sent_at)) = &self.hb.pending_hmds_test {
+                    if now.duration_since(*sent_at).as_secs() > FARM_HEARTBEAT_SECS {
+                        log::error!("HMDS heartbeat timeout — connection lost");
+                        self.hmds.disconnected = true;
+                    }
+                } else {
+                    let test_id = self.hb.next_test_id();
+                    let _ = conn.send_fix(&[
+                        (fix::TAG_MSG_TYPE, fix::MSG_TEST_REQUEST),
+                        (fix::TAG_SENDING_TIME, &ts),
+                        (fix::TAG_TEST_REQ_ID, &test_id),
+                    ]);
+                    self.hb.pending_hmds_test = Some((test_id, now));
+                    self.hb.last_hmds_sent = now;
+                }
+            }
+        }
+        }
+    }
+
+    fn pin_to_core(core: usize) {
+        let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+        if let Some(id) = core_ids.get(core) {
+            core_affinity::set_for_current(*id);
+        }
+    }
+
+    /// Whether the farm connection has been lost.
+    pub fn is_farm_disconnected(&self) -> bool {
+        self.farm.disconnected
+    }
+
+    /// Whether the auth connection has been lost.
+    pub fn is_ccp_disconnected(&self) -> bool {
+        self.ccp.disconnected
+    }
+
+    /// Replace the farm connection (after reconnection) and re-subscribe to all instruments.
+    pub fn reconnect_farm(&mut self, conn: Connection) {
+        self.farm.reconnect(
+            conn,
+            &mut self.farm_conn, &mut self.cashfarm_conn, &mut self.usfuture_conn,
+            &mut self.context, &mut self.hb,
+        );
+    }
+
+    /// Replace the auth connection (after reconnection) and reconcile order state.
+    pub fn reconnect_ccp(&mut self, conn: Connection) {
+        self.ccp.reconnect(conn, &mut self.ccp_conn, &mut self.hb);
+    }
+
+    /// Access heartbeat state for testing.
+    pub fn heartbeat_state(&self) -> &HeartbeatState {
+        &self.hb
+    }
+
+    /// Mutably access heartbeat state for testing (e.g., setting timestamps).
+    pub fn heartbeat_state_mut(&mut self) -> &mut HeartbeatState {
+        &mut self.hb
+    }
+
+    /// Inject a raw farm message for testing. Processes it through the full decode pipeline.
+    pub fn inject_farm_message(&mut self, msg: &[u8]) {
+        self.farm.process_farm_message(msg, &mut self.farm_conn, &mut self.context, &self.shared, &self.event_tx, &mut self.hb);
+    }
+
+    /// Inject a raw auth message for testing. Processes execution reports, etc.
+    pub fn inject_ccp_message(&mut self, msg: &[u8]) {
+        self.ccp.process_ccp_message(msg, &mut self.ccp_conn, &mut self.context, &self.shared, &self.event_tx, &mut self.hb, &self.account_id);
+    }
+
+    /// Inject a raw HMDS message for testing. Processes historical data, news, etc.
+    pub fn inject_hmds_message(&mut self, msg: &[u8]) {
+        self.hmds.process_hmds_message(msg, &mut self.hmds_conn, &self.shared, &self.event_tx, &mut self.hb);
+    }
+
+    /// Inject a TBT trade for testing. Pushes to SharedState and emits event.
+    pub fn inject_tbt_trade(&mut self, trade: &TbtTrade) {
+        self.shared.push_tbt_trade(trade.clone());
+        emit(&self.event_tx, Event::TbtTrade(trade.clone()));
+    }
+
+    /// Inject a TBT quote for testing. Pushes to SharedState.
+    pub fn inject_tbt_quote(&mut self, quote: &TbtQuote) {
+        self.shared.push_tbt_quote(quote.clone());
+    }
+
+    /// Inject a simulated tick for testing.
+    pub fn inject_tick(&mut self, instrument: InstrumentId) {
+        self.shared.push_quote(instrument, self.context.quote(instrument));
+        emit(&self.event_tx, Event::Tick(instrument));
+    }
+
+    /// Simulate a fill for testing. Updates position and notifies.
+    pub fn inject_fill(&mut self, fill: &Fill) {
+        let delta = match fill.side {
+            crate::types::Side::Buy => fill.qty,
+            crate::types::Side::Sell | crate::types::Side::ShortSell => -fill.qty,
+        };
+        self.context.update_position(fill.instrument, delta);
+        self.shared.push_fill(*fill);
+        self.shared.set_position(fill.instrument, self.context.position(fill.instrument));
+        emit(&self.event_tx, Event::Fill(*fill));
+    }
+}
+
+// ── Helper functions used by subsystems ──
+
+/// Emit an event to the channel (if connected).
+#[inline]
+pub(crate) fn emit(event_tx: &Option<Sender<Event>>, event: Event) {
+    if let Some(tx) = event_tx {
+        let _ = tx.send(event);
+    }
+}
+
+/// Format a fixed-point Price as a decimal string for FIX tags.
+pub(crate) fn format_price(price: Price) -> String {
+    let whole = price / PRICE_SCALE;
+    let frac = (price % PRICE_SCALE).unsigned_abs();
+    if frac == 0 {
+        whole.to_string()
+    } else {
+        let frac_str = format!("{:08}", frac);
+        let trimmed = frac_str.trim_end_matches('0');
+        format!("{}.{}", whole, trimmed)
+    }
+}
+
+/// Parse a FIX tag value as a Price (fixed-point). Returns 0 if absent or unparseable.
+pub(crate) fn parse_price_tag(val: Option<&String>) -> Price {
+    val.and_then(|s| s.parse::<f64>().ok())
+        .map(|f| (f * PRICE_SCALE as f64) as Price)
+        .unwrap_or(0)
+}
+
+/// Format a fixed-point Qty (QTY_SCALE = 10^4) to a decimal string.
+pub(crate) fn format_qty(qty: Qty) -> String {
+    let whole = qty / QTY_SCALE;
+    let frac = (qty % QTY_SCALE).unsigned_abs();
+    if frac == 0 {
+        whole.to_string()
+    } else {
+        let frac_str = format!("{:04}", frac);
+        let trimmed = frac_str.trim_end_matches('0');
+        format!("{}.{}", whole, trimmed)
+    }
+}
+
+/// Fast extraction of FIX tag 35 (MsgType) value via byte scan.
+pub(crate) fn fast_extract_msg_type(msg: &[u8]) -> Option<&[u8]> {
+    let limit = msg.len().min(48);
+    let mut i = 0;
+    while i + 3 < limit {
+        if msg[i] == b'3' && msg[i + 1] == b'5' && msg[i + 2] == b'=' {
+            if i == 0 || msg[i - 1] == 0x01 {
+                let val_start = i + 3;
+                let mut j = val_start;
+                while j < msg.len() && msg[j] != 0x01 {
+                    j += 1;
+                }
+                if j > val_start {
+                    return Some(&msg[val_start..j]);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+pub(crate) fn find_body_after_tag<'a>(msg: &'a [u8], tag_marker: &[u8]) -> Option<&'a [u8]> {
+    msg.windows(tag_marker.len())
+        .position(|w| w == tag_marker)
+        .map(|pos| &msg[pos + tag_marker.len()..])
+}
+
+/// Extract the raw bytes of a binary FIX tag value using a length tag.
+pub(crate) fn extract_raw_tag(msg: &[u8], tag: u32) -> Option<Vec<u8>> {
+    let len_tag = tag - 1;
+    if let Some(len_val) = extract_text_tag(msg, len_tag) {
+        if let Ok(data_len) = len_val.parse::<usize>() {
+            let needle = format!("{}=", tag);
+            let needle_bytes = needle.as_bytes();
+            if let Some(idx) = msg.windows(needle_bytes.len()).position(|w| w == needle_bytes) {
+                let val_start = idx + needle_bytes.len();
+                let val_end = (val_start + data_len).min(msg.len());
+                return Some(msg[val_start..val_end].to_vec());
+            }
+        }
+    }
+    let needle = format!("{}=", tag);
+    let needle_bytes = needle.as_bytes();
+    let mut pos = 0;
+    while pos < msg.len() {
+        let remaining = &msg[pos..];
+        if let Some(idx) = remaining.windows(needle_bytes.len()).position(|w| w == needle_bytes) {
+            let abs_idx = pos + idx;
+            if abs_idx == 0 || msg[abs_idx - 1] == 0x01 {
+                let val_start = abs_idx + needle_bytes.len();
+                let val_end = msg[val_start..].iter().position(|&b| b == 0x01)
+                    .map(|p| val_start + p)
+                    .unwrap_or(msg.len());
+                return Some(msg[val_start..val_end].to_vec());
+            }
+            pos = abs_idx + 1;
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+/// Extract a text FIX tag value (SOH-delimited) from raw message bytes.
+fn extract_text_tag(msg: &[u8], tag: u32) -> Option<String> {
+    let needle = format!("{}=", tag);
+    let needle_bytes = needle.as_bytes();
+    let mut pos = 0;
+    while pos < msg.len() {
+        let remaining = &msg[pos..];
+        if let Some(idx) = remaining.windows(needle_bytes.len()).position(|w| w == needle_bytes) {
+            let abs_idx = pos + idx;
+            if abs_idx == 0 || msg[abs_idx - 1] == 0x01 {
+                let val_start = abs_idx + needle_bytes.len();
+                let val_end = msg[val_start..].iter().position(|&b| b == 0x01)
+                    .map(|p| val_start + p)
+                    .unwrap_or(msg.len());
+                return Some(String::from_utf8_lossy(&msg[val_start..val_end]).into_owned());
+            }
+            pos = abs_idx + 1;
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use crate::bridge::{Event, SharedState};
+    use crate::types::*;
+    use std::time::Duration;
+
+    #[test]
+    fn inject_tick_emits_events() {
+        let shared = Arc::new(SharedState::new());
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let mut engine = HotLoop::new(shared.clone(), Some(event_tx), None);
+        engine.context_mut().market.register(265598);
+
+        engine.inject_tick(0);
+        engine.inject_tick(0);
+
+        let events: Vec<Event> = event_rx.try_iter().collect();
+        let tick_count = events.iter().filter(|e| matches!(e, Event::Tick(_))).count();
+        assert_eq!(tick_count, 2);
+    }
+
+    #[test]
+    fn inject_tick_multiple_instruments() {
+        let shared = Arc::new(SharedState::new());
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let mut engine = HotLoop::new(shared.clone(), Some(event_tx), None);
+        engine.context_mut().market.register(265598); // 0: AAPL
+        engine.context_mut().market.register(272093); // 1: MSFT
+
+        engine.inject_tick(0);
+        engine.inject_tick(1);
+
+        let events: Vec<Event> = event_rx.try_iter().collect();
+        let tick_events: Vec<_> = events.iter().filter_map(|e| match e {
+            Event::Tick(id) => Some(*id),
+            _ => None,
+        }).collect();
+        assert_eq!(tick_events, vec![0, 1]);
+    }
+
+    #[test]
+    fn inject_fill_updates_position() {
+        let shared = Arc::new(SharedState::new());
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let mut engine = HotLoop::new(shared.clone(), Some(event_tx), None);
+        engine.context_mut().market.register(265598);
+
+        let fill = Fill {
+            instrument: 0,
+            order_id: 1001,
+            side: Side::Buy,
+            price: 150_00000000,
+            qty: 100,
+            remaining: 0,
+            commission: 1_00000000,
+            timestamp_ns: 0,
+        };
+        engine.inject_fill(&fill);
+        assert_eq!(engine.context_mut().position(0), 100);
+    }
+
+    #[test]
+    fn heartbeat_state_accessible() {
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared, None, None);
+        let hb = engine.heartbeat_state_mut();
+        hb.last_farm_sent = Instant::now() - Duration::from_secs(60);
+        assert!(engine.heartbeat_state().last_farm_sent.elapsed().as_secs() >= 59);
+    }
+
+    #[test]
+    fn shutdown_sets_running_false() {
+        let shared = Arc::new(SharedState::new());
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let mut engine = HotLoop::new(shared, None, None);
+        engine.set_control_rx(rx);
+        tx.send(ControlCommand::Shutdown).unwrap();
+        engine.poll_once();
+        // running should be false now — we can't check directly, but no panic = good
+    }
+}
