@@ -418,6 +418,29 @@ impl HotLoop {
                 ControlCommand::FetchHistoricalSchedule { req_id, con_id, end_date_time, duration, use_rth } => {
                     self.hmds.send_schedule_request(req_id, con_id, &end_date_time, &duration, use_rth, &mut self.hmds_conn, &mut self.hb);
                 }
+                ControlCommand::SubscribeDepth { req_id, con_id, exchange, sec_type, num_rows, is_smart_depth } => {
+                    self.farm.send_depth_subscribe(
+                        req_id, con_id, &exchange, &sec_type, num_rows, is_smart_depth,
+                        &mut self.farm_conn, &mut self.cashfarm_conn, &mut self.usfuture_conn,
+                        &mut self.eufarm_conn, &mut self.jfarm_conn,
+                        &mut self.hb,
+                    );
+                }
+                ControlCommand::UnsubscribeDepth { req_id } => {
+                    self.farm.send_depth_unsubscribe(
+                        req_id,
+                        &mut self.farm_conn, &mut self.cashfarm_conn, &mut self.usfuture_conn,
+                        &mut self.eufarm_conn, &mut self.jfarm_conn,
+                        &mut self.hb,
+                    );
+                }
+                ControlCommand::FetchNewsProviders { .. }
+                | ControlCommand::FetchSmartComponents { .. }
+                | ControlCommand::FetchSoftDollarTiers { .. }
+                | ControlCommand::FetchUserInfo { .. } => {
+                    // Gateway-local data — handled synchronously in Python EClient.
+                    // These variants exist for future CCP round-trip support.
+                }
                 ControlCommand::Shutdown => {
                     // Unsubscribe all active market data before stopping
                     let instruments: Vec<InstrumentId> = self.farm.instrument_md_reqs

@@ -786,6 +786,23 @@ pub struct NewsBulletin {
     pub exchange: String,
 }
 
+/// A market depth (L2 order book) update.
+#[derive(Debug, Clone)]
+pub struct DepthUpdate {
+    pub req_id: u32,
+    /// Book position (0-based).
+    pub position: i32,
+    /// Market maker ID (L2 only).
+    pub market_maker: String,
+    /// 0 = insert, 1 = update, 2 = delete.
+    pub operation: i32,
+    /// 0 = ask, 1 = bid.
+    pub side: i32,
+    pub price: f64,
+    pub size: f64,
+    pub is_smart_depth: bool,
+}
+
 /// A real-time news headline from 8=O|35=G tick type 0x1E90.
 #[derive(Debug, Clone)]
 pub struct TickNews {
@@ -1029,6 +1046,25 @@ pub enum ControlCommand {
         duration: String,
         use_rth: bool,
     },
+    /// Subscribe to market depth (L2) for a contract.
+    SubscribeDepth {
+        req_id: u32,
+        con_id: i64,
+        exchange: String,
+        sec_type: String,
+        num_rows: i32,
+        is_smart_depth: bool,
+    },
+    /// Unsubscribe from market depth.
+    UnsubscribeDepth { req_id: u32 },
+    /// Request news providers list (gateway-local).
+    FetchNewsProviders { req_id: u32 },
+    /// Request SMART routing components.
+    FetchSmartComponents { req_id: u32, bbo_exchange: String },
+    /// Request soft dollar tiers.
+    FetchSoftDollarTiers { req_id: u32 },
+    /// Request user info.
+    FetchUserInfo { req_id: u32 },
     /// Graceful shutdown.
     Shutdown,
 }
