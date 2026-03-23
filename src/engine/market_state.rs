@@ -22,6 +22,10 @@ pub struct MarketState {
     min_tick_scaled: [i64; MAX_INSTRUMENTS],
     /// Per-instrument symbol name (e.g. "AAPL"). Used for orders.
     symbols: Vec<(InstrumentId, String)>,
+    /// Per-instrument security type (e.g. "STK", "FUT"). Used for orders.
+    sec_types: Vec<(InstrumentId, String)>,
+    /// Per-instrument exchange (e.g. "SMART", "CME"). Used for orders.
+    exchanges: Vec<(InstrumentId, String)>,
 }
 
 impl MarketState {
@@ -34,6 +38,8 @@ impl MarketState {
             min_ticks: [0.0; MAX_INSTRUMENTS],
             min_tick_scaled: [0; MAX_INSTRUMENTS],
             symbols: Vec::new(),
+            sec_types: Vec::new(),
+            exchanges: Vec::new(),
         }
     }
 
@@ -119,6 +125,48 @@ impl MarketState {
             }
         }
         "?"
+    }
+
+    /// Set security type for an instrument (e.g. "STK", "FUT").
+    pub fn set_sec_type(&mut self, id: InstrumentId, sec_type: String) {
+        for entry in &mut self.sec_types {
+            if entry.0 == id {
+                entry.1 = sec_type;
+                return;
+            }
+        }
+        self.sec_types.push((id, sec_type));
+    }
+
+    /// Get security type for an instrument. Returns "STK" if not set.
+    pub fn sec_type(&self, id: InstrumentId) -> &str {
+        for (iid, st) in &self.sec_types {
+            if *iid == id {
+                return st;
+            }
+        }
+        "STK"
+    }
+
+    /// Set exchange for an instrument (e.g. "SMART", "CME").
+    pub fn set_exchange(&mut self, id: InstrumentId, exchange: String) {
+        for entry in &mut self.exchanges {
+            if entry.0 == id {
+                entry.1 = exchange;
+                return;
+            }
+        }
+        self.exchanges.push((id, exchange));
+    }
+
+    /// Get exchange for an instrument. Returns "SMART" if not set.
+    pub fn exchange(&self, id: InstrumentId) -> &str {
+        for (iid, ex) in &self.exchanges {
+            if *iid == id {
+                return ex;
+            }
+        }
+        "SMART"
     }
 
     /// Set minTick for an instrument (from 35=Q). Price ticks = magnitude * min_tick.

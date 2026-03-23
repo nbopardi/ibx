@@ -744,6 +744,9 @@ impl HotLoop {
                     let qty_str = qty.to_string();
                     let price_str = format_price(price);
                     let symbol = self.context.market.symbol(instrument).to_string();
+                    let sec_type_str = self.context.market.sec_type(instrument).to_string();
+                    let exchange_str = self.context.market.exchange(instrument).to_string();
+                    let con_id_str = self.context.market.con_id(instrument).unwrap_or(0).to_string();
                     let now = chrono_free_timestamp();
                     conn.send_fix(&[
                         (fix::TAG_MSG_TYPE, fix::MSG_NEW_ORDER),
@@ -752,14 +755,15 @@ impl HotLoop {
                         (1, &self.account_id), // Account
                         (21, "2"),          // HandlInst = Automated
                         (55, &symbol),      // Symbol
+                        (6008, &con_id_str), // ConId
                         (54, side_str),     // Side
                         (38, &qty_str),     // OrderQty
                         (40, "2"),          // OrdType = Limit
                         (44, &price_str),   // Price
                         (59, "0"),          // TIF = DAY
                         (60, &now),         // TransactTime
-                        (167, "STK"),       // SecurityType = CommonStock
-                        (100, "SMART"),     // ExDestination
+                        (167, &sec_type_str),
+                        (100, &exchange_str),
                         (15, "USD"),        // Currency
                         (204, "0"),         // CustomerOrFirm
                     ])
@@ -839,6 +843,9 @@ impl HotLoop {
                     let tif_byte = [tif];
                     let tif_str = std::str::from_utf8(&tif_byte).unwrap_or("0");
                     let symbol = self.context.market.symbol(instrument).to_string();
+                    let sec_type_str = self.context.market.sec_type(instrument).to_string();
+                    let exchange_str = self.context.market.exchange(instrument).to_string();
+                    let con_id_str = self.context.market.con_id(instrument).unwrap_or(0).to_string();
                     let now = chrono_free_timestamp();
                     let display_str = attrs.display_size.to_string();
                     let min_qty_str = attrs.min_qty.to_string();
@@ -852,14 +859,15 @@ impl HotLoop {
                         (1, &self.account_id),
                         (21, "2"),
                         (55, &symbol),
+                        (6008, &con_id_str),    // ConId
                         (54, side_str),
                         (38, &qty_str),
                         (40, "2"),              // OrdType = Limit
                         (44, &price_str),
                         (59, tif_str),
                         (60, &now),
-                        (167, "STK"),
-                        (100, "SMART"),
+                        (167, &sec_type_str),
+                        (100, &exchange_str),
                         (15, "USD"),
                         (204, "0"),
                     ];
@@ -943,9 +951,12 @@ impl HotLoop {
                     let side_str = fix_side(side);
                     let qty_str = qty.to_string();
                     let symbol = self.context.market.symbol(instrument).to_string();
+                    let sec_type_str = self.context.market.sec_type(instrument).to_string();
+                    let exchange_str = self.context.market.exchange(instrument).to_string();
+                    let con_id_str = self.context.market.con_id(instrument).unwrap_or(0).to_string();
                     let now = chrono_free_timestamp();
-                    log::info!("Sending MKT order: clord={} acct={} sym={} side={} qty={}",
-                        clord_str, self.account_id, symbol, side_str, qty_str);
+                    log::info!("Sending MKT order: clord={} acct={} sym={} side={} qty={} sec_type={} exchange={} con_id={}",
+                        clord_str, self.account_id, symbol, side_str, qty_str, sec_type_str, exchange_str, con_id_str);
                     conn.send_fix(&[
                         (fix::TAG_MSG_TYPE, fix::MSG_NEW_ORDER),
                         (fix::TAG_SENDING_TIME, &now),
@@ -953,13 +964,14 @@ impl HotLoop {
                         (1, &self.account_id), // Account
                         (21, "2"),          // HandlInst = Automated
                         (55, &symbol),      // Symbol
+                        (6008, &con_id_str), // ConId
                         (54, side_str),
                         (38, &qty_str),
                         (40, "1"),          // OrdType = Market
                         (59, "0"),          // TIF = DAY
                         (60, &now),         // TransactTime
-                        (167, "STK"),       // SecurityType
-                        (100, "SMART"),     // ExDestination
+                        (167, &sec_type_str),
+                        (100, &exchange_str),
                         (15, "USD"),        // Currency
                         (204, "0"),         // CustomerOrFirm
                     ])
@@ -973,6 +985,9 @@ impl HotLoop {
                     let qty_str = qty.to_string();
                     let stop_str = format_price(stop_price);
                     let symbol = self.context.market.symbol(instrument).to_string();
+                    let sec_type_str = self.context.market.sec_type(instrument).to_string();
+                    let exchange_str = self.context.market.exchange(instrument).to_string();
+                    let con_id_str = self.context.market.con_id(instrument).unwrap_or(0).to_string();
                     let now = chrono_free_timestamp();
                     conn.send_fix(&[
                         (fix::TAG_MSG_TYPE, fix::MSG_NEW_ORDER),
@@ -981,14 +996,15 @@ impl HotLoop {
                         (1, &self.account_id),
                         (21, "2"),          // HandlInst = Automated
                         (55, &symbol),
+                        (6008, &con_id_str), // ConId
                         (54, side_str),
                         (38, &qty_str),
                         (40, "3"),          // OrdType = Stop
                         (99, &stop_str),    // StopPx
                         (59, "0"),          // TIF = DAY
                         (60, &now),
-                        (167, "STK"),
-                        (100, "SMART"),
+                        (167, &sec_type_str),
+                        (100, &exchange_str),
                         (15, "USD"),
                         (204, "0"),
                     ])
@@ -2875,6 +2891,8 @@ impl HotLoop {
                     let farm = crate::types::farm_for_instrument(&exchange, &sec_type);
                     let id = self.context.market.register(con_id);
                     self.context.market.set_symbol(id, symbol);
+                    self.context.market.set_sec_type(id, sec_type);
+                    self.context.market.set_exchange(id, exchange);
                     self.shared.set_instrument_count(self.context.market.count());
                     self.shared.bump_register_gen();
                     self.send_mktdata_subscribe(con_id, id, farm);
