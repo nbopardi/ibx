@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crossbeam_channel::Sender;
@@ -53,7 +53,7 @@ struct StoredExecution {
 /// daemon thread while the main thread calls req/cancel methods concurrently.
 /// `frozen` tells PyO3 to skip RefCell borrow-checking, which is required
 /// because `run()` holds a `&self` borrow for the lifetime of the event loop.
-/// Interior mutability is provided by `OnceLock`, `AtomicBool`, and `Mutex`.
+/// Interior mutability is provided by `Mutex`, `AtomicBool`, and atomics.
 ///
 /// # Thread lifecycle
 ///
@@ -62,21 +62,20 @@ struct StoredExecution {
 /// Dropping an `EClient` without calling `disconnect()` first is safe:
 /// the `Drop` impl sends `Shutdown` and joins the thread.
 ///
-/// **Note:** this struct is single-use — `OnceLock` fields cannot be reset,
-/// so calling `connect()` after `disconnect()` on the same instance will panic.
-/// Create a new `EClient` for reconnection.
+/// The client is **reconnectable**: calling `disconnect()` resets all session
+/// state so that a subsequent `connect()` on the same instance works correctly.
 #[pyclass(frozen, subclass)]
 pub struct EClient {
     /// Reference to the EWrapper (which is typically `self` in the `App(EWrapper, EClient)` pattern).
     wrapper: PyObject,
-    /// Set once by connect(), read-only after.
-    shared: OnceLock<Arc<SharedState>>,
-    /// Set once by connect(), read-only after.
-    control_tx: OnceLock<Sender<ControlCommand>>,
+    /// Set by connect(), cleared by disconnect().
+    shared: Mutex<Option<Arc<SharedState>>>,
+    /// Set by connect(), cleared by disconnect().
+    control_tx: Mutex<Option<Sender<ControlCommand>>>,
     next_order_id: AtomicU64,
     _thread: Mutex<Option<thread::JoinHandle<()>>>,
-    /// Set once by connect(), read-only after.
-    account_id: OnceLock<String>,
+    /// Set by connect(), cleared by disconnect().
+    account_id: Mutex<Option<String>>,
     connected: AtomicBool,
     /// Shared subscription tracking and dispatch preparation.
     core: ClientCore,
@@ -96,7 +95,7 @@ pub struct EClient {
 
 impl Drop for EClient {
     fn drop(&mut self) {
-        if let Some(tx) = self.control_tx.get() {
+        if let Some(tx) = self.control_tx.lock().unwrap().as_ref() {
             let _ = tx.send(ControlCommand::Shutdown);
         }
         if let Some(h) = self._thread.lock().unwrap().take() {
@@ -112,11 +111,11 @@ impl EClient {
     fn new(wrapper: PyObject) -> Self {
         Self {
             wrapper,
-            shared: OnceLock::new(),
-            control_tx: OnceLock::new(),
+            shared: Mutex::new(None),
+            control_tx: Mutex::new(None),
             next_order_id: AtomicU64::new(0),
             _thread: Mutex::new(None),
-            account_id: OnceLock::new(),
+            account_id: Mutex::new(None),
             connected: AtomicBool::new(false),
             core: ClientCore::new(),
             mdt_sent: Mutex::new(HashSet::new()),
@@ -160,8 +159,7 @@ impl EClient {
         let (gw, farm_conn, ccp_conn, hmds_conn, cashfarm_conn, usfuture_conn, eufarm_conn, jfarm_conn) = result
             .map_err(|e| PyRuntimeError::new_err(format!("Connection failed: {}", e)))?;
 
-        // OnceLock::set() is safe here: the `connected` guard above ensures single-call.
-        self.account_id.set(gw.account_id.clone()).expect("account_id already set");
+        *self.account_id.lock().unwrap() = Some(gw.account_id.clone());
         let shared = Arc::new(SharedState::new());
 
         let (mut hot_loop, control_tx) = gw.into_hot_loop_with_farms(shared.clone(), None, farm_conn, ccp_conn, hmds_conn, cashfarm_conn, usfuture_conn, eufarm_conn, jfarm_conn, core_id);
@@ -178,8 +176,8 @@ impl EClient {
             })
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to spawn hot loop: {}", e)))?;
 
-        self.shared.set(shared).unwrap_or_else(|_| panic!("shared already set"));
-        self.control_tx.set(control_tx).unwrap_or_else(|_| panic!("control_tx already set"));
+        *self.shared.lock().unwrap() = Some(shared);
+        *self.control_tx.lock().unwrap() = Some(control_tx);
         self.next_order_id.store(start_id, Ordering::Relaxed);
         *self._thread.lock().unwrap() = Some(handle);
         self.connected.store(true, Ordering::Release);
@@ -190,15 +188,27 @@ impl EClient {
     }
 
     /// Disconnect from IB.  Sends `Shutdown` to the hot loop, waits for the
-    /// background thread to exit, and marks the client as disconnected.
+    /// background thread to exit, resets all per-session state so the client
+    /// can be reconnected.
     fn disconnect(&self) -> PyResult<()> {
-        if let Some(tx) = self.control_tx.get() {
+        if let Some(tx) = self.control_tx.lock().unwrap().as_ref() {
             let _ = tx.send(ControlCommand::Shutdown);
         }
         if let Some(h) = self._thread.lock().unwrap().take() {
             let _ = h.join();
         }
         self.connected.store(false, Ordering::Release);
+        // Reset per-session state so connect() can be called again.
+        *self.shared.lock().unwrap() = None;
+        *self.control_tx.lock().unwrap() = None;
+        *self.account_id.lock().unwrap() = None;
+        self.core.reset();
+        self.mdt_sent.lock().unwrap().clear();
+        self.market_data_type.store(1, Ordering::Relaxed);
+        self.open_orders.lock().unwrap().clear();
+        self.executions.lock().unwrap().clear();
+        *self.news_providers.lock().unwrap() = "BRFG*BRFUPDN".to_string();
+        self.contract_cache.lock().unwrap().clear();
         Ok(())
     }
 
@@ -225,9 +235,8 @@ impl EClient {
         regulatory_snapshot: bool,
         mkt_data_options: Vec<PyObject>,
     ) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
-        let shared = self.shared.get().unwrap();
+        let tx = self.tx()?;
+        let shared = self.shared_state()?;
 
         // If generic_tick_list contains 292 (news), also subscribe via CCP
         let wants_news = generic_tick_list.split(',')
@@ -258,8 +267,7 @@ impl EClient {
     fn cancel_mkt_data(&self, req_id: i64) -> PyResult<()> {
         if let Some(instrument) = self.core.unregister_mkt_data(req_id) {
             self.mdt_sent.lock().unwrap().remove(&req_id);
-            let tx = self.control_tx.get()
-                .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+            let tx = self.tx()?;
             tx.send(ControlCommand::Unsubscribe { instrument })
                 .map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
             let _ = tx.send(ControlCommand::UnsubscribeNews { instrument });
@@ -277,8 +285,7 @@ impl EClient {
         number_of_ticks: i32,
         ignore_size: bool,
     ) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
 
         let tbt_type = match tick_type {
             "Last" | "AllLast" => TbtType::Last,
@@ -286,7 +293,7 @@ impl EClient {
             _ => return Err(PyRuntimeError::new_err(format!("Unknown tick type: '{}'", tick_type))),
         };
 
-        let shared = self.shared.get().unwrap();
+        let shared = self.shared_state()?;
         tx.send(ControlCommand::RegisterInstrument { con_id: contract.con_id, reply_tx: None })
             .map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
         self.core.register_tbt(
@@ -302,8 +309,7 @@ impl EClient {
     fn cancel_tick_by_tick_data(&self, req_id: i64) -> PyResult<()> {
         if let Some(instrument) = self.core.req_to_instrument.lock().unwrap().remove(&req_id) {
             self.core.instrument_to_req.lock().unwrap().remove(&instrument);
-            let tx = self.control_tx.get()
-                .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+            let tx = self.tx()?;
             tx.send(ControlCommand::UnsubscribeTbt { instrument })
                 .map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
         }
@@ -325,8 +331,7 @@ impl EClient {
         keep_up_to_date: bool,
         chart_options: Vec<PyObject>,
     ) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         let _ = (format_date, keep_up_to_date, chart_options);
         // Route SCHEDULE requests to the schedule-specific command
         if what_to_show.eq_ignore_ascii_case("SCHEDULE") {
@@ -354,8 +359,7 @@ impl EClient {
 
     /// Cancel historical data.
     fn cancel_historical_data(&self, req_id: i64) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::CancelHistorical { req_id: req_id as u32 })
             .map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
         Ok(())
@@ -371,8 +375,7 @@ impl EClient {
         use_rth: i32,
         format_date: i32,
     ) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::FetchHeadTimestamp {
             req_id: req_id as u32,
             con_id: contract.con_id,
@@ -385,8 +388,7 @@ impl EClient {
 
     /// Request contract details.
     fn req_contract_details(&self, req_id: i64, contract: &Contract) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::FetchContractDetails {
             req_id: req_id as u32,
             con_id: contract.con_id,
@@ -442,8 +444,7 @@ impl EClient {
 
     /// Request all positions.
     fn req_positions(&self, py: Python<'_>) -> PyResult<()> {
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let shared = self.shared_state()?;
         let positions = shared.portfolio.position_infos();
         let cache = self.contract_cache.lock().unwrap();
         for pi in &positions {
@@ -467,7 +468,7 @@ impl EClient {
             let avg_cost = pi.avg_cost as f64 / PRICE_SCALE_F;
             self.wrapper.call_method(
                 py, "position",
-                (self.account_id.get().map(|s| s.as_str()).unwrap_or(""), &c_py, pi.position as f64, avg_cost),
+                (self.account().as_str(), &c_py, pi.position as f64, avg_cost),
                 None,
             )?;
         }
@@ -482,8 +483,7 @@ impl EClient {
 
     /// Place an order. Delegates to Rust API's order routing logic.
     fn place_order(&self, py: Python<'_>, order_id: i64, contract: &Contract, order: &Order) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
 
         let oid = if order_id > 0 {
             order_id as u64
@@ -521,8 +521,7 @@ impl EClient {
     /// Cancel an order.
     #[pyo3(signature = (order_id, manual_order_cancel_time=""))]
     fn cancel_order(&self, order_id: i64, manual_order_cancel_time: &str) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::Order(OrderRequest::Cancel { order_id: order_id as u64 }))
             .map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
         let _ = manual_order_cancel_time;
@@ -531,8 +530,7 @@ impl EClient {
 
     /// Cancel all orders globally.
     fn req_global_cancel(&self) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         let map = self.core.req_to_instrument.lock().unwrap();
         for &instrument in map.values() {
             let _ = tx.send(ControlCommand::Order(OrderRequest::CancelAll { instrument }));
@@ -597,7 +595,7 @@ impl EClient {
                 .collect()
         };
         // Also merge in any orders from shared cache not in our local map
-        if let Some(shared) = self.shared.get() {
+        if let Some(shared) = self.shared.lock().unwrap().clone() {
             for (oid, info) in shared.orders.drain_open_orders() {
                 if !matches!(info.order_state.status.as_str(), "Filled" | "Cancelled" | "Inactive") {
                     // Update local contract cache from enriched data
@@ -679,7 +677,7 @@ impl EClient {
         let execs: Vec<StoredExecution> = {
             self.executions.lock().unwrap().clone()
         };
-        let acct_name = self.account_id.get().map(|s| s.as_str()).unwrap_or("");
+        let acct_name = self.account().as_str();
         for se in &execs {
             // Apply filter (empty fields match everything)
             if !f_symbol.is_empty() && !se.contract.symbol.eq_ignore_ascii_case(&f_symbol) { continue; }
@@ -747,8 +745,7 @@ impl EClient {
         ignore_size: bool,
         misc_options: Vec<PyObject>,
     ) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         let _ = (ignore_size, misc_options);
         tx.send(ControlCommand::FetchHistoricalTicks {
             req_id: req_id as u32,
@@ -773,8 +770,7 @@ impl EClient {
         use_rth: i32,
         real_time_bars_options: Vec<PyObject>,
     ) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         let _ = (bar_size, real_time_bars_options);
         tx.send(ControlCommand::SubscribeRealTimeBar {
             req_id: req_id as u32,
@@ -788,8 +784,7 @@ impl EClient {
 
     /// Cancel real-time bars.
     fn cancel_real_time_bars(&self, req_id: i64) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::CancelRealTimeBar { req_id: req_id as u32 })
             .map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
         Ok(())
@@ -797,8 +792,7 @@ impl EClient {
 
     /// Cancel head timestamp request.
     fn cancel_head_time_stamp(&self, req_id: i64) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::CancelHeadTimestamp { req_id: req_id as u32 })
             .map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
         Ok(())
@@ -822,8 +816,7 @@ impl EClient {
 
     /// Search for matching symbols.
     fn req_matching_symbols(&self, req_id: i64, pattern: &str) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::FetchMatchingSymbols {
             req_id: req_id as u32,
             pattern: pattern.to_string(),
@@ -852,8 +845,7 @@ impl EClient {
         scanner_subscription_options: Vec<PyObject>,
     ) -> PyResult<()> {
         let _ = scanner_subscription_options;
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         // Extract fields from the subscription object
         Python::with_gil(|py| {
             let instrument = subscription.getattr(py, "instrument")
@@ -872,8 +864,7 @@ impl EClient {
 
     /// Cancel scanner subscription.
     fn cancel_scanner_subscription(&self, req_id: i64) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::CancelScanner { req_id: req_id as u32 })
             .map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
         Ok(())
@@ -881,8 +872,7 @@ impl EClient {
 
     /// Request scanner parameters XML.
     fn req_scanner_parameters(&self) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::FetchScannerParams)
             .map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
         Ok(())
@@ -909,8 +899,7 @@ impl EClient {
         news_article_options: Vec<PyObject>,
     ) -> PyResult<()> {
         let _ = news_article_options;
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::FetchNewsArticle {
             req_id: req_id as u32,
             provider_code: provider_code.to_string(),
@@ -932,8 +921,7 @@ impl EClient {
         historical_news_options: Vec<PyObject>,
     ) -> PyResult<()> {
         let _ = historical_news_options;
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::FetchHistoricalNews {
             req_id: req_id as u32,
             con_id: con_id as u32,
@@ -957,8 +945,7 @@ impl EClient {
         fundamental_data_options: Vec<PyObject>,
     ) -> PyResult<()> {
         let _ = fundamental_data_options;
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::FetchFundamentalData {
             req_id: req_id as u32,
             con_id: contract.con_id as u32,
@@ -969,8 +956,7 @@ impl EClient {
 
     /// Cancel fundamental data.
     fn cancel_fundamental_data(&self, req_id: i64) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::CancelFundamentalData { req_id: req_id as u32 })
             .map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
         Ok(())
@@ -1043,7 +1029,7 @@ impl EClient {
 
     /// Request managed accounts list.
     fn req_managed_accts(&self, py: Python<'_>) -> PyResult<()> {
-        self.wrapper.call_method1(py, "managed_accounts", (self.account_id.get().map(|s| s.as_str()).unwrap_or(""),))?;
+        self.wrapper.call_method1(py, "managed_accounts", (self.account().as_str(),))?;
         Ok(())
     }
 
@@ -1055,11 +1041,10 @@ impl EClient {
     fn req_account_updates_multi(
         &self, py: Python<'_>, req_id: i64, account: &str, model_code: &str, ledger_and_nlv: bool,
     ) -> PyResult<()> {
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let shared = self.shared_state()?;
         let _ = ledger_and_nlv;
         let acct = shared.portfolio.account();
-        let acct_name = if !account.is_empty() { account } else { self.account_id.get().map(|s| s.as_str()).unwrap_or("") };
+        let acct_name = if !account.is_empty() { account } else { self.account().as_str() };
         let tag_values: [(&str, f64); 8] = [
             ("NetLiquidation", acct.net_liquidation as f64 / PRICE_SCALE_F),
             ("TotalCashValue", acct.total_cash_value as f64 / PRICE_SCALE_F),
@@ -1092,8 +1077,7 @@ impl EClient {
     /// One-shot delivery from SharedState (single-account gateway).
     #[pyo3(signature = (req_id, account, model_code))]
     fn req_positions_multi(&self, py: Python<'_>, req_id: i64, account: &str, model_code: &str) -> PyResult<()> {
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let shared = self.shared_state()?;
         let positions = shared.portfolio.position_infos();
         for pi in &positions {
             let mut c = super::contract::Contract::default();
@@ -1163,7 +1147,7 @@ impl EClient {
     /// Request market rule details (price increments).
     fn req_market_rule(&self, py: Python<'_>, market_rule_id: i32) -> PyResult<()> {
         // Market rules are cached from secdef responses.
-        if let Some(shared) = self.shared.get() {
+        if let Some(shared) = self.shared.lock().unwrap().clone() {
             if let Some(rule) = shared.reference.market_rule(market_rule_id) {
                 let increments: Vec<(f64, f64)> = rule.price_increments.iter()
                     .map(|pi| (pi.low_edge, pi.increment)).collect();
@@ -1205,11 +1189,8 @@ impl EClient {
     fn req_family_codes(&self, py: Python<'_>) -> PyResult<()> {
         // Family codes come from login data.
         // Return account_id with empty family code (matches paper behavior).
-        let account = if !self.account_id.get().map(|s| s.is_empty()).unwrap_or(true) {
-            self.account_id.get().map(|s| s.as_str()).unwrap_or("")
-        } else {
-            "*"
-        };
+        let acct_id = self.account();
+        let account = if !acct_id.is_empty() { acct_id.as_str() } else { "*" };
         let codes = vec![(account, "")];
         let py_list = pyo3::types::PyList::new(py, codes.iter().map(|(acct, code)| {
             pyo3::types::PyTuple::new(py, &[
@@ -1226,8 +1207,7 @@ impl EClient {
     /// Request histogram data.
     #[pyo3(signature = (req_id, contract, use_rth, time_period))]
     fn req_histogram_data(&self, req_id: i64, contract: &Contract, use_rth: bool, time_period: &str) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::FetchHistogramData {
             req_id: req_id as u32,
             con_id: contract.con_id as u32,
@@ -1239,8 +1219,7 @@ impl EClient {
 
     /// Cancel histogram data.
     fn cancel_histogram_data(&self, req_id: i64) -> PyResult<()> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let tx = self.tx()?;
         tx.send(ControlCommand::CancelHistogramData { req_id: req_id as u32 })
             .map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
         Ok(())
@@ -1296,7 +1275,7 @@ impl EClient {
     #[pyo3(signature = (api_only=false))]
     fn req_completed_orders(&self, py: Python<'_>, api_only: bool) -> PyResult<()> {
         let _ = api_only;
-        if let Some(shared) = self.shared.get() {
+        if let Some(shared) = self.shared.lock().unwrap().clone() {
             let completed = shared.orders.drain_completed_orders();
             for co in &completed {
                 let status_str = match co.status {
@@ -1363,14 +1342,14 @@ impl EClient {
         // Fire initial callbacks
         let next_id = self.next_order_id.load(Ordering::Relaxed) as i64;
         self.wrapper.call_method1(py, "next_valid_id", (next_id,))?;
-        self.wrapper.call_method1(py, "managed_accounts", (self.account_id.get().map(|s| s.as_str()).unwrap_or(""),))?;
+        self.wrapper.call_method1(py, "managed_accounts", (self.account().as_str(),))?;
         self.wrapper.call_method0(py, "connect_ack")?;
 
         // Event loop
         while self.connected.load(Ordering::Relaxed) {
             py.check_signals()?;
 
-            let shared = match self.shared.get() {
+            let shared = match self.shared.lock().unwrap().clone() {
                 Some(s) => s,
                 None => break,
             };
@@ -1439,7 +1418,7 @@ impl EClient {
                 });
 
                 // exec_details callback (real-time)
-                let acct_name = self.account_id.get().map(|s| s.as_str()).unwrap_or("");
+                let acct_name = self.account().as_str();
                 let c_py = Py::new(py, exec_contract)?.into_any();
                 let exec_dict = pyo3::types::PyDict::new(py);
                 exec_dict.set_item("execId", exec_id.as_str())?;
@@ -1887,7 +1866,7 @@ impl EClient {
 
             // Account updates (via ClientCore)
             if let Some(batch) = self.core.prepare_account_updates(shared) {
-                let account_name = self.account_id.get().map(|s| s.as_str()).unwrap_or("");
+                let account_name = self.account().as_str();
                 for field in &batch.fields {
                     self.wrapper.call_method1(py, "update_account_value",
                         (field.key, field.value.as_str(), field.currency, account_name))?;
@@ -1919,7 +1898,7 @@ impl EClient {
 
             // Account summary dispatch (via ClientCore)
             {
-                let acct_name = self.account_id.get().map(|s| s.as_str()).unwrap_or("");
+                let acct_name = self.account().as_str();
                 if let Some(batch) = self.core.prepare_account_summary(shared, acct_name) {
                     // Python-specific: also emit AccountType string tag
                     let tags_orig = self.core.account_summary_req.lock().unwrap().clone();
@@ -1953,8 +1932,8 @@ impl EClient {
     }
 
     /// Get the account ID.
-    fn get_account_id(&self) -> &str {
-        self.account_id.get().map(|s| s.as_str()).unwrap_or("")
+    fn get_account_id(&self) -> String {
+        self.account()
     }
 }
 
@@ -1972,9 +1951,9 @@ impl EClient {
         }
         let shared = Arc::new(SharedState::new());
         let (tx, _rx) = crossbeam_channel::unbounded();
-        self.shared.set(shared).unwrap_or_else(|_| panic!("shared already set"));
-        self.control_tx.set(tx).expect("control_tx already set");
-        self.account_id.set(account_id).unwrap_or_else(|_| panic!("account_id already set"));
+        *self.shared.lock().unwrap() = Some(shared);
+        *self.control_tx.lock().unwrap() = Some(tx);
+        *self.account_id.lock().unwrap() = Some(account_id);
         self.next_order_id.store(1000, Ordering::Relaxed);
         self.connected.store(true, Ordering::Release);
         Ok(())
@@ -1990,8 +1969,7 @@ impl EClient {
     /// Set instrument count on SharedState.
     #[doc(hidden)]
     fn _test_set_instrument_count(&self, count: u32) -> PyResult<()> {
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let shared = self.shared_state()?;
         shared.market.set_instrument_count(count);
         Ok(())
     }
@@ -2005,8 +1983,7 @@ impl EClient {
         bid_size: i64, ask_size: i64, last_size: i64,
         volume: i64, open: f64, high: f64, low: f64, close: f64,
     ) -> PyResult<()> {
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let shared = self.shared_state()?;
         let ps = PRICE_SCALE as f64;
         let q = Quote {
             bid: (bid * ps) as i64, ask: (ask * ps) as i64, last: (last * ps) as i64,
@@ -2028,8 +2005,7 @@ impl EClient {
         &self, instrument: u32, order_id: u64, side: &str,
         price: f64, qty: i64, remaining: i64, commission: f64,
     ) -> PyResult<()> {
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let shared = self.shared_state()?;
         let s = match side {
             "BUY" => Side::Buy,
             "SELL" => Side::Sell,
@@ -2052,8 +2028,7 @@ impl EClient {
         &self, order_id: u64, instrument: u32, status: &str,
         filled_qty: i64, remaining_qty: i64,
     ) -> PyResult<()> {
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let shared = self.shared_state()?;
         let st = match status {
             "PendingSubmit" => OrderStatus::PendingSubmit,
             "Submitted" => OrderStatus::Submitted,
@@ -2071,8 +2046,7 @@ impl EClient {
     /// Push a cancel reject into SharedState.
     #[doc(hidden)]
     fn _test_push_cancel_reject(&self, order_id: u64, instrument: u32, reason_code: i32) -> PyResult<()> {
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let shared = self.shared_state()?;
         shared.orders.push_cancel_reject(CancelReject {
             order_id, instrument, reject_type: 1, reason_code, timestamp_ns: 100,
         });
@@ -2084,8 +2058,7 @@ impl EClient {
     fn _test_push_tbt_trade(
         &self, instrument: u32, price: f64, size: i64, exchange: &str,
     ) -> PyResult<()> {
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let shared = self.shared_state()?;
         let ps = PRICE_SCALE as f64;
         shared.market.push_tbt_trade(TbtTrade {
             instrument, price: (price * ps) as i64, size,
@@ -2099,8 +2072,7 @@ impl EClient {
     fn _test_push_tbt_quote(
         &self, instrument: u32, bid: f64, ask: f64, bid_size: i64, ask_size: i64,
     ) -> PyResult<()> {
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let shared = self.shared_state()?;
         let ps = PRICE_SCALE as f64;
         shared.market.push_tbt_quote(TbtQuote {
             instrument,
@@ -2115,8 +2087,7 @@ impl EClient {
     fn _test_push_historical_data(
         &self, req_id: u32, bars: Vec<(String, f64, f64, f64, f64, i64)>, is_complete: bool,
     ) -> PyResult<()> {
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let shared = self.shared_state()?;
         let bar_list: Vec<HistoricalBar> = bars.into_iter().map(|(time, o, h, l, c, v)| {
             HistoricalBar { time, open: o, high: h, low: l, close: c, volume: v, wap: 0.0, count: 0 }
         }).collect();
@@ -2129,8 +2100,7 @@ impl EClient {
     /// Push a head timestamp into SharedState.
     #[doc(hidden)]
     fn _test_push_head_timestamp(&self, req_id: u32, timestamp: &str) -> PyResult<()> {
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let shared = self.shared_state()?;
         shared.reference.push_head_timestamp(req_id, HeadTimestampResponse {
             head_timestamp: timestamp.to_string(), timezone: String::new(),
         });
@@ -2144,8 +2114,7 @@ impl EClient {
         &self, net_liquidation: f64, buying_power: f64,
         daily_pnl: f64, unrealized_pnl: f64, realized_pnl: f64,
     ) -> PyResult<()> {
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let shared = self.shared_state()?;
         let ps = PRICE_SCALE as f64;
         let mut acct = shared.portfolio.account();
         acct.net_liquidation = (net_liquidation * ps) as i64;
@@ -2160,8 +2129,7 @@ impl EClient {
     /// Push a position into SharedState.
     #[doc(hidden)]
     fn _test_set_position(&self, con_id: i64, position: i64, avg_cost: f64) -> PyResult<()> {
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let shared = self.shared_state()?;
         let ps = PRICE_SCALE as f64;
         shared.portfolio.set_position_info(PositionInfo {
             con_id, position, avg_cost: (avg_cost * ps) as i64,
@@ -2178,8 +2146,7 @@ impl EClient {
         }
         // Temporarily disconnect so we can reuse the run() dispatch logic
         // without entering the while loop. Instead, inline the dispatch here.
-        let shared = self.shared.get()
-            .ok_or_else(|| PyRuntimeError::new_err("No shared state"))?;
+        let shared = self.shared_state()?;
 
         // Drain fills -> order_status
         let fills = shared.orders.drain_fills();
@@ -2244,7 +2211,7 @@ impl EClient {
             });
 
             // exec_details callback
-            let acct_name = self.account_id.get().map(|s| s.as_str()).unwrap_or("");
+            let acct_name = self.account().as_str();
             let c_py = Py::new(py, exec_contract)?.into_any();
             let exec_dict = pyo3::types::PyDict::new(py);
             exec_dict.set_item("execId", exec_id.as_str())?;
@@ -2485,9 +2452,10 @@ impl EClient {
         }
 
         // Account state -> update_account_value (all fields)
-        if !self.account_id.get().map(|s| s.is_empty()).unwrap_or(true) {
+        let acct_id = self.account();
+        if !acct_id.is_empty() {
             let acct = shared.portfolio.account();
-            let account_name = self.account_id.get().map(|s| s.as_str()).unwrap_or("");
+            let account_name = acct_id.as_str();
             let fields: &[(&str, i64)] = &[
                 ("NetLiquidation", acct.net_liquidation),
                 ("BuyingPower", acct.buying_power),
@@ -2515,7 +2483,7 @@ impl EClient {
 
         // Account summary dispatch (via ClientCore)
         {
-            let acct_name = self.account_id.get().map(|s| s.as_str()).unwrap_or("");
+            let acct_name = self.account().as_str();
             if let Some(batch) = self.core.prepare_account_summary(shared, acct_name) {
                 // Python-specific: also emit AccountType string tag
                 let tags_orig = self.core.account_summary_req.lock().unwrap().clone();
@@ -2543,13 +2511,28 @@ impl EClient {
 }
 
 impl EClient {
+    /// Clone the control channel sender, or return "Not connected".
+    fn tx(&self) -> PyResult<Sender<ControlCommand>> {
+        self.control_tx.lock().unwrap().clone()
+            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))
+    }
+
+    /// Clone the shared state Arc, or return "Not connected".
+    fn shared_state(&self) -> PyResult<Arc<SharedState>> {
+        self.shared.lock().unwrap().clone()
+            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))
+    }
+
+    /// Return the account id (empty string if not connected).
+    fn account(&self) -> String {
+        self.account_id.lock().unwrap().clone().unwrap_or_default()
+    }
+
     /// Find instrument ID for a contract, registering if needed.
     fn find_or_register_instrument(&self, contract: &Contract) -> PyResult<u32> {
-        let tx = self.control_tx.get()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
-        let shared = self.shared.get().unwrap();
+        let tx = self.tx()?;
         self.core.find_or_register_instrument(
-            shared, tx,
+            &tx,
             contract.con_id, &contract.symbol, &contract.exchange, &contract.sec_type,
         ).map_err(|e| PyRuntimeError::new_err(e))
     }
