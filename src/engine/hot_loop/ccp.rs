@@ -2082,7 +2082,7 @@ impl CcpState {
         self.pending_secdef.push(req_id);
     }
 
-    pub(crate) fn send_secdef_request_by_symbol(&mut self, req_id: u32, symbol: &str, sec_type: &str, exchange: &str, currency: &str, ccp_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
+    pub(crate) fn send_secdef_request_by_symbol(&mut self, req_id: u32, symbol: &str, sec_type: &str, exchange: &str, currency: &str, maturity: &str, ccp_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
         if let Some(conn) = ccp_conn.as_mut() {
             let req_id_str = req_id.to_string();
             let ts = chrono_free_timestamp();
@@ -2090,7 +2090,7 @@ impl CcpState {
             let fix_sec_type = match sec_type {
                 "STK" => "CS", "FUT" => "FUT", "OPT" => "OPT", "IND" => "IND", other => other,
             };
-            let _ = conn.send_fix(&[
+            let mut fields: Vec<(u32, &str)> = vec![
                 (fix::TAG_MSG_TYPE, "c"),
                 (fix::TAG_SENDING_TIME, &ts),
                 (320, &req_id_str),
@@ -2100,8 +2100,12 @@ impl CcpState {
                 (207, fix_exchange),
                 (15, currency),
                 (6088, "Socket"),
-            ]);
-            log::info!("Sent secdef-by-symbol: req_id={} symbol={} sec_type={}", req_id, symbol, sec_type);
+            ];
+            if !maturity.is_empty() {
+                fields.push((200, maturity)); // MaturityMonthYear
+            }
+            let _ = conn.send_fix(&fields);
+            log::info!("Sent secdef-by-symbol: req_id={} symbol={} sec_type={} maturity={}", req_id, symbol, sec_type, maturity);
             hb.last_ccp_sent = Instant::now();
         }
         self.pending_secdef.push(req_id);
