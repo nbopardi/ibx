@@ -244,7 +244,7 @@ impl EClient {
         };
 
         let instrument = self.core.find_or_register_instrument(
-            &self.shared, &self.control_tx,
+            &self.control_tx,
             contract.con_id, &contract.symbol, &contract.exchange, &contract.sec_type,
         )?;
 
@@ -1053,6 +1053,8 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = std::thread::spawn(|| {});
         let client = EClient::from_parts(shared.clone(), tx, handle, "DU123".into());
+        // Pre-seed SPY so find_or_register_instrument hits the fast path.
+        client.core.con_id_to_instrument.lock().unwrap().insert(756733, 0);
         (client, rx, shared)
     }
 
@@ -1284,9 +1286,7 @@ mod tests {
         shared.market.set_instrument_count(1);
         let order = Order { action: "BUY".into(), total_quantity: 100.0, order_type: "MKT".into(), ..Default::default() };
         client.place_order(1, &spy(), &order).unwrap();
-        // Drain RegisterInstrument + Subscribe
-        let _ = rx.try_recv();
-        let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         match cmd {
             ControlCommand::Order(OrderRequest::SubmitMarket { qty, .. }) => assert_eq!(qty, 100),
@@ -1303,7 +1303,7 @@ mod tests {
             lmt_price: 150.25, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         match cmd {
             ControlCommand::Order(OrderRequest::SubmitLimit { qty, price, .. }) => {
@@ -1323,7 +1323,7 @@ mod tests {
             lmt_price: 100.0, tif: "GTC".into(), ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         match cmd {
             ControlCommand::Order(OrderRequest::SubmitLimitEx { tif, .. }) => {
@@ -1342,7 +1342,7 @@ mod tests {
             lmt_price: 100.0, hidden: true, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         match cmd {
             ControlCommand::Order(OrderRequest::SubmitLimitEx { attrs, .. }) => {
@@ -1361,7 +1361,7 @@ mod tests {
             aux_price: 145.0, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         match cmd {
             ControlCommand::Order(OrderRequest::SubmitStop { side, stop_price, .. }) => {
@@ -1381,7 +1381,7 @@ mod tests {
             lmt_price: 144.0, aux_price: 145.0, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         match cmd {
             ControlCommand::Order(OrderRequest::SubmitStopLimit { price, stop_price, .. }) => {
@@ -1401,7 +1401,7 @@ mod tests {
             aux_price: 2.0, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         match cmd {
             ControlCommand::Order(OrderRequest::SubmitTrailingStop { trail_amt, .. }) => {
@@ -1420,7 +1420,7 @@ mod tests {
             trailing_percent: 5.0, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         match cmd {
             ControlCommand::Order(OrderRequest::SubmitTrailingStopPct { trail_pct, .. }) => {
@@ -1439,7 +1439,7 @@ mod tests {
             lmt_price: 148.0, aux_price: 2.0, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitTrailingStopLimit { .. })));
     }
@@ -1452,7 +1452,7 @@ mod tests {
             action: "BUY".into(), total_quantity: 100.0, order_type: "MOC".into(), ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitMoc { .. })));
     }
@@ -1466,7 +1466,7 @@ mod tests {
             lmt_price: 150.0, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitLoc { .. })));
     }
@@ -1480,7 +1480,7 @@ mod tests {
             aux_price: 148.0, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitMit { .. })));
     }
@@ -1494,7 +1494,7 @@ mod tests {
             lmt_price: 150.0, aux_price: 148.0, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitLit { .. })));
     }
@@ -1507,7 +1507,7 @@ mod tests {
             action: "BUY".into(), total_quantity: 100.0, order_type: "MTL".into(), ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitMtl { .. })));
     }
@@ -1520,7 +1520,7 @@ mod tests {
             action: "BUY".into(), total_quantity: 100.0, order_type: "MKT PRT".into(), ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitMktPrt { .. })));
     }
@@ -1534,7 +1534,7 @@ mod tests {
             aux_price: 145.0, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitStpPrt { .. })));
     }
@@ -1548,7 +1548,7 @@ mod tests {
             aux_price: 0.10, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitRel { .. })));
     }
@@ -1562,7 +1562,7 @@ mod tests {
             aux_price: 0.05, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitPegMkt { .. })));
     }
@@ -1576,7 +1576,7 @@ mod tests {
             aux_price: 0.02, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitPegMid { .. })));
     }
@@ -1590,7 +1590,7 @@ mod tests {
             lmt_price: 150.0, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitMidPrice { .. })));
     }
@@ -1603,7 +1603,7 @@ mod tests {
             action: "BUY".into(), total_quantity: 100.0, order_type: "SNAP MKT".into(), ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitSnapMkt { .. })));
     }
@@ -1616,7 +1616,7 @@ mod tests {
             action: "BUY".into(), total_quantity: 100.0, order_type: "SNAP MID".into(), ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitSnapMid { .. })));
     }
@@ -1629,7 +1629,7 @@ mod tests {
             action: "BUY".into(), total_quantity: 100.0, order_type: "SNAP PRI".into(), ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitSnapPri { .. })));
     }
@@ -1642,7 +1642,7 @@ mod tests {
             action: "BUY".into(), total_quantity: 100.0, order_type: "BOX TOP".into(), ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitMtl { .. })));
     }
@@ -1655,7 +1655,7 @@ mod tests {
             action: "SELL".into(), total_quantity: 50.0, order_type: "MKT".into(), ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         match cmd {
             ControlCommand::Order(OrderRequest::SubmitMarket { side, .. }) => {
@@ -1673,7 +1673,7 @@ mod tests {
             action: "SSHORT".into(), total_quantity: 50.0, order_type: "MKT".into(), ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         match cmd {
             ControlCommand::Order(OrderRequest::SubmitMarket { side, .. }) => {
@@ -1694,7 +1694,7 @@ mod tests {
             ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitAlgo { .. })));
     }
@@ -1708,7 +1708,7 @@ mod tests {
             lmt_price: 150.0, what_if: true, ..Default::default()
         };
         client.place_order(1, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitWhatIf { .. })));
     }
@@ -1745,7 +1745,7 @@ mod tests {
         };
         // order_id = 0 → auto-assign
         client.place_order(0, &spy(), &order).unwrap();
-        let _ = rx.try_recv(); let _ = rx.try_recv();
+
         let cmd = rx.try_recv().unwrap();
         match cmd {
             ControlCommand::Order(OrderRequest::SubmitMarket { order_id, .. }) => {

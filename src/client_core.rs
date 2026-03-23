@@ -255,6 +255,22 @@ impl ClientCore {
         }
     }
 
+    /// Clear all per-session state so the owning client can reconnect.
+    pub fn reset(&self) {
+        self.req_to_instrument.lock().unwrap().clear();
+        self.instrument_to_req.lock().unwrap().clear();
+        self.con_id_to_instrument.lock().unwrap().clear();
+        self.last_quotes.lock().unwrap().clear();
+        self.snapshot_reqs.lock().unwrap().clear();
+        *self.pnl_req_id.lock().unwrap() = None;
+        self.pnl_single_reqs.lock().unwrap().clear();
+        *self.last_pnl.lock().unwrap() = [0; 3];
+        *self.account_summary_req.lock().unwrap() = None;
+        self.bulletin_subscribed.store(false, Ordering::Relaxed);
+        self.account_updates_subscribed.store(false, Ordering::Relaxed);
+        *self.last_account.lock().unwrap() = None;
+    }
+
     // ── Registration helpers ──
 
     /// Registration reply timeout.
@@ -273,7 +289,6 @@ impl ClientCore {
     /// Returns `Err` if the control channel is closed.
     pub fn find_or_register_instrument(
         &self,
-        shared: &SharedState,
         control_tx: &Sender<ControlCommand>,
         con_id: i64,
         symbol: &str,
@@ -300,17 +315,9 @@ impl ClientCore {
             reply_tx: Some(reply_tx),
         }).map_err(|e| format!("Engine stopped: {}", e))?;
 
-        match Self::recv_registration(reply_rx) {
-            Ok(id) => {
-                self.con_id_to_instrument.lock().unwrap().insert(con_id, id);
-                Ok(id)
-            }
-            Err(_) => {
-                let id = shared.market.instrument_count().saturating_sub(1);
-                self.con_id_to_instrument.lock().unwrap().insert(con_id, id);
-                Ok(id)
-            }
-        }
+        let id = Self::recv_registration(reply_rx)?;
+        self.con_id_to_instrument.lock().unwrap().insert(con_id, id);
+        Ok(id)
     }
 
     // ── Subscription management ──
