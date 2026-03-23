@@ -273,8 +273,8 @@ impl HotLoop {
                     self.shared.set_instrument_count(self.context.market.count());
                     if let Some(tx) = reply_tx { let _ = tx.send(id); }
                 }
-                ControlCommand::FetchHistorical { req_id, con_id, symbol, end_date_time, duration, bar_size, what_to_show, use_rth, .. } => {
-                    self.hmds.send_historical_request(req_id, con_id, &end_date_time, &duration, &bar_size, &what_to_show, use_rth, &mut self.hmds_conn, &mut self.hb);
+                ControlCommand::FetchHistorical { req_id, con_id, symbol, exchange, sec_type, end_date_time, duration, bar_size, what_to_show, use_rth } => {
+                    self.hmds.send_historical_request(req_id, con_id, &exchange, &sec_type, &end_date_time, &duration, &bar_size, &what_to_show, use_rth, &mut self.hmds_conn, &mut self.hb);
                     let _ = symbol;
                 }
                 ControlCommand::CancelHistorical { req_id } => {

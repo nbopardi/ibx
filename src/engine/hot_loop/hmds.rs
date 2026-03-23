@@ -427,6 +427,8 @@ impl HmdsState {
         &mut self,
         req_id: u32,
         con_id: i64,
+        exchange: &str,
+        sec_type: &str,
         end_date_time: &str,
         duration: &str,
         bar_size: &str,
@@ -483,12 +485,22 @@ impl HmdsState {
         };
 
         let query_id = format!("hist_{}", qid);
+        let fix_sec_type: &'static str = match sec_type {
+            "STK" => "CS", "FUT" => "FUT", "OPT" => "OPT", "IND" => "IND",
+            "CASH" => "CASH", "BOND" => "BOND", "WAR" => "WAR", _ => "CS",
+        };
+        let fix_exchange: &'static str = match exchange {
+            "SMART" => "BEST", "CME" => "CME", "GLOBEX" => "GLOBEX",
+            "NYSE" => "NYSE", "NASDAQ" => "NASDAQ", "AMEX" => "AMEX",
+            "ARCA" => "ARCA", "CBOE" => "CBOE", "ISE" => "ISE",
+            "IDEALPRO" => "IDEALPRO", "ISLAND" => "ISLAND", _ => "BEST",
+        };
         let req = crate::control::historical::HistoricalRequest {
             query_id: query_id.clone(),
             con_id: con_id as u32,
             symbol: String::new(),
-            sec_type: "CS",
-            exchange: "SMART",
+            sec_type: fix_sec_type,
+            exchange: fix_exchange,
             data_type,
             end_time: end_date_time.to_string(),
             duration: duration.to_string(),
