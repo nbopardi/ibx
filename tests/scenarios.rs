@@ -78,6 +78,7 @@ fn order_lifecycle_partial_then_full_fill() {
 fn order_lifecycle_place_then_cancel() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
+    client.seed_instrument(756733, 0);
 
     // Place order
     let order = Order {
@@ -152,6 +153,7 @@ fn order_lifecycle_partial_fill_then_cancel() {
 fn order_lifecycle_modify_then_fill() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
+    client.seed_instrument(756733, 0);
 
     // Place limit at 150
     let order = Order {
@@ -188,6 +190,7 @@ fn order_lifecycle_modify_then_fill() {
 fn order_lifecycle_what_if_preview() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
+    client.seed_instrument(756733, 0);
 
     let order = Order {
         action: "BUY".into(), total_quantity: 100.0,
@@ -227,6 +230,7 @@ fn order_lifecycle_what_if_preview() {
 fn order_lifecycle_algo_vwap_partial_fills() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
+    client.seed_instrument(756733, 0);
     client.map_req_instrument(1, 0);
 
     let order = Order {
@@ -816,6 +820,7 @@ fn mixed_news_between_orders() {
 
     // News arrives
     shared.market.push_tick_news(TickNews {
+        instrument: 0,
         provider_code: "BRFG".into(), article_id: "BRFG$200".into(),
         headline: "Fed holds rates".into(), timestamp: 1700000000,
     });
@@ -871,6 +876,7 @@ fn mixed_all_data_types_single_process() {
 
     // News
     shared.market.push_tick_news(TickNews {
+        instrument: 0,
         provider_code: "DJ".into(), article_id: "DJ$1".into(),
         headline: "Breaking".into(), timestamp: 0,
     });

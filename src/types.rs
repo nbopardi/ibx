@@ -806,6 +806,7 @@ pub struct DepthUpdate {
 /// A real-time news headline from 8=O|35=G tick type 0x1E90.
 #[derive(Debug, Clone)]
 pub struct TickNews {
+    pub instrument: InstrumentId,
     pub provider_code: String,
     pub article_id: String,
     pub headline: String,

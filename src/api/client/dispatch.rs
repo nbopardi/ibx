@@ -162,10 +162,9 @@ impl EClient {
     fn dispatch_data(&self, wrapper: &mut impl Wrapper) {
         // News → tick_news
         for news in self.shared.market.drain_tick_news() {
-            let first_req_id = self.core.instrument_to_req.lock().unwrap()
-                .values().next().copied().unwrap_or(-1);
+            let req_id = self.core.req_id_for_instrument(news.instrument);
             wrapper.tick_news(
-                first_req_id, news.timestamp as i64,
+                req_id, news.timestamp as i64,
                 &news.provider_code, &news.article_id, &news.headline, "",
             );
         }

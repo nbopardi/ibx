@@ -217,7 +217,7 @@ impl FarmState {
                 let parsed = fix::fix_parse(msg);
                 super::ccp::handle_position_update(&parsed, context, shared, event_tx);
             }
-            b"G" => self.handle_tick_news(msg, shared, event_tx),
+            b"G" => self.handle_tick_news(msg, context, shared, event_tx),
             _ => {}
         }
     }
@@ -524,7 +524,7 @@ impl FarmState {
         log::info!("Farm reconnected, re-subscribed {} instruments", self.instrument_md_reqs.len());
     }
 
-    fn handle_tick_news(&mut self, msg: &[u8], shared: &SharedState, event_tx: &Option<Sender<Event>>) {
+    fn handle_tick_news(&mut self, msg: &[u8], context: &Context, shared: &SharedState, event_tx: &Option<Sender<Event>>) {
         let body = match find_body_after_tag(msg, b"35=G\x01") {
             Some(b) => b,
             None => return,
@@ -534,6 +534,9 @@ impl FarmState {
 
         let tick_type = u16::from_be_bytes([body[0], body[1]]);
         if tick_type != 0x1E90 { return; }
+
+        let server_tag = u32::from_be_bytes([body[2], body[3], body[4], body[5]]);
+        let instrument = context.market.instrument_by_server_tag(server_tag).unwrap_or(0);
 
         let batch_count = u32::from_be_bytes([body[8], body[9], body[10], body[11]]) as usize;
         let mut pos = 12;
@@ -578,6 +581,7 @@ impl FarmState {
             };
 
             let news = crate::types::TickNews {
+                instrument,
                 provider_code: provider,
                 article_id,
                 headline,

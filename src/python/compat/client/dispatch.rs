@@ -320,16 +320,13 @@ impl EClient {
         // Drain news -> tickNews
         let news_items = shared.market.drain_tick_news();
         for news in news_items {
-            let first_req_id = self.core.instrument_to_req.lock().unwrap()
-                .values().next().copied();
-            if let Some(req_id) = first_req_id {
-                self.wrapper.call_method(
-                    py, "tick_news",
-                    (req_id, news.timestamp as i64, news.provider_code.as_str(),
-                     news.article_id.as_str(), news.headline.as_str(), ""),
-                    None,
-                )?;
-            }
+            let req_id = self.core.req_id_for_instrument(news.instrument);
+            self.wrapper.call_method(
+                py, "tick_news",
+                (req_id, news.timestamp as i64, news.provider_code.as_str(),
+                 news.article_id.as_str(), news.headline.as_str(), ""),
+                None,
+            )?;
         }
 
         // Drain news bulletins -> updateNewsBulletin

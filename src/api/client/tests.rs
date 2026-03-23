@@ -1324,6 +1324,7 @@ fn process_msgs_dispatches_tick_news() {
     let (client, _rx, shared) = test_client();
     client.core.instrument_to_req.lock().unwrap().insert(0, 1);
     shared.market.push_tick_news(TickNews {
+        instrument: 0,
         provider_code: "BRFG".into(), article_id: "BRFG$123".into(),
         headline: "AAPL beats".into(), timestamp: 1700000000,
     });
