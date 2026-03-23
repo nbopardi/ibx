@@ -112,7 +112,7 @@ impl SeqQuote {
 
 // ── Domain-specific state containers ──
 
-/// Lock-free quotes, TBT streams, real-time bars, and news ticks.
+/// Lock-free quotes, TBT streams, real-time bars, depth updates, and news ticks.
 pub struct MarketDataState {
     quotes: Box<[SeqQuote; MAX_INSTRUMENTS]>,
     /// InstrumentId counter — set by hot loop on RegisterInstrument.
@@ -120,6 +120,7 @@ pub struct MarketDataState {
     tbt_trades: Mutex<Vec<TbtTrade>>,
     tbt_quotes: Mutex<Vec<TbtQuote>>,
     real_time_bars: Mutex<Vec<(u32, RealTimeBar)>>,
+    depth_updates: Mutex<Vec<DepthUpdate>>,
     tick_news: Mutex<Vec<TickNews>>,
     news_bulletins: Mutex<Vec<NewsBulletin>>,
 }
@@ -132,6 +133,7 @@ impl MarketDataState {
             tbt_trades: Mutex::new(Vec::with_capacity(256)),
             tbt_quotes: Mutex::new(Vec::with_capacity(256)),
             real_time_bars: Mutex::new(Vec::with_capacity(64)),
+            depth_updates: Mutex::new(Vec::with_capacity(64)),
             tick_news: Mutex::new(Vec::with_capacity(32)),
             news_bulletins: Mutex::new(Vec::with_capacity(16)),
         }
@@ -160,6 +162,10 @@ impl MarketDataState {
         std::mem::take(&mut *self.real_time_bars.lock().unwrap())
     }
 
+    pub fn drain_depth_updates(&self) -> Vec<DepthUpdate> {
+        std::mem::take(&mut *self.depth_updates.lock().unwrap())
+    }
+
     pub fn drain_tick_news(&self) -> Vec<TickNews> {
         std::mem::take(&mut *self.tick_news.lock().unwrap())
     }
@@ -185,6 +191,10 @@ impl MarketDataState {
 
     #[doc(hidden)] pub fn push_real_time_bar(&self, req_id: u32, bar: RealTimeBar) {
         self.real_time_bars.lock().unwrap().push((req_id, bar));
+    }
+
+    #[doc(hidden)] pub fn push_depth_update(&self, update: DepthUpdate) {
+        self.depth_updates.lock().unwrap().push(update);
     }
 
     #[doc(hidden)] pub fn push_tick_news(&self, news: TickNews) {

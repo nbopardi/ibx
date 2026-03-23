@@ -16,6 +16,8 @@ pub(crate) struct FarmState {
     pub(crate) next_md_req_id: u32,
     pub(crate) md_req_to_instrument: Vec<(u32, InstrumentId)>,
     pub(crate) instrument_md_reqs: Vec<(InstrumentId, FarmSlot, Vec<u32>)>,
+    /// Active depth subscriptions: (req_id, farm_slot).
+    pub(crate) depth_subs: Vec<(u32, FarmSlot)>,
     pub(crate) disconnected: bool,
     pub(crate) tick_buf: Vec<tick_decoder::RawTick>,
     pub(crate) farm_msg_buf: Vec<Vec<u8>>,
@@ -27,6 +29,7 @@ impl FarmState {
             next_md_req_id: 1,
             md_req_to_instrument: Vec::new(),
             instrument_md_reqs: Vec::new(),
+            depth_subs: Vec::new(),
             disconnected: false,
             tick_buf: Vec::with_capacity(16),
             farm_msg_buf: Vec::with_capacity(32),
@@ -403,6 +406,82 @@ impl FarmState {
             ]);
         }
         hb.last_farm_sent = Instant::now();
+    }
+
+    pub(crate) fn send_depth_subscribe(
+        &mut self,
+        req_id: u32,
+        con_id: i64,
+        exchange: &str,
+        sec_type: &str,
+        num_rows: i32,
+        is_smart_depth: bool,
+        farm_conn: &mut Option<Connection>,
+        cashfarm_conn: &mut Option<Connection>,
+        usfuture_conn: &mut Option<Connection>,
+        eufarm_conn: &mut Option<Connection>,
+        jfarm_conn: &mut Option<Connection>,
+        hb: &mut HeartbeatState,
+    ) {
+        let farm = crate::types::farm_for_instrument(exchange, sec_type);
+        let fix_exchange = if is_smart_depth || exchange == "SMART" { "BEST" } else { exchange };
+        let fix_sec_type = match sec_type {
+            "STK" => "CS", "FUT" => "FUT", "OPT" => "OPT", "IND" => "IND",
+            "CASH" => "CASH", other => other,
+        };
+        self.depth_subs.push((req_id, farm));
+
+        if let Some(conn) = farm_conn_for_slot(farm, farm_conn, cashfarm_conn, usfuture_conn, eufarm_conn, jfarm_conn) {
+            let req_id_str = req_id.to_string();
+            let con_id_str = (con_id as u32).to_string();
+            let num_rows_str = num_rows.to_string();
+            let ts = chrono_free_timestamp();
+            let _ = conn.send_fixcomp(&[
+                (fix::TAG_MSG_TYPE, fix::MSG_MARKET_DATA_REQ),
+                (fix::TAG_SENDING_TIME, &ts),
+                (263, "1"),
+                (146, "1"),
+                (262, &req_id_str),
+                (6008, &con_id_str),
+                (207, fix_exchange),
+                (167, fix_sec_type),
+                (264, &num_rows_str),
+                (6088, "Socket"),
+                (9830, "1"),
+            ]);
+            log::info!("Sent depth subscribe: con_id={} req_id={} rows={} exchange={}",
+                con_id, req_id, num_rows, fix_exchange);
+            hb.last_farm_sent = Instant::now();
+        }
+    }
+
+    pub(crate) fn send_depth_unsubscribe(
+        &mut self,
+        req_id: u32,
+        farm_conn: &mut Option<Connection>,
+        cashfarm_conn: &mut Option<Connection>,
+        usfuture_conn: &mut Option<Connection>,
+        eufarm_conn: &mut Option<Connection>,
+        jfarm_conn: &mut Option<Connection>,
+        hb: &mut HeartbeatState,
+    ) {
+        let farm = match self.depth_subs.iter().position(|(id, _)| *id == req_id) {
+            Some(idx) => {
+                let (_, f) = self.depth_subs.remove(idx);
+                f
+            }
+            None => return,
+        };
+        if let Some(conn) = farm_conn_for_slot(farm, farm_conn, cashfarm_conn, usfuture_conn, eufarm_conn, jfarm_conn) {
+            let req_id_str = req_id.to_string();
+            let _ = conn.send_fixcomp(&[
+                (fix::TAG_MSG_TYPE, fix::MSG_MARKET_DATA_REQ),
+                (262, &req_id_str),
+                (263, "2"),
+            ]);
+            hb.last_farm_sent = Instant::now();
+            log::info!("Sent depth unsubscribe: req_id={}", req_id);
+        }
     }
 
     pub(crate) fn handle_disconnect(&mut self, context: &mut Context, event_tx: &Option<Sender<Event>>) {

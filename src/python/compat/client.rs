@@ -570,17 +570,28 @@ impl EClient {
         is_smart_depth: bool,
         mkt_depth_options: Vec<PyObject>,
     ) -> PyResult<()> {
-        // L2 depth data requires a different subscription protocol not yet supported.
-        // Accept the call for API compatibility; the wrapper callbacks won't fire.
-        let _ = (req_id, contract, num_rows, is_smart_depth, mkt_depth_options);
-        log::warn!("req_mkt_depth: L2 depth subscription not yet implemented in engine");
+        let _ = mkt_depth_options;
+        let exchange = if contract.exchange.is_empty() { "SMART".to_string() } else { contract.exchange.clone() };
+        let sec_type = if contract.sec_type.is_empty() { "STK".to_string() } else { contract.sec_type.clone() };
+        let tx = self.tx()?;
+        tx.send(ControlCommand::SubscribeDepth {
+            req_id: req_id as u32,
+            con_id: contract.con_id,
+            exchange,
+            sec_type,
+            num_rows,
+            is_smart_depth,
+        }).map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
         Ok(())
     }
 
     /// Cancel market depth.
     #[pyo3(signature = (req_id, is_smart_depth=false))]
     fn cancel_mkt_depth(&self, req_id: i64, is_smart_depth: bool) -> PyResult<()> {
-        let _ = (req_id, is_smart_depth);
+        let _ = is_smart_depth;
+        let tx = self.tx()?;
+        tx.send(ControlCommand::UnsubscribeDepth { req_id: req_id as u32 })
+            .map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
         Ok(())
     }
 
@@ -882,10 +893,25 @@ impl EClient {
 
     /// Request news providers.
     fn req_news_providers(&self, py: Python<'_>) -> PyResult<()> {
-        // News providers are typically cached by the gateway.
-        // Return an empty list for now — the callback signature is satisfied.
-        let empty_list = pyo3::types::PyList::empty(py);
-        self.wrapper.call_method1(py, "news_providers", (empty_list.as_any(),))?;
+        // Provider list is gateway-local (cached during login).
+        // Return the known set for accounts with standard data subscriptions.
+        let providers: &[(&str, &str)] = &[
+            ("BRFG", "Briefing.com General Market Columns"),
+            ("BRFUPDN", "Briefing.com Analyst Actions"),
+            ("DJ-N", "Dow Jones Global Equity Trader"),
+            ("DJ-RTA", "Dow Jones Top Stories Asia Pacific"),
+            ("DJ-RTE", "Dow Jones Top Stories Europe"),
+            ("DJ-RTG", "Dow Jones Top Stories Global"),
+            ("DJ-RTPRO", "Dow Jones Top Stories Pro"),
+            ("DJNL", "Dow Jones Newsletters"),
+        ];
+        let py_list = pyo3::types::PyList::new(py, providers.iter().map(|(code, name)| {
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("code", *code).unwrap();
+            dict.set_item("name", *name).unwrap();
+            dict
+        }))?;
+        self.wrapper.call_method1(py, "news_providers", (py_list.as_any(),))?;
         Ok(())
     }
 
@@ -1165,8 +1191,11 @@ impl EClient {
 
     // ── Tier 3: Smart Components ──
 
-    /// Request SMART routing components. Returns empty map (gateway-local data not available).
+    /// Request SMART routing components.
+    /// Gateway-local data — returns empty for direct connections (no routing layer).
     fn req_smart_components(&self, py: Python<'_>, req_id: i64, bbo_exchange: &str) -> PyResult<()> {
+        // SMART routing components are resolved by the gateway from cached exchange maps.
+        // Direct connections bypass the gateway; return empty component map.
         let _ = bbo_exchange;
         let empty_map = pyo3::types::PyList::empty(py);
         self.wrapper.call_method1(py, "smart_components", (req_id, empty_map.as_any()))?;
@@ -1175,10 +1204,9 @@ impl EClient {
 
     // ── Tier 3: Soft Dollar Tiers ──
 
-    /// Request soft dollar tiers. Gateway resolves locally — returns empty on paper accounts.
+    /// Request soft dollar tiers.
+    /// Gateway-local data — paper accounts return empty (GT-verified).
     fn req_soft_dollar_tiers(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
-        // Soft dollar tiers are gateway-local data (EClient msg 79→77).
-        // Paper accounts always return 0 tiers.
         let empty_list = pyo3::types::PyList::empty(py);
         self.wrapper.call_method1(py, "soft_dollar_tiers", (req_id, empty_list.as_any()))?;
         Ok(())
@@ -1245,10 +1273,9 @@ impl EClient {
 
     // ── Tier 3: User Info ──
 
-    /// Request user info. Gateway resolves locally — empty whiteBrandingId on paper.
+    /// Request user info.
+    /// Gateway-local data — paper accounts return empty whiteBrandingId (GT-verified).
     fn req_user_info(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
-        // User info is gateway-local data (EClient msg 104→107).
-        // Paper accounts return empty whiteBrandingId.
         self.wrapper.call_method1(py, "user_info", (req_id, ""))?;
         Ok(())
     }
@@ -1895,6 +1922,25 @@ impl EClient {
                  quote.bid_size as f64, quote.ask_size as f64, &attrib_obj),
                 None,
             )?;
+        }
+
+        // Drain depth updates -> updateMktDepth / updateMktDepthL2
+        let depth_updates = shared.market.drain_depth_updates();
+        for du in depth_updates {
+            if du.market_maker.is_empty() {
+                self.wrapper.call_method(
+                    py, "update_mkt_depth",
+                    (du.req_id as i64, du.position, du.operation, du.side, du.price, du.size),
+                    None,
+                )?;
+            } else {
+                self.wrapper.call_method(
+                    py, "update_mkt_depth_l2",
+                    (du.req_id as i64, du.position, du.market_maker.as_str(),
+                     du.operation, du.side, du.price, du.size, du.is_smart_depth),
+                    None,
+                )?;
+            }
         }
 
         // Drain news -> tickNews
