@@ -222,6 +222,8 @@ impl HotLoop {
                     let farm = crate::types::farm_for_instrument(&exchange, &sec_type);
                     let id = self.context.market.register(con_id);
                     self.context.market.set_symbol(id, symbol);
+                    self.context.market.set_sec_type(id, sec_type);
+                    self.context.market.set_exchange(id, exchange);
                     self.shared.set_instrument_count(self.context.market.count());
                     if let Some(tx) = reply_tx { let _ = tx.send(id); }
                     self.farm.send_mktdata_subscribe(
@@ -271,7 +273,7 @@ impl HotLoop {
                     self.shared.set_instrument_count(self.context.market.count());
                     if let Some(tx) = reply_tx { let _ = tx.send(id); }
                 }
-                ControlCommand::FetchHistorical { req_id, con_id, symbol, end_date_time, duration, bar_size, what_to_show, use_rth } => {
+                ControlCommand::FetchHistorical { req_id, con_id, symbol, end_date_time, duration, bar_size, what_to_show, use_rth, .. } => {
                     self.hmds.send_historical_request(req_id, con_id, &end_date_time, &duration, &bar_size, &what_to_show, use_rth, &mut self.hmds_conn, &mut self.hb);
                     let _ = symbol;
                 }
@@ -284,7 +286,7 @@ impl HotLoop {
                 ControlCommand::FetchHeadTimestamp { req_id, con_id, what_to_show, use_rth } => {
                     self.hmds.send_head_timestamp_request(req_id, con_id, &what_to_show, use_rth, &mut self.hmds_conn, &mut self.hb);
                 }
-                ControlCommand::FetchContractDetails { req_id, con_id, symbol, sec_type, exchange, currency } => {
+                ControlCommand::FetchContractDetails { req_id, con_id, symbol, sec_type, exchange, currency, .. } => {
                     if con_id > 0 {
                         self.ccp.send_secdef_request(req_id, con_id, &mut self.ccp_conn, &mut self.hb);
                     } else {
