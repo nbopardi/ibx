@@ -148,7 +148,7 @@ pub(super) fn phase_connection_recovery(conns: Conns, _gw: &Gateway, config: &Ga
 
     // Reconnect real farm for remaining tests
     let (farm, ccp, hmds) = match Gateway::connect(config) {
-        Ok((_gw2, f, c, h, _, _)) => {
+        Ok((_gw2, f, c, h, _, _, _, _)) => {
             println!("  Reconnected to IB for remaining tests");
             (f, c, h)
         }
@@ -242,6 +242,7 @@ pub(super) fn phase_auth_wrong_password(config: &GatewayConfig) {
         password: "definitely_wrong_password_12345".to_string(),
         host: config.host.clone(),
         paper: config.paper,
+        accept_invalid_certs: false,
     };
 
     let start = Instant::now();

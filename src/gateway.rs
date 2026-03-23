@@ -416,12 +416,15 @@ pub struct GatewayConfig {
     pub password: String,
     pub host: String,
     pub paper: bool,
+    /// Accept invalid TLS certificates during auth. Default: `false` (secure).
+    /// Only set to `true` for local testing against self-signed gateways.
+    pub accept_invalid_certs: bool,
 }
 
 impl Gateway {
     /// Connect to IB: auth + logon + data farm connections.
     /// Returns Gateway + farm Connection + auth Connection + optional historical data Connection.
-    pub fn connect(config: &GatewayConfig) -> io::Result<(Self, Connection, Connection, Option<Connection>, Option<Connection>, Option<Connection>)> {
+    pub fn connect(config: &GatewayConfig) -> io::Result<(Self, Connection, Connection, Option<Connection>, Option<Connection>, Option<Connection>, Option<Connection>, Option<Connection>)> {
         Self::connect_to_host(config, &config.host, 0)
     }
 
@@ -430,7 +433,7 @@ impl Gateway {
         config: &GatewayConfig,
         host: &str,
         redirect_depth: u32,
-    ) -> io::Result<(Self, Connection, Connection, Option<Connection>, Option<Connection>, Option<Connection>)> {
+    ) -> io::Result<(Self, Connection, Connection, Option<Connection>, Option<Connection>, Option<Connection>, Option<Connection>, Option<Connection>)> {
         if redirect_depth > 3 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -450,7 +453,7 @@ impl Gateway {
         let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(TIMEOUT_SSL_AUTH))?;
 
         let connector = TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(config.accept_invalid_certs)
             .build()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let mut tls = connector
@@ -775,6 +778,24 @@ impl Gateway {
             Err(e) => { log::warn!("usfuture connection failed (non-fatal): {}", e); None }
         };
 
+        let eufarm_conn = match connect_farm(
+            host, "eufarm",
+            &config.username, config.paper,
+            &server_session_id, &session_key, &hw_info, &encoded,
+        ) {
+            Ok(c) => { log::info!("eufarm connected"); Some(c) }
+            Err(e) => { log::warn!("eufarm connection failed (non-fatal): {}", e); None }
+        };
+
+        let jfarm_conn = match connect_farm(
+            host, "jfarm",
+            &config.username, config.paper,
+            &server_session_id, &session_key, &hw_info, &encoded,
+        ) {
+            Ok(c) => { log::info!("jfarm connected"); Some(c) }
+            Err(e) => { log::warn!("jfarm connection failed (non-fatal): {}", e); None }
+        };
+
         let gw = Gateway {
             account_id: if account_id.is_empty() { config.username.clone() } else { account_id },
             session_token: session_key,
@@ -784,7 +805,7 @@ impl Gateway {
             hw_info,
             encoded,
         };
-        Ok((gw, farm_conn, ccp_conn, hmds_conn, cashfarm_conn, usfuture_conn))
+        Ok((gw, farm_conn, ccp_conn, hmds_conn, cashfarm_conn, usfuture_conn, eufarm_conn, jfarm_conn))
     }
 
     /// Create the control channel and build a HotLoop with connected sockets.
@@ -797,7 +818,7 @@ impl Gateway {
         hmds_conn: Option<Connection>,
         core_id: Option<usize>,
     ) -> (HotLoop, Sender<ControlCommand>) {
-        self.into_hot_loop_with_farms(shared, event_tx, farm_conn, ccp_conn, hmds_conn, None, None, core_id)
+        self.into_hot_loop_with_farms(shared, event_tx, farm_conn, ccp_conn, hmds_conn, None, None, None, None, core_id)
     }
 
     /// Create the control channel and build a HotLoop with all farm connections.
@@ -810,6 +831,8 @@ impl Gateway {
         hmds_conn: Option<Connection>,
         cashfarm_conn: Option<Connection>,
         usfuture_conn: Option<Connection>,
+        eufarm_conn: Option<Connection>,
+        jfarm_conn: Option<Connection>,
         core_id: Option<usize>,
     ) -> (HotLoop, Sender<ControlCommand>) {
         let (tx, rx) = bounded(64);
@@ -821,6 +844,8 @@ impl Gateway {
         hot_loop.hmds_conn = hmds_conn;
         hot_loop.cashfarm_conn = cashfarm_conn;
         hot_loop.usfuture_conn = usfuture_conn;
+        hot_loop.eufarm_conn = eufarm_conn;
+        hot_loop.jfarm_conn = jfarm_conn;
         (hot_loop, tx)
     }
 }
@@ -1089,6 +1114,7 @@ mod tests {
             password: "pass".to_string(),
             host: "cdc1.ibllc.com".to_string(),
             paper: true,
+            accept_invalid_certs: false,
         };
         assert_eq!(config.username, "user");
         assert!(config.paper);

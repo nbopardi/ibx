@@ -41,6 +41,10 @@ pub struct HotLoop {
     pub cashfarm_conn: Option<Connection>,
     /// US futures tick farm connection (optional).
     pub usfuture_conn: Option<Connection>,
+    /// European stocks farm connection (optional).
+    pub eufarm_conn: Option<Connection>,
+    /// Japan stocks farm connection (optional).
+    pub jfarm_conn: Option<Connection>,
     /// SPSC channel receiver for control plane commands.
     control_rx: Option<Receiver<ControlCommand>>,
     /// Whether the hot loop should keep running.
@@ -53,6 +57,19 @@ pub struct HotLoop {
     pub(crate) farm: FarmState,
     pub(crate) ccp: CcpState,
     pub(crate) hmds: HmdsState,
+}
+
+/// Per-secondary-farm heartbeat tracking.
+pub struct SecondaryFarmHb {
+    pub last_sent: Instant,
+    pub last_recv: Instant,
+    pub pending_test: Option<(String, Instant)>,
+}
+
+impl SecondaryFarmHb {
+    fn new(now: Instant) -> Self {
+        Self { last_sent: now, last_recv: now, pending_test: None }
+    }
 }
 
 /// Tracks last send/recv times and pending test requests for heartbeat management.
@@ -71,6 +88,11 @@ pub struct HeartbeatState {
     pub pending_hmds_test: Option<(String, Instant)>,
     /// Counter for generating unique test request IDs.
     test_req_counter: u32,
+    /// Per-secondary-farm heartbeat state.
+    pub cashfarm_hb: SecondaryFarmHb,
+    pub usfuture_hb: SecondaryFarmHb,
+    pub eufarm_hb: SecondaryFarmHb,
+    pub jfarm_hb: SecondaryFarmHb,
 }
 
 impl HeartbeatState {
@@ -87,12 +109,27 @@ impl HeartbeatState {
             pending_farm_test: None,
             pending_hmds_test: None,
             test_req_counter: 0,
+            cashfarm_hb: SecondaryFarmHb::new(now),
+            usfuture_hb: SecondaryFarmHb::new(now),
+            eufarm_hb: SecondaryFarmHb::new(now),
+            jfarm_hb: SecondaryFarmHb::new(now),
         }
     }
 
     fn next_test_id(&mut self) -> String {
         self.test_req_counter += 1;
         format!("T{}", self.test_req_counter)
+    }
+
+    /// Get mutable heartbeat state for a secondary farm slot.
+    pub fn secondary_hb_mut(&mut self, slot: &crate::types::FarmSlot) -> &mut SecondaryFarmHb {
+        match slot {
+            crate::types::FarmSlot::CashFarm => &mut self.cashfarm_hb,
+            crate::types::FarmSlot::UsFuture => &mut self.usfuture_hb,
+            crate::types::FarmSlot::EuFarm => &mut self.eufarm_hb,
+            crate::types::FarmSlot::JFarm => &mut self.jfarm_hb,
+            crate::types::FarmSlot::UsFarm => unreachable!("UsFarm uses primary heartbeat"),
+        }
     }
 }
 
@@ -108,6 +145,8 @@ impl HotLoop {
             hmds_conn: None,
             cashfarm_conn: None,
             usfuture_conn: None,
+            eufarm_conn: None,
+            jfarm_conn: None,
             control_rx: None,
             running: true,
             account_id: String::new(),
@@ -184,6 +223,16 @@ impl HotLoop {
                 &mut self.farm_conn, &mut self.context, &self.shared,
                 &self.event_tx, &mut self.hb,
             );
+            self.farm.poll_secondary_farm(
+                &mut self.eufarm_conn, &crate::types::FarmSlot::EuFarm,
+                &mut self.farm_conn, &mut self.context, &self.shared,
+                &self.event_tx, &mut self.hb,
+            );
+            self.farm.poll_secondary_farm(
+                &mut self.jfarm_conn, &crate::types::FarmSlot::JFarm,
+                &mut self.farm_conn, &mut self.context, &self.shared,
+                &self.event_tx, &mut self.hb,
+            );
 
             // 1b. Busy-poll historical socket for tick-by-tick data
             self.hmds.poll(
@@ -227,6 +276,7 @@ impl HotLoop {
                     self.farm.send_mktdata_subscribe(
                         con_id, id, farm,
                         &mut self.farm_conn, &mut self.cashfarm_conn, &mut self.usfuture_conn,
+                        &mut self.eufarm_conn, &mut self.jfarm_conn,
                         &mut self.hb,
                     );
                 }
@@ -234,6 +284,7 @@ impl HotLoop {
                     self.farm.send_mktdata_unsubscribe(
                         instrument,
                         &mut self.farm_conn, &mut self.cashfarm_conn, &mut self.usfuture_conn,
+                        &mut self.eufarm_conn, &mut self.jfarm_conn,
                         &mut self.hb,
                     );
                 }
@@ -357,6 +408,7 @@ impl HotLoop {
                         self.farm.send_mktdata_unsubscribe(
                             instrument,
                             &mut self.farm_conn, &mut self.cashfarm_conn, &mut self.usfuture_conn,
+                            &mut self.eufarm_conn, &mut self.jfarm_conn,
                             &mut self.hb,
                         );
                     }
@@ -484,6 +536,81 @@ impl HotLoop {
             }
         }
         }
+
+        // --- Secondary farm heartbeats ---
+        self.check_secondary_heartbeat(now, &ts);
+    }
+
+    fn check_secondary_heartbeat(&mut self, now: Instant, ts: &str) {
+        use crate::types::FarmSlot;
+
+        let pairs: [(FarmSlot, bool); 4] = [
+            (FarmSlot::CashFarm, self.cashfarm_conn.is_some()),
+            (FarmSlot::UsFuture, self.usfuture_conn.is_some()),
+            (FarmSlot::EuFarm, self.eufarm_conn.is_some()),
+            (FarmSlot::JFarm, self.jfarm_conn.is_some()),
+        ];
+        for (slot, has_conn) in &pairs {
+            if !has_conn { continue; }
+            let shb = self.hb.secondary_hb_mut(slot);
+            let since_sent = now.duration_since(shb.last_sent).as_secs();
+            let since_recv = now.duration_since(shb.last_recv).as_secs();
+            let need_heartbeat = since_sent >= FARM_HEARTBEAT_SECS;
+            let timed_out = since_recv > FARM_HEARTBEAT_SECS + HEARTBEAT_GRACE_SECS;
+            let test_expired = shb.pending_test.as_ref()
+                .map(|(_, sent_at)| now.duration_since(*sent_at).as_secs() > FARM_HEARTBEAT_SECS)
+                .unwrap_or(false);
+            let need_test = timed_out && shb.pending_test.is_none();
+            let conn = match slot {
+                FarmSlot::CashFarm => self.cashfarm_conn.as_mut(),
+                FarmSlot::UsFuture => self.usfuture_conn.as_mut(),
+                FarmSlot::EuFarm => self.eufarm_conn.as_mut(),
+                FarmSlot::JFarm => self.jfarm_conn.as_mut(),
+                FarmSlot::UsFarm => unreachable!(),
+            };
+            let conn = match conn {
+                Some(c) => c,
+                None => continue,
+            };
+
+            if need_heartbeat {
+                let _ = conn.send_fix(&[
+                    (fix::TAG_MSG_TYPE, fix::MSG_HEARTBEAT),
+                    (fix::TAG_SENDING_TIME, ts),
+                ]);
+                self.hb.secondary_hb_mut(slot).last_sent = now;
+            }
+            if test_expired {
+                log::error!("{:?} heartbeat timeout — connection lost", slot);
+                let conn_opt = match slot {
+                    FarmSlot::CashFarm => &mut self.cashfarm_conn,
+                    FarmSlot::UsFuture => &mut self.usfuture_conn,
+                    FarmSlot::EuFarm => &mut self.eufarm_conn,
+                    FarmSlot::JFarm => &mut self.jfarm_conn,
+                    FarmSlot::UsFarm => unreachable!(),
+                };
+                self.farm.handle_secondary_disconnect(conn_opt, slot, &mut self.context, &self.shared, &self.event_tx);
+            } else if need_test {
+                let test_id = self.hb.next_test_id();
+                let conn = match slot {
+                    FarmSlot::CashFarm => self.cashfarm_conn.as_mut(),
+                    FarmSlot::UsFuture => self.usfuture_conn.as_mut(),
+                    FarmSlot::EuFarm => self.eufarm_conn.as_mut(),
+                    FarmSlot::JFarm => self.jfarm_conn.as_mut(),
+                    FarmSlot::UsFarm => unreachable!(),
+                };
+                if let Some(c) = conn {
+                    let _ = c.send_fix(&[
+                        (fix::TAG_MSG_TYPE, fix::MSG_TEST_REQUEST),
+                        (fix::TAG_SENDING_TIME, ts),
+                        (fix::TAG_TEST_REQ_ID, &test_id),
+                    ]);
+                    let shb = self.hb.secondary_hb_mut(slot);
+                    shb.pending_test = Some((test_id, now));
+                    shb.last_sent = now;
+                }
+            }
+        }
     }
 
     fn pin_to_core(core: usize) {
@@ -508,6 +635,7 @@ impl HotLoop {
         self.farm.reconnect(
             conn,
             &mut self.farm_conn, &mut self.cashfarm_conn, &mut self.usfuture_conn,
+            &mut self.eufarm_conn, &mut self.jfarm_conn,
             &mut self.context, &mut self.hb,
         );
     }

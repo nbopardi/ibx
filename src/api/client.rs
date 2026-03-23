@@ -82,14 +82,16 @@ impl EClient {
             password: config.password.clone(),
             host: config.host.clone(),
             paper: config.paper,
+            accept_invalid_certs: false,
         };
 
-        let (gw, farm_conn, ccp_conn, hmds_conn, _cashfarm, _usfuture) = Gateway::connect(&gw_config)?;
+        let (gw, farm_conn, ccp_conn, hmds_conn, cashfarm, usfuture, eufarm, jfarm) = Gateway::connect(&gw_config)?;
         let account_id = gw.account_id.clone();
         let shared = Arc::new(SharedState::new());
 
-        let (mut hot_loop, control_tx) = gw.into_hot_loop(
-            shared.clone(), None, farm_conn, ccp_conn, hmds_conn, config.core_id,
+        let (mut hot_loop, control_tx) = gw.into_hot_loop_with_farms(
+            shared.clone(), None, farm_conn, ccp_conn, hmds_conn,
+            cashfarm, usfuture, eufarm, jfarm, config.core_id,
         );
 
         let handle = thread::Builder::new()
