@@ -21,6 +21,7 @@ pub(super) fn get_config() -> Option<GatewayConfig> {
         password,
         host,
         paper: true,
+        accept_invalid_certs: false,
     })
 }
 

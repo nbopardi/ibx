@@ -112,9 +112,14 @@ impl FarmState {
             Ok(0) => return,
             Err(e) => {
                 log::error!("{:?} connection lost: {}", slot, e);
+                self.handle_secondary_disconnect(secondary_conn, slot, context, shared, event_tx);
                 return;
             }
-            Ok(_) => {}
+            Ok(_) => {
+                let shb = hb.secondary_hb_mut(slot);
+                shb.last_recv = Instant::now();
+                shb.pending_test = None;
+            }
         }
         let frames = conn.extract_frames();
         let mut msgs = Vec::new();
@@ -136,6 +141,35 @@ impl FarmState {
         }
         for msg in &msgs {
             self.process_farm_message(msg, farm_conn, context, shared, event_tx, hb);
+        }
+    }
+
+    /// Handle disconnect of a secondary farm: drop connection, clear subscriptions for that slot.
+    pub(crate) fn handle_secondary_disconnect(
+        &mut self,
+        secondary_conn: &mut Option<Connection>,
+        slot: &FarmSlot,
+        _context: &mut Context,
+        _shared: &SharedState,
+        event_tx: &Option<Sender<Event>>,
+    ) {
+        *secondary_conn = None;
+        // Collect req IDs and instrument IDs for the disconnected farm slot
+        let mut stale_req_ids = Vec::new();
+        let mut affected_count = 0usize;
+        self.instrument_md_reqs.retain(|(_, farm, reqs)| {
+            if farm == slot {
+                stale_req_ids.extend(reqs.iter().copied());
+                affected_count += 1;
+                false
+            } else {
+                true
+            }
+        });
+        self.md_req_to_instrument.retain(|(rid, _)| !stale_req_ids.contains(rid));
+        if affected_count > 0 {
+            log::warn!("{:?} disconnected, cleared {} instrument subscriptions", slot, affected_count);
+            emit(event_tx, Event::Disconnected);
         }
     }
 
@@ -286,6 +320,8 @@ impl FarmState {
         farm_conn: &mut Option<Connection>,
         cashfarm_conn: &mut Option<Connection>,
         usfuture_conn: &mut Option<Connection>,
+        eufarm_conn: &mut Option<Connection>,
+        jfarm_conn: &mut Option<Connection>,
         hb: &mut HeartbeatState,
     ) {
         let bid_ask_id = self.next_md_req_id;
@@ -300,7 +336,7 @@ impl FarmState {
             None => self.instrument_md_reqs.push((instrument, farm, vec![bid_ask_id, last_id])),
         }
 
-        if let Some(conn) = farm_conn_for_slot(farm, farm_conn, cashfarm_conn, usfuture_conn) {
+        if let Some(conn) = farm_conn_for_slot(farm, farm_conn, cashfarm_conn, usfuture_conn, eufarm_conn, jfarm_conn) {
             let bid_ask_str = bid_ask_id.to_string();
             let last_str = last_id.to_string();
             let con_id_str = (con_id as u32).to_string();
@@ -339,6 +375,8 @@ impl FarmState {
         farm_conn: &mut Option<Connection>,
         cashfarm_conn: &mut Option<Connection>,
         usfuture_conn: &mut Option<Connection>,
+        eufarm_conn: &mut Option<Connection>,
+        jfarm_conn: &mut Option<Connection>,
         hb: &mut HeartbeatState,
     ) {
         let (farm, reqs) = match self.instrument_md_reqs.iter()
@@ -351,7 +389,7 @@ impl FarmState {
             None => return,
         };
 
-        let conn = match farm_conn_for_slot(farm, farm_conn, cashfarm_conn, usfuture_conn) {
+        let conn = match farm_conn_for_slot(farm, farm_conn, cashfarm_conn, usfuture_conn, eufarm_conn, jfarm_conn) {
             Some(c) => c,
             None => return,
         };
@@ -382,6 +420,8 @@ impl FarmState {
         farm_conn: &mut Option<Connection>,
         cashfarm_conn: &mut Option<Connection>,
         usfuture_conn: &mut Option<Connection>,
+        eufarm_conn: &mut Option<Connection>,
+        jfarm_conn: &mut Option<Connection>,
         context: &mut Context,
         hb: &mut HeartbeatState,
     ) {
@@ -391,11 +431,16 @@ impl FarmState {
         hb.last_farm_recv = Instant::now();
         hb.pending_farm_test = None;
 
-        let active: Vec<(InstrumentId, i64)> = context.market.active_instruments().collect();
+        // Preserve original farm slots for re-subscription
+        let active: Vec<(InstrumentId, FarmSlot, i64)> = self.instrument_md_reqs.iter()
+            .filter_map(|(id, slot, _)| {
+                context.market.con_id(*id).map(|con_id| (*id, *slot, con_id))
+            })
+            .collect();
         self.md_req_to_instrument.clear();
         self.instrument_md_reqs.clear();
-        for (instrument, con_id) in active {
-            self.send_mktdata_subscribe(con_id, instrument, FarmSlot::UsFarm, farm_conn, cashfarm_conn, usfuture_conn, hb);
+        for (instrument, farm, con_id) in active {
+            self.send_mktdata_subscribe(con_id, instrument, farm, farm_conn, cashfarm_conn, usfuture_conn, eufarm_conn, jfarm_conn, hb);
         }
         log::info!("Farm reconnected, re-subscribed {} instruments", self.instrument_md_reqs.len());
     }
@@ -470,12 +515,42 @@ pub(crate) fn farm_conn_for_slot<'a>(
     farm_conn: &'a mut Option<Connection>,
     cashfarm_conn: &'a mut Option<Connection>,
     usfuture_conn: &'a mut Option<Connection>,
+    eufarm_conn: &'a mut Option<Connection>,
+    jfarm_conn: &'a mut Option<Connection>,
 ) -> Option<&'a mut Connection> {
     match slot {
         FarmSlot::UsFarm => farm_conn.as_mut(),
-        FarmSlot::CashFarm => cashfarm_conn.as_mut().or(farm_conn.as_mut()),
-        FarmSlot::UsFuture => usfuture_conn.as_mut().or(farm_conn.as_mut()),
-        FarmSlot::EuFarm => farm_conn.as_mut(),
-        FarmSlot::JFarm => farm_conn.as_mut(),
+        FarmSlot::CashFarm => {
+            if cashfarm_conn.is_some() {
+                cashfarm_conn.as_mut()
+            } else {
+                log::warn!("CashFarm unavailable, falling back to UsFarm");
+                farm_conn.as_mut()
+            }
+        }
+        FarmSlot::UsFuture => {
+            if usfuture_conn.is_some() {
+                usfuture_conn.as_mut()
+            } else {
+                log::warn!("UsFuture unavailable, falling back to UsFarm");
+                farm_conn.as_mut()
+            }
+        }
+        FarmSlot::EuFarm => {
+            if eufarm_conn.is_some() {
+                eufarm_conn.as_mut()
+            } else {
+                log::warn!("EuFarm unavailable, falling back to UsFarm");
+                farm_conn.as_mut()
+            }
+        }
+        FarmSlot::JFarm => {
+            if jfarm_conn.is_some() {
+                jfarm_conn.as_mut()
+            } else {
+                log::warn!("JFarm unavailable, falling back to UsFarm");
+                farm_conn.as_mut()
+            }
+        }
     }
 }

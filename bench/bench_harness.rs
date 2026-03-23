@@ -80,10 +80,11 @@ impl BenchSession {
             password: config.password.clone(),
             host: config.host.clone(),
             paper: config.paper,
+            accept_invalid_certs: false,
         };
 
         let connect_start = Instant::now();
-        let (gw, farm_conn, ccp_conn, hmds_conn, _cashfarm, _usfuture) =
+        let (gw, farm_conn, ccp_conn, hmds_conn, _cashfarm, _usfuture, _eufarm, _jfarm) =
             Gateway::connect(&gw_config).expect("Gateway::connect() failed");
         let connect_time = connect_start.elapsed();
         let account_id = gw.account_id.clone();

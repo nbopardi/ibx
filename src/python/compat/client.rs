@@ -129,17 +129,18 @@ impl EClient {
             password,
             host,
             paper,
+            accept_invalid_certs: false,
         };
 
         let result = py.allow_threads(|| Gateway::connect(&config));
-        let (gw, farm_conn, ccp_conn, hmds_conn, cashfarm_conn, usfuture_conn) = result
+        let (gw, farm_conn, ccp_conn, hmds_conn, cashfarm_conn, usfuture_conn, eufarm_conn, jfarm_conn) = result
             .map_err(|e| PyRuntimeError::new_err(format!("Connection failed: {}", e)))?;
 
         // OnceLock::set() is safe here: the `connected` guard above ensures single-call.
         self.account_id.set(gw.account_id.clone()).expect("account_id already set");
         let shared = Arc::new(SharedState::new());
 
-        let (mut hot_loop, control_tx) = gw.into_hot_loop_with_farms(shared.clone(), None, farm_conn, ccp_conn, hmds_conn, cashfarm_conn, usfuture_conn, core_id);
+        let (mut hot_loop, control_tx) = gw.into_hot_loop_with_farms(shared.clone(), None, farm_conn, ccp_conn, hmds_conn, cashfarm_conn, usfuture_conn, eufarm_conn, jfarm_conn, core_id);
 
         let start_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
