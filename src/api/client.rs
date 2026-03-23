@@ -580,6 +580,14 @@ impl EClient {
     /// Drain all SharedState queues and dispatch to the Wrapper.
     /// Call this in a loop — it is the Rust equivalent of C++ `EReader::processMsgs()`.
     pub fn process_msgs(&self, wrapper: &mut impl Wrapper) {
+        self.dispatch_orders(wrapper);
+        self.dispatch_quotes(wrapper);
+        self.dispatch_data(wrapper);
+    }
+
+    // ── Order / Fill Dispatch ──
+
+    fn dispatch_orders(&self, wrapper: &mut impl Wrapper) {
         // Fills → order_status + exec_details
         for fill in self.shared.drain_fills() {
             let price_f = fill.price as f64 / PRICE_SCALE_F;
@@ -635,6 +643,23 @@ impl EClient {
             wrapper.error(reject.order_id as i64, code, &msg, "");
         }
 
+        // What-if → order_status (with margin info in why_held)
+        for wi in self.shared.drain_what_if_responses() {
+            let msg = format!(
+                "WhatIf: initMargin={:.2}, maintMargin={:.2}, commission={:.2}",
+                wi.init_margin_after as f64 / PRICE_SCALE_F,
+                wi.maint_margin_after as f64 / PRICE_SCALE_F,
+                wi.commission as f64 / PRICE_SCALE_F,
+            );
+            wrapper.order_status(
+                wi.order_id as i64, "PreSubmitted", 0.0, 0.0, 0.0, 0, 0, 0.0, 0, &msg, 0.0,
+            );
+        }
+    }
+
+    // ── Quote Dispatch ──
+
+    fn dispatch_quotes(&self, wrapper: &mut impl Wrapper) {
         // Quote polling → tick_price / tick_size (via ClientCore)
         let instruments = self.core.snapshot_instruments();
         let attrib = crate::api::types::TickAttrib::default();
@@ -678,7 +703,11 @@ impl EClient {
                 quote.bid_size as f64, quote.ask_size as f64, &attrib_ba,
             );
         }
+    }
 
+    // ── Historical / News / Account Dispatch ──
+
+    fn dispatch_data(&self, wrapper: &mut impl Wrapper) {
         // News → tick_news
         for news in self.shared.drain_tick_news() {
             let first_req_id = self.core.instrument_to_req.lock().unwrap()
@@ -694,19 +723,6 @@ impl EClient {
             for b in self.shared.drain_news_bulletins() {
                 wrapper.update_news_bulletin(b.msg_id as i64, b.msg_type, &b.message, &b.exchange);
             }
-        }
-
-        // What-if → order_status (with margin info in why_held)
-        for wi in self.shared.drain_what_if_responses() {
-            let msg = format!(
-                "WhatIf: initMargin={:.2}, maintMargin={:.2}, commission={:.2}",
-                wi.init_margin_after as f64 / PRICE_SCALE_F,
-                wi.maint_margin_after as f64 / PRICE_SCALE_F,
-                wi.commission as f64 / PRICE_SCALE_F,
-            );
-            wrapper.order_status(
-                wi.order_id as i64, "PreSubmitted", 0.0, 0.0, 0.0, 0, 0, 0.0, 0, &msg, 0.0,
-            );
         }
 
         // Historical data → historical_data + historical_data_end
@@ -1094,7 +1110,7 @@ mod tests {
         let (client, rx, _shared) = test_client();
         client.req_mkt_data(1, &spy(), "", false, false);
         let cmd1 = rx.try_recv().unwrap();
-        assert!(matches!(cmd1, ControlCommand::RegisterInstrument { con_id: 756733 }));
+        assert!(matches!(cmd1, ControlCommand::RegisterInstrument { con_id: 756733, .. }));
         let cmd2 = rx.try_recv().unwrap();
         match cmd2 {
             ControlCommand::Subscribe { con_id, symbol, .. } => {
@@ -1131,7 +1147,7 @@ mod tests {
         client.req_tick_by_tick_data(10, &spy(), "BidAsk", 0, false);
         let cmd = rx.try_recv().unwrap();
         match cmd {
-            ControlCommand::SubscribeTbt { con_id, symbol, tbt_type } => {
+            ControlCommand::SubscribeTbt { con_id, symbol, tbt_type, .. } => {
                 assert_eq!(con_id, 756733);
                 assert_eq!(symbol, "SPY");
                 assert!(matches!(tbt_type, TbtType::BidAsk));

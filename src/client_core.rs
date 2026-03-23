@@ -254,16 +254,16 @@ impl ClientCore {
 
     // ── Registration helpers ──
 
-    /// Spin-wait for the hot loop to process a registration command.
-    /// Returns the InstrumentId assigned (instrument_count - 1).
-    pub fn wait_for_registration(shared: &SharedState, old_gen: u64) -> InstrumentId {
-        for _ in 0..100_000 {
-            if shared.register_gen() != old_gen {
-                break;
-            }
-            std::hint::spin_loop();
-        }
-        shared.instrument_count().saturating_sub(1)
+    /// Registration reply timeout.
+    #[cfg(not(test))]
+    const REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    #[cfg(test)]
+    const REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1);
+
+    /// Wait for the hot loop to process a registration command and return the assigned ID.
+    fn recv_registration(reply_rx: crossbeam_channel::Receiver<InstrumentId>) -> Result<InstrumentId, String> {
+        reply_rx.recv_timeout(Self::REGISTRATION_TIMEOUT)
+            .map_err(|_| "Registration timed out".to_string())
     }
 
     /// Find instrument ID for a contract, registering if needed.
@@ -286,17 +286,21 @@ impl ClientCore {
         }
 
         // Register new
-        let reg_gen = shared.register_gen();
-        control_tx.send(ControlCommand::RegisterInstrument { con_id })
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        control_tx.send(ControlCommand::RegisterInstrument { con_id, reply_tx: None })
             .map_err(|e| format!("Engine stopped: {}", e))?;
         control_tx.send(ControlCommand::Subscribe {
             con_id,
             symbol: symbol.to_string(),
             exchange: exchange.to_string(),
             sec_type: sec_type.to_string(),
+            reply_tx: Some(reply_tx),
         }).map_err(|e| format!("Engine stopped: {}", e))?;
 
-        Ok(Self::wait_for_registration(shared, reg_gen))
+        match Self::recv_registration(reply_rx) {
+            Ok(id) => Ok(id),
+            Err(_) => Ok(shared.instrument_count().saturating_sub(1)),
+        }
     }
 
     // ── Subscription management ──
@@ -304,7 +308,7 @@ impl ClientCore {
     /// Register a market data subscription mapping.
     pub fn register_mkt_data(
         &self,
-        shared: &SharedState,
+        _shared: &SharedState,
         control_tx: &Sender<ControlCommand>,
         req_id: i64,
         con_id: i64,
@@ -313,17 +317,18 @@ impl ClientCore {
         sec_type: &str,
         snapshot: bool,
     ) -> Result<InstrumentId, String> {
-        let reg_gen = shared.register_gen();
-        control_tx.send(ControlCommand::RegisterInstrument { con_id })
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        control_tx.send(ControlCommand::RegisterInstrument { con_id, reply_tx: None })
             .map_err(|e| format!("Engine stopped: {}", e))?;
         control_tx.send(ControlCommand::Subscribe {
             con_id,
             symbol: symbol.to_string(),
             exchange: exchange.to_string(),
             sec_type: sec_type.to_string(),
+            reply_tx: Some(reply_tx),
         }).map_err(|e| format!("Engine stopped: {}", e))?;
 
-        let instrument_id = Self::wait_for_registration(shared, reg_gen);
+        let instrument_id = Self::recv_registration(reply_rx)?;
         self.req_to_instrument.lock().unwrap().insert(req_id, instrument_id);
         self.instrument_to_req.lock().unwrap().insert(instrument_id, req_id);
         if snapshot {
@@ -346,21 +351,22 @@ impl ClientCore {
     /// Register a TBT subscription mapping.
     pub fn register_tbt(
         &self,
-        shared: &SharedState,
+        _shared: &SharedState,
         control_tx: &Sender<ControlCommand>,
         req_id: i64,
         con_id: i64,
         symbol: &str,
         tbt_type: TbtType,
     ) -> Result<InstrumentId, String> {
-        let reg_gen = shared.register_gen();
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         control_tx.send(ControlCommand::SubscribeTbt {
             con_id,
             symbol: symbol.to_string(),
             tbt_type,
+            reply_tx: Some(reply_tx),
         }).map_err(|e| format!("Engine stopped: {}", e))?;
 
-        let instrument_id = Self::wait_for_registration(shared, reg_gen);
+        let instrument_id = Self::recv_registration(reply_rx)?;
         self.req_to_instrument.lock().unwrap().insert(req_id, instrument_id);
         self.instrument_to_req.lock().unwrap().insert(instrument_id, req_id);
         Ok(instrument_id)

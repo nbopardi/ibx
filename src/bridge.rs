@@ -145,9 +145,6 @@ pub struct SharedState {
     account: Mutex<AccountState>,
     /// InstrumentId counter — set by hot loop on RegisterInstrument.
     instrument_count: AtomicU64,
-    /// Generation counter — bumped by hot loop after each instrument registration.
-    /// Callers spin on this instead of sleeping to wait for registration to complete.
-    register_gen: AtomicU64,
 }
 
 impl SharedState {
@@ -184,7 +181,6 @@ impl SharedState {
             positions: std::array::from_fn(|_| AtomicU64::new(0)),
             account: Mutex::new(AccountState::default()),
             instrument_count: AtomicU64::new(0),
-            register_gen: AtomicU64::new(0),
         }
     }
 
@@ -516,15 +512,6 @@ impl SharedState {
         self.instrument_count.store(count as u64, Ordering::Relaxed);
     }
 
-    /// Current registration generation (for spin-wait synchronization).
-    pub fn register_gen(&self) -> u64 {
-        self.register_gen.load(Ordering::Acquire)
-    }
-
-    /// Bump the registration generation (called by hot loop after instrument registration).
-    #[doc(hidden)] pub fn bump_register_gen(&self) {
-        self.register_gen.fetch_add(1, Ordering::Release);
-    }
 }
 
 #[cfg(test)]

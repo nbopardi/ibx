@@ -907,15 +907,15 @@ pub fn farm_for_instrument(exchange: &str, sec_type: &str) -> FarmSlot {
 pub enum ControlCommand {
     /// Subscribe to market data for a contract.
     /// `exchange` and `sec_type` determine farm routing (empty = UsFarm default).
-    Subscribe { con_id: i64, symbol: String, exchange: String, sec_type: String },
+    Subscribe { con_id: i64, symbol: String, exchange: String, sec_type: String, reply_tx: Option<crossbeam_channel::Sender<InstrumentId>> },
     /// Unsubscribe from market data for an instrument.
     Unsubscribe { instrument: InstrumentId },
     /// Subscribe to tick-by-tick data via historical data connection.
-    SubscribeTbt { con_id: i64, symbol: String, tbt_type: TbtType },
+    SubscribeTbt { con_id: i64, symbol: String, tbt_type: TbtType, reply_tx: Option<crossbeam_channel::Sender<InstrumentId>> },
     /// Unsubscribe from tick-by-tick data.
     UnsubscribeTbt { instrument: InstrumentId },
     /// Subscribe to per-contract news ticks via CCP (264=292).
-    SubscribeNews { con_id: i64, symbol: String, providers: String },
+    SubscribeNews { con_id: i64, symbol: String, providers: String, reply_tx: Option<crossbeam_channel::Sender<InstrumentId>> },
     /// Unsubscribe from per-contract news ticks.
     UnsubscribeNews { instrument: InstrumentId },
     /// Update a strategy parameter.
@@ -923,7 +923,7 @@ pub enum ControlCommand {
     /// Submit an order from external caller (bridge mode).
     Order(OrderRequest),
     /// Register an instrument from external caller (bridge mode).
-    RegisterInstrument { con_id: i64 },
+    RegisterInstrument { con_id: i64, reply_tx: Option<crossbeam_channel::Sender<InstrumentId>> },
     /// Request historical bar data via historical data connection.
     FetchHistorical {
         req_id: u32,
@@ -1410,7 +1410,7 @@ mod tests {
 
     #[test]
     fn control_command_subscribe() {
-        let cmd = ControlCommand::Subscribe { con_id: 265598, symbol: "AAPL".into(), exchange: String::new(), sec_type: String::new() };
+        let cmd = ControlCommand::Subscribe { con_id: 265598, symbol: "AAPL".into(), exchange: String::new(), sec_type: String::new(), reply_tx: None };
         match cmd {
             ControlCommand::Subscribe { con_id, .. } => assert_eq!(con_id, 265598),
             _ => panic!("wrong variant"),
@@ -1440,7 +1440,7 @@ mod tests {
 
     #[test]
     fn control_command_clone() {
-        let cmd = ControlCommand::Subscribe { con_id: 42, symbol: "TEST".into(), exchange: String::new(), sec_type: String::new() };
+        let cmd = ControlCommand::Subscribe { con_id: 42, symbol: "TEST".into(), exchange: String::new(), sec_type: String::new(), reply_tx: None };
         let cmd2 = cmd.clone();
         match cmd2 {
             ControlCommand::Subscribe { con_id, .. } => assert_eq!(con_id, 42),

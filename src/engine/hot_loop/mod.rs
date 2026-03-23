@@ -218,12 +218,12 @@ impl HotLoop {
 
         for cmd in cmds {
             match cmd {
-                ControlCommand::Subscribe { con_id, symbol, exchange, sec_type } => {
+                ControlCommand::Subscribe { con_id, symbol, exchange, sec_type, reply_tx } => {
                     let farm = crate::types::farm_for_instrument(&exchange, &sec_type);
                     let id = self.context.market.register(con_id);
                     self.context.market.set_symbol(id, symbol);
                     self.shared.set_instrument_count(self.context.market.count());
-                    self.shared.bump_register_gen();
+                    if let Some(tx) = reply_tx { let _ = tx.send(id); }
                     self.farm.send_mktdata_subscribe(
                         con_id, id, farm,
                         &mut self.farm_conn, &mut self.cashfarm_conn, &mut self.usfuture_conn,
@@ -237,21 +237,21 @@ impl HotLoop {
                         &mut self.hb,
                     );
                 }
-                ControlCommand::SubscribeTbt { con_id, symbol, tbt_type } => {
+                ControlCommand::SubscribeTbt { con_id, symbol, tbt_type, reply_tx } => {
                     let id = self.context.market.register(con_id);
                     self.context.market.set_symbol(id, symbol);
                     self.shared.set_instrument_count(self.context.market.count());
-                    self.shared.bump_register_gen();
+                    if let Some(tx) = reply_tx { let _ = tx.send(id); }
                     self.hmds.send_tbt_subscribe(con_id, id, tbt_type, &mut self.hmds_conn, &mut self.hb);
                 }
                 ControlCommand::UnsubscribeTbt { instrument } => {
                     self.hmds.send_tbt_unsubscribe(instrument, &mut self.hmds_conn, &mut self.hb);
                 }
-                ControlCommand::SubscribeNews { con_id, symbol, providers } => {
+                ControlCommand::SubscribeNews { con_id, symbol, providers, reply_tx } => {
                     let id = self.context.market.register(con_id);
                     self.context.market.set_symbol(id, symbol);
                     self.shared.set_instrument_count(self.context.market.count());
-                    self.shared.bump_register_gen();
+                    if let Some(tx) = reply_tx { let _ = tx.send(id); }
                     // Allocate req_id from farm's counter (shared ID space)
                     let req_id = self.farm.next_md_req_id;
                     self.farm.next_md_req_id += 1;
@@ -266,10 +266,10 @@ impl HotLoop {
                 ControlCommand::Order(req) => {
                     self.context.pending_orders.push(req);
                 }
-                ControlCommand::RegisterInstrument { con_id } => {
-                    self.context.market.register(con_id);
+                ControlCommand::RegisterInstrument { con_id, reply_tx } => {
+                    let id = self.context.market.register(con_id);
                     self.shared.set_instrument_count(self.context.market.count());
-                    self.shared.bump_register_gen();
+                    if let Some(tx) = reply_tx { let _ = tx.send(id); }
                 }
                 ControlCommand::FetchHistorical { req_id, con_id, symbol, end_date_time, duration, bar_size, what_to_show, use_rth } => {
                     self.hmds.send_historical_request(req_id, con_id, &end_date_time, &duration, &bar_size, &what_to_show, use_rth, &mut self.hmds_conn, &mut self.hb);

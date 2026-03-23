@@ -209,6 +209,7 @@ impl EClient {
                 con_id: contract.con_id,
                 symbol: contract.symbol.clone(),
                 providers,
+                reply_tx: None,
             }).map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
         }
 
@@ -257,9 +258,7 @@ impl EClient {
         };
 
         let shared = self.shared.get().unwrap();
-        // RegisterInstrument is sent inside register_tbt for TBT (SubscribeTbt implies it)
-        let reg_gen = shared.register_gen();
-        tx.send(ControlCommand::RegisterInstrument { con_id: contract.con_id })
+        tx.send(ControlCommand::RegisterInstrument { con_id: contract.con_id, reply_tx: None })
             .map_err(|e| PyRuntimeError::new_err(format!("Engine stopped: {}", e)))?;
         self.core.register_tbt(
             shared, tx, req_id,

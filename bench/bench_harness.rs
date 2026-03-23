@@ -114,6 +114,7 @@ impl BenchSession {
                 symbol: symbol.to_string(),
                 exchange: String::new(),
                 sec_type: String::new(),
+                reply_tx: None,
             })
             .unwrap();
     }
@@ -124,6 +125,7 @@ impl BenchSession {
                 con_id,
                 symbol: symbol.to_string(),
                 tbt_type,
+                reply_tx: None,
             })
             .unwrap();
     }

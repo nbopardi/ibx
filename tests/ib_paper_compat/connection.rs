@@ -177,7 +177,7 @@ pub(super) fn phase_reconnection_state_recovery(conns: Conns, _gw: &Gateway, _co
         shared.clone(), Some(event_tx), account_id.clone(), conns.farm, conns.ccp, conns.hmds, None,
     );
 
-    control_tx.send(ControlCommand::Subscribe { con_id: 756733, symbol: "SPY".into(), exchange: String::new(), sec_type: String::new() }).unwrap();
+    control_tx.send(ControlCommand::Subscribe { con_id: 756733, symbol: "SPY".into(), exchange: String::new(), sec_type: String::new(), reply_tx: None }).unwrap();
     let join = run_hot_loop(hot_loop);
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -208,7 +208,7 @@ pub(super) fn phase_reconnection_state_recovery(conns: Conns, _gw: &Gateway, _co
         conns1.farm, conns1.ccp, conns1.hmds, None,
     );
 
-    control_tx2.send(ControlCommand::Subscribe { con_id: 756733, symbol: "SPY".into(), exchange: String::new(), sec_type: String::new() }).unwrap();
+    control_tx2.send(ControlCommand::Subscribe { con_id: 756733, symbol: "SPY".into(), exchange: String::new(), sec_type: String::new(), reply_tx: None }).unwrap();
     let join2 = run_hot_loop(hot_loop2);
 
     let deadline2 = Instant::now() + Duration::from_secs(15);
@@ -272,9 +272,9 @@ pub(super) fn phase_register_instrument_channel(conns: Conns) -> Conns {
     let join = run_hot_loop(hot_loop);
 
     // Register 3 instruments via ControlCommand channel (not context_mut)
-    control_tx.send(ControlCommand::RegisterInstrument { con_id: 756733 }).unwrap();
-    control_tx.send(ControlCommand::RegisterInstrument { con_id: 265598 }).unwrap();
-    control_tx.send(ControlCommand::RegisterInstrument { con_id: 272093 }).unwrap();
+    control_tx.send(ControlCommand::RegisterInstrument { con_id: 756733, reply_tx: None }).unwrap();
+    control_tx.send(ControlCommand::RegisterInstrument { con_id: 265598, reply_tx: None }).unwrap();
+    control_tx.send(ControlCommand::RegisterInstrument { con_id: 272093, reply_tx: None }).unwrap();
 
     // Give hot loop time to process
     std::thread::sleep(Duration::from_millis(500));
@@ -284,7 +284,7 @@ pub(super) fn phase_register_instrument_channel(conns: Conns) -> Conns {
     println!("  Instrument count after 3 registrations: {}", count);
 
     // Now subscribe to one of the registered instruments
-    control_tx.send(ControlCommand::Subscribe { con_id: 756733, symbol: "SPY".into(), exchange: String::new(), sec_type: String::new() }).unwrap();
+    control_tx.send(ControlCommand::Subscribe { con_id: 756733, symbol: "SPY".into(), exchange: String::new(), sec_type: String::new(), reply_tx: None }).unwrap();
 
     // Wait briefly for any events (subscription confirmation or ticks)
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -333,7 +333,7 @@ pub(super) fn phase_update_param(conns: Conns) -> Conns {
         order_id: oid, instrument: inst_id, side: Side::Buy, qty: 1,
         price: 1_00_000_000, outside_rth: true,
     })).unwrap();
-    control_tx.send(ControlCommand::Subscribe { con_id: 756733, symbol: "SPY".into(), exchange: String::new(), sec_type: String::new() }).unwrap();
+    control_tx.send(ControlCommand::Subscribe { con_id: 756733, symbol: "SPY".into(), exchange: String::new(), sec_type: String::new(), reply_tx: None }).unwrap();
     let join = run_hot_loop(hot_loop);
 
     let deadline = Instant::now() + Duration::from_secs(30);
