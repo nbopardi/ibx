@@ -344,8 +344,9 @@ impl HotLoop {
                 ControlCommand::Order(req) => {
                     self.context.pending_orders.push(req);
                 }
-                ControlCommand::RegisterInstrument { con_id, reply_tx } => {
+                ControlCommand::RegisterInstrument { con_id, symbol, reply_tx } => {
                     let id = self.context.market.register(con_id);
+                    self.context.market.set_symbol(id, symbol);
                     self.shared.market.set_instrument_count(self.context.market.count());
                     if let Some(tx) = reply_tx { let _ = tx.send(id); }
                 }

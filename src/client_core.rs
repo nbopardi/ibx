@@ -347,7 +347,7 @@ impl ClientCore {
         &self,
         control_tx: &Sender<ControlCommand>,
         con_id: i64,
-        _symbol: &str,
+        symbol: &str,
         _exchange: &str,
         _sec_type: &str,
     ) -> Result<InstrumentId, String> {
@@ -361,7 +361,7 @@ impl ClientCore {
 
         // Register new — only allocates an InstrumentId slot, does not subscribe to market data.
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        control_tx.send(ControlCommand::RegisterInstrument { con_id, reply_tx: Some(reply_tx) })
+        control_tx.send(ControlCommand::RegisterInstrument { con_id, symbol: symbol.to_string(), reply_tx: Some(reply_tx) })
             .map_err(|e| format!("Engine stopped: {}", e))?;
 
         let id = Self::recv_registration(reply_rx)?;
@@ -399,7 +399,7 @@ impl ClientCore {
         }
 
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        control_tx.send(ControlCommand::RegisterInstrument { con_id, reply_tx: None })
+        control_tx.send(ControlCommand::RegisterInstrument { con_id, symbol: symbol.to_string(), reply_tx: None })
             .map_err(|e| format!("Engine stopped: {}", e))?;
         control_tx.send(ControlCommand::Subscribe {
             con_id,

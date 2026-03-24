@@ -941,7 +941,7 @@ pub enum ControlCommand {
     /// Submit an order from external caller (bridge mode).
     Order(OrderRequest),
     /// Register an instrument from external caller (bridge mode).
-    RegisterInstrument { con_id: i64, reply_tx: Option<crossbeam_channel::Sender<InstrumentId>> },
+    RegisterInstrument { con_id: i64, symbol: String, reply_tx: Option<crossbeam_channel::Sender<InstrumentId>> },
     /// Request historical bar data via historical data connection.
     FetchHistorical {
         req_id: u32,
