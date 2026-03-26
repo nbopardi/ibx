@@ -223,6 +223,39 @@ class TestSessionFeatures:
             f"Too many updates after cancel: {new_after_cancel} (before cancel: {count_before})"
         print(f"Before cancel: {count_before}, after: {new_after_cancel} new")
 
+    def test_l2_smart_depth(self):
+        """SmartDepth returns depth from multiple exchanges."""
+        contract = Contract()
+        contract.con_id = 265598
+        contract.symbol = "AAPL"
+        contract.sec_type = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+
+        self.c.req_mkt_depth(5003, contract, 10, True, [])  # is_smart_depth=True
+        got = self.w.got_depth_l2.wait(timeout=30)
+        time.sleep(5)
+        self.c.cancel_mkt_depth(5003)
+
+        if not got:
+            pytest.skip("No SmartDepth data — market may be closed")
+
+        updates = [u for u in self.w.depth_l2_updates if u["req_id"] == 5003]
+        assert len(updates) > 5, f"Expected 5+ SmartDepth updates, got {len(updates)}"
+
+        # Verify is_smart_depth flag set
+        smart_updates = [u for u in updates if u.get("is_smart_depth")]
+        assert len(smart_updates) > 0, "No updates with is_smart_depth=True"
+
+        # Verify we get both bids and asks
+        bids = [u for u in updates if u["side"] == 1 and u["price"] > 0]
+        asks = [u for u in updates if u["side"] == 0 and u["price"] > 0]
+        assert len(bids) > 0, "No SmartDepth bids"
+        assert len(asks) > 0, "No SmartDepth asks"
+
+        print(f"SmartDepth: {len(bids)} bids + {len(asks)} asks = {len(updates)} total, "
+              f"smart_flag={len(smart_updates)}")
+
     # ── reqMktDepthExchanges ──
 
     def test_depth_exchanges_returns_exchanges(self):
