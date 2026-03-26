@@ -189,10 +189,10 @@ client.disconnect()
 |---|---|
 | **Connection** | `connect`, `disconnect`, `is_connected`, `run`, `get_account_id` |
 | **Market Data** | `req_mkt_data`, `cancel_mkt_data`, `req_tick_by_tick_data`, `cancel_tick_by_tick_data`, `req_mkt_depth`, `cancel_mkt_depth`, `req_market_data_type` |
-| **Orders** | `place_order`, `cancel_order`, `req_global_cancel`, `req_ids`, `req_open_orders`, `req_all_open_orders`, `req_completed_orders`, `req_executions` |
+| **Orders** | `place_order`, `cancel_order`, `req_global_cancel`, `req_ids`, `req_open_orders`, `req_all_open_orders`, `req_auto_open_orders`, `req_completed_orders`, `req_executions` |
 | **Account** | `req_positions`, `cancel_positions`, `req_positions_multi`, `cancel_positions_multi`, `req_account_summary`, `cancel_account_summary`, `req_account_updates`, `req_account_updates_multi`, `cancel_account_updates_multi`, `req_pnl`, `cancel_pnl`, `req_pnl_single`, `cancel_pnl_single`, `req_managed_accts` |
 | **Historical** | `req_historical_data`, `cancel_historical_data`, `req_head_time_stamp`, `cancel_head_time_stamp`, `req_historical_ticks`, `req_real_time_bars`, `cancel_real_time_bars`, `req_histogram_data`, `cancel_histogram_data` |
-| **Reference** | `req_contract_details`, `req_matching_symbols`, `req_sec_def_opt_params`, `req_market_rule`, `req_smart_components` |
+| **Reference** | `req_contract_details`, `req_matching_symbols`, `req_sec_def_opt_params`, `req_mkt_depth_exchanges`, `req_market_rule`, `req_smart_components` |
 | **Scanner** | `req_scanner_parameters`, `req_scanner_subscription`, `cancel_scanner_subscription` |
 | **News** | `req_news_providers`, `req_news_article`, `req_historical_news`, `req_news_bulletins`, `cancel_news_bulletins` |
 | **Fundamental** | `req_fundamental_data`, `cancel_fundamental_data` |
@@ -214,8 +214,9 @@ Jupyter notebooks adapted from [ib_async's examples](https://ib-api-reloaded.git
 | [bar_data](notebooks/bar_data.ipynb) | Head timestamp, historical bars, pandas/matplotlib plot |
 | [tick_data](notebooks/tick_data.ipynb) | L1 streaming, live quote table, tick-by-tick last & bid/ask |
 | [ordering](notebooks/ordering.ipynb) | Limit orders, cancel, market orders, sell to flatten |
+| [scanners](notebooks/scanners.ipynb) | Scanner parameters, market scanner subscriptions, resolve results |
 
-> **Note:** `market_depth`, `option_chain`, and `scanners` notebooks are placeholders — blocked on L2 depth (#31), multi-asset options (#38), and scanner bridging respectively.
+> **Note:** `market_depth` (adapted from [ib_async](https://ib-api-reloaded.github.io/ib_async/notebooks.html)) and `option_chain` notebooks are planned — option_chain is blocked on multi-asset options (#38).
 
 ## Architecture
 
