@@ -754,6 +754,128 @@ fn req_global_cancel_no_instruments_no_commands() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  Order validation — aux_price guards (issue #115)
+// ═══════════════════════════════════════════════════════════════════
+
+#[test]
+fn stp_order_with_zero_aux_price_is_rejected() {
+    let (client, _rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order {
+        action: "SELL".into(), total_quantity: 100.0, order_type: "STP".into(),
+        lmt_price: 145.0, // common mistake: setting lmt_price instead of aux_price
+        ..Default::default()
+    };
+    let result = client.place_order(1, &spy(), &order);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("aux_price"));
+}
+
+#[test]
+fn stp_order_with_valid_aux_price_succeeds() {
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order {
+        action: "SELL".into(), total_quantity: 100.0, order_type: "STP".into(),
+        aux_price: 145.0, ..Default::default()
+    };
+    client.place_order(1, &spy(), &order).unwrap();
+    let cmd = rx.try_recv().unwrap();
+    assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitStop { .. })));
+}
+
+#[test]
+fn stp_lmt_order_with_zero_aux_price_is_rejected() {
+    let (client, _rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order {
+        action: "SELL".into(), total_quantity: 100.0, order_type: "STP LMT".into(),
+        lmt_price: 144.0, ..Default::default() // aux_price missing
+    };
+    let result = client.place_order(1, &spy(), &order);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("aux_price"));
+}
+
+#[test]
+fn trail_order_with_zero_amount_and_zero_percent_is_rejected() {
+    let (client, _rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order {
+        action: "SELL".into(), total_quantity: 100.0, order_type: "TRAIL".into(),
+        ..Default::default() // neither trailing_percent nor aux_price
+    };
+    let result = client.place_order(1, &spy(), &order);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("trailing_percent"));
+}
+
+#[test]
+fn trail_order_with_trailing_percent_succeeds() {
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order {
+        action: "SELL".into(), total_quantity: 100.0, order_type: "TRAIL".into(),
+        trailing_percent: 5.0, ..Default::default()
+    };
+    client.place_order(1, &spy(), &order).unwrap();
+    let cmd = rx.try_recv().unwrap();
+    assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitTrailingStopPct { .. })));
+}
+
+#[test]
+fn trail_limit_order_with_zero_aux_price_is_rejected() {
+    let (client, _rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order {
+        action: "SELL".into(), total_quantity: 100.0, order_type: "TRAIL LIMIT".into(),
+        lmt_price: 148.0, ..Default::default() // aux_price missing
+    };
+    let result = client.place_order(1, &spy(), &order);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("aux_price"));
+}
+
+#[test]
+fn mit_order_with_zero_aux_price_is_rejected() {
+    let (client, _rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order {
+        action: "BUY".into(), total_quantity: 100.0, order_type: "MIT".into(),
+        ..Default::default()
+    };
+    let result = client.place_order(1, &spy(), &order);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("aux_price"));
+}
+
+#[test]
+fn stp_prt_order_with_zero_aux_price_is_rejected() {
+    let (client, _rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order {
+        action: "SELL".into(), total_quantity: 100.0, order_type: "STP PRT".into(),
+        ..Default::default()
+    };
+    let result = client.place_order(1, &spy(), &order);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("aux_price"));
+}
+
+#[test]
+fn lit_order_with_zero_aux_price_is_rejected() {
+    let (client, _rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order {
+        action: "BUY".into(), total_quantity: 100.0, order_type: "LIT".into(),
+        lmt_price: 150.0, ..Default::default() // aux_price missing
+    };
+    let result = client.place_order(1, &spy(), &order);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("aux_price"));
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  Historical data requests
 // ═══════════════════════════════════════════════════════════════════
 

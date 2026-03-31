@@ -941,9 +941,41 @@ impl ClientCore {
             | "MOC" | "LOC" | "MIT" | "LIT" | "MTL" | "MKT PRT" | "STP PRT"
             | "REL" | "PEG MKT" | "PEG MID" | "PEG MIDPT" | "MIDPX" | "MIDPRICE"
             | "SNAP MKT" | "SNAP MID" | "SNAP MIDPT" | "SNAP PRI" | "SNAP PRIM"
-            | "BOX TOP" => Ok(()),
-            _ => Err(format!("Unsupported order type: '{}'", order.order_type)),
+            | "BOX TOP" => {}
+            _ => return Err(format!("Unsupported order type: '{}'", order.order_type)),
         }
+
+        // Reject orders that require aux_price when it is zero — prevents silent no-trigger bugs.
+        // See: https://github.com/deepentropy/ibx/issues/115
+        match order_type.as_str() {
+            "STP" | "STP PRT" | "MIT" if order.aux_price == 0.0 => {
+                return Err(format!(
+                    "{} order requires aux_price (stop/trigger price) but got 0.0 — \
+                     set aux_price to the desired trigger price, not lmt_price",
+                    order.order_type
+                ));
+            }
+            "STP LMT" | "LIT" if order.aux_price == 0.0 => {
+                return Err(format!(
+                    "{} order requires aux_price (stop/trigger price) but got 0.0",
+                    order.order_type
+                ));
+            }
+            "TRAIL" if order.trailing_percent == 0.0 && order.aux_price == 0.0 => {
+                return Err(
+                    "TRAIL order requires either trailing_percent or aux_price (trail amount) \
+                     but both are 0.0".into()
+                );
+            }
+            "TRAIL LIMIT" if order.aux_price == 0.0 => {
+                return Err(
+                    "TRAIL LIMIT order requires aux_price (trail amount) but got 0.0".into()
+                );
+            }
+            _ => {}
+        }
+
+        Ok(())
     }
 
     /// Build an `OrderRequest` from an API `Order`, handling all order types.

@@ -17,6 +17,12 @@ use super::super::contract::{Contract, Order, CommissionReport};
 impl EClient {
     /// Place an order.
     fn place_order(&self, py: Python<'_>, order_id: i64, contract: &Contract, order: &Order) -> PyResult<()> {
+        // Convert and validate order params first (fail fast, no connection needed)
+        let mut api_order = order.to_api();
+        api_order.conditions = order.convert_conditions(py);
+        ClientCore::validate_order(&api_order)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+
         let tx = self.tx()?;
 
         let oid = if order_id > 0 {
@@ -26,10 +32,6 @@ impl EClient {
         };
 
         let instrument = self.find_or_register_instrument(contract)?;
-
-        // Convert Python Order to Rust API Order and use shared routing logic
-        let mut api_order = order.to_api();
-        api_order.conditions = order.convert_conditions(py);
 
         // If orderId is already tracked, this is a modification — emit Modify instead of Submit.
         let cmd = if self.core.is_order_tracked(oid) {
