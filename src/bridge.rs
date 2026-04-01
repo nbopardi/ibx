@@ -10,7 +10,7 @@
 //! - The HotLoop pushes to SharedState sub-containers directly.
 //! - External callers read snapshots and poll events without blocking the hot loop.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::cell::UnsafeCell;
 
@@ -564,6 +564,8 @@ impl ReferenceState {
 /// Account snapshot, per-position info, and atomic instrument positions.
 pub struct PortfolioState {
     account: Mutex<AccountState>,
+    /// True once the first gateway account message ("UT"/"UM"/"RL") has been received.
+    account_data_received: AtomicBool,
     /// Position info (conId -> PositionInfo) for reqPositions and P&L.
     position_infos: Mutex<HashMap<i64, PositionInfo>>,
     positions: [AtomicU64; MAX_INSTRUMENTS],
@@ -573,6 +575,7 @@ impl PortfolioState {
     fn new() -> Self {
         Self {
             account: Mutex::new(AccountState::default()),
+            account_data_received: AtomicBool::new(false),
             position_infos: Mutex::new(HashMap::new()),
             positions: std::array::from_fn(|_| AtomicU64::new(0)),
         }
@@ -600,8 +603,14 @@ impl PortfolioState {
 
     // ── Hot-loop-side writers ──
 
+    /// True once at least one gateway account message has been processed.
+    pub fn account_data_received(&self) -> bool {
+        self.account_data_received.load(Ordering::Acquire)
+    }
+
     #[doc(hidden)] pub fn set_account(&self, account: &AccountState) {
         *self.account.lock().unwrap() = *account;
+        self.account_data_received.store(true, Ordering::Release);
     }
 
     #[doc(hidden)] pub fn set_position_info(&self, info: PositionInfo) {

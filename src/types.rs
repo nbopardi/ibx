@@ -250,6 +250,11 @@ pub struct OrderAttrs {
     /// OCA group ID (FIX tag 583). 0 = not set. Links orders so one cancels others.
     /// Orders sharing the same non-zero oca_group are in the same OCA group.
     pub oca_group: u64,
+    /// OCA group as a string (FIX tag 583). Used by Python compat for user-specified OCA names.
+    /// When non-empty, takes precedence over numeric `oca_group`.
+    pub oca_group_str: String,
+    /// Parent order ID (IB tag 6107). 0 = no parent. Links child orders to parent in brackets.
+    pub parent_id: u64,
     /// Discretionary amount (IB tag 9813). 0 = not set. Fixed-point Price value.
     /// The amount above the limit price that the order may trade at.
     pub discretionary_amt: Price,
@@ -493,6 +498,15 @@ pub enum OrderRequest {
         side: Side,
         qty: u32,
         trail_pct: u32, // basis points: 100 = 1%, 250 = 2.5%
+    },
+    SubmitTrailingStopPctEx {
+        order_id: OrderId,
+        instrument: InstrumentId,
+        side: Side,
+        qty: u32,
+        trail_pct: u32,
+        tif: u8,
+        attrs: OrderAttrs,
     },
     SubmitMoc {
         order_id: OrderId,
@@ -739,6 +753,7 @@ impl OrderRequest {
             | Self::SubmitTrailingStop { order_id, .. }
             | Self::SubmitTrailingStopLimit { order_id, .. }
             | Self::SubmitTrailingStopPct { order_id, .. }
+            | Self::SubmitTrailingStopPctEx { order_id, .. }
             | Self::SubmitMoc { order_id, .. }
             | Self::SubmitLoc { order_id, .. }
             | Self::SubmitMit { order_id, .. }

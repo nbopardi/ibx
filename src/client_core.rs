@@ -192,6 +192,13 @@ pub struct AccountSummaryEntry {
     pub currency: &'static str,
 }
 
+/// A single portfolio position update.
+pub struct PortfolioUpdateEntry {
+    pub con_id: i64,
+    pub position: f64,
+    pub avg_cost: f64,
+}
+
 /// Convert OrderStatus enum to ibapi-compatible string.
 #[inline]
 pub fn order_status_str(status: OrderStatus) -> &'static str {
@@ -260,6 +267,7 @@ pub struct ClientCore {
     // Account updates subscription
     pub account_updates_subscribed: AtomicBool,
     pub last_account: Mutex<Option<AccountState>>,
+    pub last_portfolio: Mutex<Option<Vec<PositionInfo>>>,
 
     // Execution replay store
     pub executions: Mutex<Vec<StoredExecution>>,
@@ -294,6 +302,7 @@ impl ClientCore {
             bulletin_subscribed: AtomicBool::new(false),
             account_updates_subscribed: AtomicBool::new(false),
             last_account: Mutex::new(None),
+            last_portfolio: Mutex::new(None),
             executions: Mutex::new(Vec::new()),
             open_orders: Mutex::new(HashMap::new()),
             market_data_type: AtomicI32::new(1),
@@ -318,6 +327,7 @@ impl ClientCore {
         self.bulletin_subscribed.store(false, Ordering::Relaxed);
         self.account_updates_subscribed.store(false, Ordering::Relaxed);
         *self.last_account.lock().unwrap() = None;
+        *self.last_portfolio.lock().unwrap() = None;
         self.executions.lock().unwrap().clear();
         self.open_orders.lock().unwrap().clear();
         self.market_data_type.store(1, Ordering::Relaxed);
@@ -538,6 +548,7 @@ impl ClientCore {
         self.account_updates_subscribed.store(subscribe, Ordering::Release);
         if !subscribe {
             *self.last_account.lock().unwrap() = None;
+            *self.last_portfolio.lock().unwrap() = None;
         }
     }
 
@@ -850,6 +861,10 @@ impl ClientCore {
         if !self.account_updates_subscribed.load(Ordering::Acquire) {
             return None;
         }
+        // Don't deliver until the gateway has actually sent account data.
+        if !shared.portfolio.account_data_received() {
+            return None;
+        }
 
         let acct = shared.portfolio.account();
         let mut prev_guard = self.last_account.lock().unwrap();
@@ -896,8 +911,47 @@ impl ClientCore {
         Some(AccountUpdateBatch { fields, delivered })
     }
 
+    /// Prepare portfolio updates (position entries) for account streaming.
+    /// Returns changed/new position infos when account updates are subscribed.
+    pub fn prepare_portfolio_updates(&self, shared: &SharedState) -> Vec<PortfolioUpdateEntry> {
+        if !self.account_updates_subscribed.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        if !shared.portfolio.account_data_received() {
+            return Vec::new();
+        }
+
+        let current = shared.portfolio.position_infos();
+        let mut prev_guard = self.last_portfolio.lock().unwrap();
+        let is_first = prev_guard.is_none();
+
+        let changed = if is_first {
+            current.iter().map(|pi| PortfolioUpdateEntry {
+                con_id: pi.con_id,
+                position: pi.position as f64,
+                avg_cost: pi.avg_cost as f64 / PRICE_SCALE_F,
+            }).collect()
+        } else {
+            let prev = prev_guard.as_ref().unwrap();
+            current.iter().filter(|pi| {
+                !prev.iter().any(|pp| pp.con_id == pi.con_id && pp.position == pi.position && pp.avg_cost == pi.avg_cost)
+            }).map(|pi| PortfolioUpdateEntry {
+                con_id: pi.con_id,
+                position: pi.position as f64,
+                avg_cost: pi.avg_cost as f64 / PRICE_SCALE_F,
+            }).collect()
+        };
+
+        *prev_guard = Some(current);
+        changed
+    }
+
     /// Prepare account summary response (one-shot, consumes the request).
     pub fn prepare_account_summary(&self, shared: &SharedState, _account_id: &str) -> Option<AccountSummaryBatch> {
+        // Wait for gateway account data before delivering summary.
+        if !shared.portfolio.account_data_received() {
+            return None;
+        }
         let req = self.account_summary_req.lock().unwrap().take();
         let (req_id, tags) = req?;
 
@@ -1049,7 +1103,15 @@ impl ClientCore {
             "TRAIL" => {
                 if order.trailing_percent > 0.0 {
                     let pct = (order.trailing_percent * 100.0) as u32;
-                    OrderRequest::SubmitTrailingStopPct { order_id, instrument, side, qty, trail_pct: pct }
+                    if order.has_extended_attrs() || order.tif != "DAY" {
+                        OrderRequest::SubmitTrailingStopPctEx {
+                            order_id, instrument, side, qty, trail_pct: pct,
+                            tif: order.tif_byte(),
+                            attrs: order.attrs(),
+                        }
+                    } else {
+                        OrderRequest::SubmitTrailingStopPct { order_id, instrument, side, qty, trail_pct: pct }
+                    }
                 } else {
                     let trail = (order.aux_price * PRICE_SCALE_F) as i64;
                     OrderRequest::SubmitTrailingStop { order_id, instrument, side, qty, trail_amt: trail }

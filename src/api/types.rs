@@ -416,6 +416,12 @@ impl Order {
             good_after: 0,
             good_till: 0,
             oca_group: self.oca_group.parse().unwrap_or(0),
+            oca_group_str: if self.oca_group.parse::<u64>().is_err() && !self.oca_group.is_empty() {
+                self.oca_group.clone()
+            } else {
+                String::new()
+            },
+            parent_id: self.parent_id.max(0) as u64,
             discretionary_amt: (self.discretionary_amt * PRICE_SCALE_F) as Price,
             sweep_to_fill: self.sweep_to_fill,
             all_or_none: self.all_or_none,
@@ -436,6 +442,7 @@ impl Order {
             || !self.good_after_time.is_empty()
             || !self.good_till_date.is_empty()
             || !self.oca_group.is_empty()
+            || self.parent_id > 0
             || self.discretionary_amt > 0.0
             || self.sweep_to_fill
             || self.all_or_none
