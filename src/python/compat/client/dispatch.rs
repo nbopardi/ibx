@@ -469,6 +469,29 @@ impl EClient {
             for field in &batch.fields {
                 call_wrapper!(self.wrapper, py, "update_account_value", (field.key, field.value.as_str(), field.currency, account_name.as_str()));
             }
+
+            // Portfolio updates (position entries)
+            let portfolio = self.core.prepare_portfolio_updates(shared);
+            for entry in &portfolio {
+                let contract = self.core.get_contract(entry.con_id, shared);
+                let c = contract.map(|ac| {
+                    let mut c = crate::python::compat::contract::Contract::default();
+                    c.con_id = ac.con_id;
+                    c.symbol = ac.symbol;
+                    c.sec_type = ac.sec_type;
+                    c.exchange = ac.exchange;
+                    c.currency = ac.currency;
+                    c
+                }).unwrap_or_else(|| {
+                    let mut c = crate::python::compat::contract::Contract::default();
+                    c.con_id = entry.con_id;
+                    c
+                });
+                let c_py = pyo3::Py::new(py, c).unwrap().into_any();
+                call_wrapper!(self.wrapper, py, "update_portfolio",
+                    (&c_py, entry.position, 0.0_f64, 0.0_f64, entry.avg_cost, 0.0_f64, 0.0_f64, account_name.as_str()));
+            }
+
             if batch.delivered {
                 call_wrapper!(self.wrapper, py, "update_account_time", ("",));
                 call_wrapper!(self.wrapper, py, "account_download_end", (account_name.as_str(),));

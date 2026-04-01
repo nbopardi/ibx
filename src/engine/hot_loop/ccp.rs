@@ -121,7 +121,6 @@ impl CcpState {
             Some(t) => t.as_str(),
             None => return,
         };
-        log::debug!("CCP msg 35={}", msg_type);
         match msg_type {
             fix::MSG_EXEC_REPORT => self.handle_exec_report(&parsed, context, shared, event_tx, account_id),
             fix::MSG_CANCEL_REJECT => self.handle_cancel_reject(&parsed, context, shared, event_tx),
@@ -146,7 +145,6 @@ impl CcpState {
             }
             "U" => {
                 if let Some(comm) = parsed.get(&6040) {
-                    log::trace!("CCP U msg: 6040={}", comm);
                     match comm.as_str() {
                         "77" => self.handle_account_summary(&parsed, context, shared),
                         "186" => {
@@ -643,7 +641,6 @@ impl CcpState {
     fn handle_account_summary(&mut self, parsed: &std::collections::HashMap<u32, String>, context: &mut Context, shared: &SharedState) {
         if let Some(val) = parsed.get(&9806).and_then(|s| s.parse::<f64>().ok()) {
             context.account.net_liquidation = (val * PRICE_SCALE as f64) as Price;
-            log::info!("Account summary: net_liq=${:.2}", val);
         }
         shared.portfolio.set_account(context.account());
     }
@@ -917,13 +914,15 @@ pub(crate) fn handle_position_update(
         .map(|v| (v * PRICE_SCALE as f64) as Price)
         .unwrap_or(0);
 
+    // Always store position info for reqPositions/pnlSingle, regardless of instrument registry.
+    shared.portfolio.set_position_info(PositionInfo { con_id, position, avg_cost });
+
     if let Some(instrument) = context.market.instrument_by_con_id(con_id) {
         let current = context.position(instrument);
         let delta = position - current;
         if delta != 0 {
             context.update_position(instrument, delta);
         }
-        shared.portfolio.set_position_info(PositionInfo { con_id, position, avg_cost });
         shared.portfolio.set_position(instrument, position);
         emit(event_tx, Event::PositionUpdate { instrument, con_id, position, avg_cost });
     }

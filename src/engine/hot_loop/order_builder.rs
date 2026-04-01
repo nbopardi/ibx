@@ -142,7 +142,17 @@ pub(crate) fn drain_and_send_orders(
                 let min_qty_str = format_uint(attrs.min_qty as u64);
                 let gat_str = if attrs.good_after > 0 { unix_to_ib_datetime(attrs.good_after) } else { String::new() };
                 let gtd_str = if attrs.good_till > 0 { unix_to_ib_datetime(attrs.good_till) } else { String::new() };
-                let oca_str = if attrs.oca_group > 0 { format!("OCA_{}", attrs.oca_group) } else { String::new() };
+                let oca_str = if !attrs.oca_group_str.is_empty() {
+                    attrs.oca_group_str.clone()
+                } else if attrs.oca_group > 0 {
+                    format!("OCA_{}", attrs.oca_group)
+                } else {
+                    String::new()
+                };
+                let parent_str = if attrs.parent_id > 0 {
+                    // Match parent ClOrdID format: "{order_id}.{ver}" — assume ver=0 for initial submission
+                    format!("{}.0", attrs.parent_id)
+                } else { String::new() };
                 let mut fields: Vec<(u32, &str)> = vec![
                     (fix::TAG_MSG_TYPE, fix::MSG_NEW_ORDER),
                     (fix::TAG_SENDING_TIME, &now),
@@ -179,9 +189,12 @@ pub(crate) fn drain_and_send_orders(
                 if attrs.good_till > 0 {
                     fields.push((126, &gtd_str));
                 }
-                if attrs.oca_group > 0 {
+                if !oca_str.is_empty() {
                     fields.push((583, &oca_str));
                     fields.push((6209, "CancelOnFillWBlock"));
+                }
+                if attrs.parent_id > 0 {
+                    fields.push((6107, &parent_str));
                 }
                 let disc_str;
                 if attrs.discretionary_amt > 0 {
@@ -505,6 +518,59 @@ pub(crate) fn drain_and_send_orders(
                     (15, "USD"),
                     (204, "0"),
                 ])
+            }
+            OrderRequest::SubmitTrailingStopPctEx { order_id, instrument, side, qty, trail_pct, tif, attrs } => {
+                context.insert_order(crate::types::Order::new(
+                    order_id, instrument, side, qty, 0, b'P', tif, 0,
+                ));
+                let ver = *context.modify_versions.get(&order_id).unwrap_or(&0);
+                let clord_str = format!("{}.{}", order_id, ver);
+                let side_str = fix_side(side);
+                let qty_str = format_uint(qty as u64);
+                let pct_str = trail_pct.to_string();
+                let symbol = context.market.symbol(instrument).to_string();
+                let now = chrono_free_timestamp();
+                let tif_byte = [tif];
+                let tif_str = std::str::from_utf8(&tif_byte).unwrap_or("0");
+                let oca_str = if !attrs.oca_group_str.is_empty() {
+                    attrs.oca_group_str.clone()
+                } else if attrs.oca_group > 0 {
+                    format!("OCA_{}", attrs.oca_group)
+                } else {
+                    String::new()
+                };
+                let parent_str = if attrs.parent_id > 0 {
+                    format!("{}.0", attrs.parent_id)
+                } else { String::new() };
+                let mut fields: Vec<(u32, &str)> = vec![
+                    (fix::TAG_MSG_TYPE, fix::MSG_NEW_ORDER),
+                    (fix::TAG_SENDING_TIME, &now),
+                    (11, &clord_str),
+                    (1, account_id),
+                    (21, "2"),
+                    (55, &symbol),
+                    (54, side_str),
+                    (38, &qty_str),
+                    (40, "P"),              // OrdType = Trailing Stop
+                    (6268, &pct_str),       // TrailingPercent (basis points)
+                    (59, tif_str),
+                    (60, &now),
+                    (167, "STK"),
+                    (100, "SMART"),
+                    (15, "USD"),
+                    (204, "0"),
+                ];
+                if attrs.outside_rth {
+                    fields.push((6433, "1"));
+                }
+                if !oca_str.is_empty() {
+                    fields.push((583, &oca_str));
+                    fields.push((6209, "CancelOnFillWBlock"));
+                }
+                if attrs.parent_id > 0 {
+                    fields.push((6107, &parent_str));
+                }
+                conn.send_fix(&fields)
             }
             OrderRequest::SubmitMoc { order_id, instrument, side, qty } => {
                 context.insert_order(crate::types::Order::new(
