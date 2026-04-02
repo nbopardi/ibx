@@ -379,12 +379,7 @@ impl HotLoop {
                 }
                 ControlCommand::FetchHistorical { req_id, con_id, symbol, end_date_time, duration, bar_size, what_to_show, use_rth, keep_up_to_date } => {
                     if keep_up_to_date {
-                        // CCP route — IV derived from AES-CBC logon encryption.
-                        // DISABLED: signed FIXCOMP via send_raw still kills session.
-                        // May need send_fixcomp (which wraps FIXCOMP + 8349 in one step)
-                        // instead of manual build+sign+send_raw.
-                        // Fallback to one-shot via HMDS for now.
-                        self.hmds.send_historical_request_ex(req_id, con_id, &end_date_time, &duration, &bar_size, &what_to_show, use_rth, false, &symbol, &mut self.hmds_conn, &mut self.hb);
+                        self.hmds.send_historical_request_via_ccp(req_id, con_id, &end_date_time, &duration, &bar_size, &what_to_show, use_rth, &symbol, &mut self.ccp_conn, &mut self.hb, &self.ccp.ccp_sign_key, &self.ccp.ccp_sign_iv);
                         self.hmds.keep_up_to_date_reqs.insert(req_id);
                     } else {
                         self.hmds.send_historical_request_ex(req_id, con_id, &end_date_time, &duration, &bar_size, &what_to_show, use_rth, false, &symbol, &mut self.hmds_conn, &mut self.hb);
