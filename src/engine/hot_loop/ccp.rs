@@ -46,6 +46,10 @@ pub(crate) struct CcpState {
     pub(crate) kut_ticker_map: std::collections::HashMap<u32, u32>,
     /// tickerId → minTick for bar decoding
     pub(crate) kut_min_tick: std::collections::HashMap<u32, f64>,
+    /// HMAC signing key for XML-carrying CCP messages (selective signing).
+    pub(crate) ccp_sign_key: Vec<u8>,
+    /// HMAC signing IV — advances only for signed messages, independent of unsigned ones.
+    pub(crate) ccp_sign_iv: std::sync::Mutex<Vec<u8>>,
 }
 
 impl CcpState {
@@ -60,6 +64,8 @@ impl CcpState {
             pending_kut_historical: Vec::new(),
             kut_ticker_map: std::collections::HashMap::new(),
             kut_min_tick: std::collections::HashMap::new(),
+            ccp_sign_key: Vec::new(),
+            ccp_sign_iv: std::sync::Mutex::new(Vec::new()),
         }
     }
 

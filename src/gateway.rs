@@ -283,6 +283,10 @@ pub struct Gateway {
     pub raw_family_codes: String,
     /// White branding ID from CCP logon (empty for standard accounts).
     pub white_branding_id: String,
+    /// CCP HMAC signing key (kb[64..84]) for selective signing of XML messages.
+    pub ccp_sign_key: Vec<u8>,
+    /// CCP HMAC initial IV (kb[48..64]) for selective signing.
+    pub ccp_sign_iv: Vec<u8>,
 }
 
 /// Connect to a data farm: key exchange → encrypted logon → token auth → routing → Connection.
@@ -1055,9 +1059,11 @@ impl Gateway {
         // Auth connection (non-blocking TLS for hot loop)
         let mut ccp_conn = Connection::new(tls)?;
         ccp_conn.seq = ccp_seq;
-        // Note: CCP signing keys NOT set on connection — init messages were unsigned,
-        // so setting sign_key would desync the IV chain and break orders.
-        // keepUpToDate needs separate signing state (see #103).
+        // CCP signing: selective, not global. Only XML-carrying messages (35=W, 6040=10020)
+        // need 8349 HMAC signing. Init messages and orders are sent unsigned.
+        // Store signing material for the hot loop to use on keepUpToDate requests.
+        let ccp_sign_key = channel.key_block().map(|kb| kb[64..84].to_vec()).unwrap_or_default();
+        let ccp_sign_iv = channel.key_block().map(|kb| kb[48..64].to_vec()).unwrap_or_default();
         // Seed init burst into connection buffer so the hot loop processes 8=O account data
         ccp_conn.seed_buffer(&init_data);
 
@@ -1124,6 +1130,8 @@ impl Gateway {
             raw_soft_dollar_tiers,
             raw_family_codes,
             white_branding_id,
+            ccp_sign_key,
+            ccp_sign_iv,
         };
         Ok((gw, farm_conn, ccp_conn, hmds_conn, cashfarm_conn, usfuture_conn, eufarm_conn, jfarm_conn))
     }
@@ -1261,6 +1269,8 @@ impl Gateway {
         hot_loop.set_reconnect_auth(reconnect_auth);
         hot_loop.farm_conn = Some(farm_conn);
         hot_loop.ccp_conn = Some(ccp_conn);
+        hot_loop.ccp.ccp_sign_key = self.ccp_sign_key.clone();
+        hot_loop.ccp.ccp_sign_iv = std::sync::Mutex::new(self.ccp_sign_iv.clone());
         hot_loop.hmds_conn = hmds_conn;
         hot_loop.cashfarm_conn = cashfarm_conn;
         hot_loop.usfuture_conn = usfuture_conn;
