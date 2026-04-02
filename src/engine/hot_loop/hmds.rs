@@ -604,6 +604,8 @@ impl HmdsState {
 
         let xml = crate::control::historical::build_query_xml(&req);
         if let Some(conn) = ccp_conn.as_mut() {
+            // CCP doesn't use HMAC signing (TLS provides encryption).
+            // Send as raw FIX with CCP seq number — same as orders.
             let ts = chrono_free_timestamp();
             let _ = conn.send_fix(&[
                 (fix::TAG_MSG_TYPE, "W"),
