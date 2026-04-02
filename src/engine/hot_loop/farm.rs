@@ -264,6 +264,7 @@ impl FarmState {
         tick_decoder::decode_ticks_35p_into(body, &mut ticks);
         let mut notified: u32 = 0;
 
+        // Phase 1: Apply all ticks to internal quotes before publishing.
         for tick in &ticks {
             let instrument = match context.market.instrument_by_server_tag(tick.server_tag) {
                 Some(id) => id,
@@ -289,12 +290,16 @@ impl FarmState {
                 _ => {}
             }
 
-            let bit = 1u32 << instrument;
-            if notified & bit == 0 {
-                notified |= bit;
-                shared.market.push_quote(instrument, context.quote(instrument));
-                emit(event_tx, Event::Tick(instrument));
-            }
+            notified |= 1u32 << instrument;
+        }
+
+        // Phase 2: Publish complete quotes after all ticks in the batch are applied.
+        let mut remaining = notified;
+        while remaining != 0 {
+            let instrument = remaining.trailing_zeros();
+            remaining &= remaining - 1;
+            shared.market.push_quote(instrument, context.quote(instrument));
+            emit(event_tx, Event::Tick(instrument));
         }
         self.tick_buf = ticks;
     }
