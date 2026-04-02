@@ -556,6 +556,8 @@ impl HmdsState {
         symbol: &str,
         ccp_conn: &mut Option<Connection>,
         hb: &mut HeartbeatState,
+        sign_key: &[u8],
+        sign_iv: &std::sync::Mutex<Vec<u8>>,
     ) {
         // Reuse the same request builder but with keep_up_to_date=true
         let duration = duration.to_lowercase();
@@ -604,14 +606,16 @@ impl HmdsState {
 
         let xml = crate::control::historical::build_query_xml(&req);
         if let Some(conn) = ccp_conn.as_mut() {
-            // CCP doesn't use HMAC signing (TLS provides encryption).
-            // Send as raw FIX with CCP seq number — same as orders.
             let ts = chrono_free_timestamp();
-            let _ = conn.send_fix(&[
+            // FIXCOMP compress + selective HMAC 8349 signing
+            let raw = fix::fix_build(&[
                 (fix::TAG_MSG_TYPE, "W"),
                 (fix::TAG_SENDING_TIME, &ts),
                 (6118, &xml),
-            ]);
+            ], 0);
+            let compressed = fixcomp::fixcomp_build(&raw);
+            // Try unsigned FIXCOMP first — gateway may accept without 8349
+            let _ = conn.send_raw(&compressed);
             hb.last_ccp_sent = Instant::now();
         }
         self.pending_historical.push((query_id, req_id));

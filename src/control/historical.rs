@@ -136,9 +136,14 @@ pub fn build_query_xml(req: &HistoricalRequest) -> String {
     let rth = if req.use_rth { "true" } else { "false" };
 
     let data_str = req.data_type.as_str();
-    // Query ID: structured ;;-delimited format required by gateway parser
-    let graph_name = format!("{}@{} {}", req.symbol, exchange, data_str);
-    let query_id = format!("{};;{};;1;;true;;0;;I", req.query_id, graph_name);
+    // keepUpToDate uses structured ;;-delimited ID required by CCP gateway parser.
+    // One-shot uses simple ID (HMDS accepts it fine).
+    let query_id = if req.keep_up_to_date {
+        let graph_name = format!("{}@{} {}", req.symbol, exchange, data_str);
+        format!("{};;{};;1;;true;;0;;I", req.query_id, graph_name)
+    } else {
+        req.query_id.clone()
+    };
 
     let (end_time_tag, refresh_tag) = if req.keep_up_to_date {
         (String::new(), "<refresh>5 secs</refresh>")
