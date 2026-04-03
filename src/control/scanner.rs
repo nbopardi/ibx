@@ -15,10 +15,21 @@ pub struct ScannerSubscription {
     pub max_items: u32,
 }
 
+/// One entry from a scanner result.
+#[derive(Debug, Clone, Default)]
+pub struct ScannerEntry {
+    pub con_id: u32,
+    pub symbol: String,
+    pub sec_type: String,
+    pub exchange: String,
+    pub currency: String,
+}
+
 /// Parsed scanner subscription response.
 #[derive(Debug, Clone)]
 pub struct ScannerResult {
     pub con_ids: Vec<u32>,
+    pub entries: Vec<ScannerEntry>,
     pub scan_time: String,
 }
 
@@ -84,6 +95,7 @@ pub fn parse_scanner_response(xml: &str) -> Option<ScannerResult> {
     let scan_time = extract_xml_tag(xml, "scanTime").unwrap_or("").to_string();
 
     let mut con_ids = Vec::new();
+    let mut entries = Vec::new();
     let mut search_start = 0;
 
     while let Some(c_start) = xml[search_start..].find("<Contract>") {
@@ -94,15 +106,16 @@ pub fn parse_scanner_response(xml: &str) -> Option<ScannerResult> {
         };
         let contract_xml = &xml[abs_start..c_end];
 
-        if let Some(id) = extract_xml_tag(contract_xml, "contractID") {
-            if let Ok(n) = id.parse::<u32>() {
-                con_ids.push(n);
-            }
+        let con_id = extract_xml_tag(contract_xml, "contractID")
+            .and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        if con_id != 0 {
+            con_ids.push(con_id);
         }
+        entries.push(ScannerEntry { con_id, ..Default::default() });
         search_start = c_end;
     }
 
-    Some(ScannerResult { con_ids, scan_time })
+    Some(ScannerResult { con_ids, entries, scan_time })
 }
 
 #[cfg(test)]
