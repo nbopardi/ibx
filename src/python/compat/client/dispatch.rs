@@ -354,9 +354,16 @@ impl EClient {
         // Drain scanner data -> scannerData + scannerDataEnd
         let scanner_results = shared.reference.drain_scanner_data();
         for (req_id, result) in scanner_results {
-            for (rank, &con_id) in result.con_ids.iter().enumerate() {
+            for (rank, entry) in result.entries.iter().enumerate() {
                 let mut cd = ContractDetails::default();
-                cd.contract.con_id = con_id as i64;
+                cd.contract.con_id = entry.con_id as i64;
+                // Look up cached contract for symbol info
+                if let Some(ac) = self.core.get_contract(entry.con_id as i64, shared) {
+                    cd.contract.symbol = ac.symbol;
+                    cd.contract.sec_type = ac.sec_type;
+                    cd.contract.exchange = ac.exchange;
+                    cd.contract.currency = ac.currency;
+                }
                 let cd_py = Py::new(py, cd)?.into_any();
                 call_wrapper!(self.wrapper, py, "scanner_data", (req_id as i64, rank as i32, &cd_py, "", "", "", ""));
             }
