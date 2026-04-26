@@ -281,6 +281,8 @@ pub struct Gateway {
     pub raw_soft_dollar_tiers: String,
     /// Raw family code data from CCP logon tag 6823.
     pub raw_family_codes: String,
+    /// Raw news provider data from CCP logon tag 6830.
+    pub raw_news_providers: String,
     /// White branding ID from CCP logon (empty for standard accounts).
     pub white_branding_id: String,
     /// CCP HMAC signing key (kb[64..84]) for selective signing of XML messages.
@@ -916,6 +918,7 @@ impl Gateway {
         let mut ccp_token = String::new();
         let mut raw_soft_dollar_tiers = String::new();
         let mut raw_family_codes = String::new();
+        let mut raw_news_providers = String::new();
         let mut white_branding_id = String::new();
 
         for _ in 0..5 {
@@ -967,6 +970,9 @@ impl Gateway {
             }
             if let Some(v) = fields.get(&6823) {
                 if raw_family_codes.is_empty() { raw_family_codes = v.clone(); }
+            }
+            if let Some(v) = fields.get(&6830) {
+                if raw_news_providers.is_empty() { raw_news_providers = v.clone(); }
             }
             if let Some(v) = fields.get(&6571) {
                 if white_branding_id.is_empty() { white_branding_id = v.clone(); }
@@ -1051,6 +1057,9 @@ impl Gateway {
             } else if part.starts_with("6823=") && raw_family_codes.is_empty() {
                 raw_family_codes = part[5..].to_string();
                 log::info!("Found family codes from init response ({} bytes)", raw_family_codes.len());
+            } else if part.starts_with("6830=") && raw_news_providers.is_empty() {
+                raw_news_providers = part[5..].to_string();
+                log::info!("Found news providers from init response ({} bytes)", raw_news_providers.len());
             } else if part.starts_with("6571=") && white_branding_id.is_empty() {
                 white_branding_id = part[5..].to_string();
                 log::info!("Found white branding ID from init response");
@@ -1133,6 +1142,7 @@ impl Gateway {
             encoded,
             raw_soft_dollar_tiers,
             raw_family_codes,
+            raw_news_providers,
             white_branding_id,
             ccp_sign_key,
             ccp_sign_iv,
@@ -1160,19 +1170,33 @@ impl Gateway {
         }).collect();
         shared.reference.set_smart_components(smart_components);
 
-        // News providers: hardcoded list matching Gateway.
-        let news_providers: Vec<NewsProvider> = [
-            ("BRFG", "Briefing.com General Market Columns"),
-            ("BRFUPDN", "Briefing.com Analyst Actions"),
-            ("DJ-N", "Dow Jones Global Equity Trader"),
-            ("DJ-RTA", "Dow Jones Top Stories Asia Pacific"),
-            ("DJ-RTE", "Dow Jones Top Stories Europe"),
-            ("DJ-RTG", "Dow Jones Top Stories Global"),
-            ("DJ-RTPRO", "Dow Jones Top Stories Pro"),
-            ("DJNL", "Dow Jones Newsletters"),
-        ].iter().map(|(code, name)| NewsProvider {
-            code: code.to_string(), name: name.to_string(),
-        }).collect();
+        // News providers: parse from CCP logon tag 6830, fall back to defaults.
+        // Wire format: "code1,name1;code2,name2;..." (tag value capped at 155 entries).
+        let news_providers: Vec<NewsProvider> = if self.raw_news_providers.is_empty() {
+            // Default list — only used when account-specific entitlement data is unavailable.
+            [
+                ("BRFG", "Briefing.com General Market Columns"),
+                ("BRFUPDN", "Briefing.com Analyst Actions"),
+                ("DJ-N", "Dow Jones Global Equity Trader"),
+                ("DJ-RTA", "Dow Jones Top Stories Asia Pacific"),
+                ("DJ-RTE", "Dow Jones Top Stories Europe"),
+                ("DJ-RTG", "Dow Jones Top Stories Global"),
+                ("DJ-RTPRO", "Dow Jones Top Stories Pro"),
+                ("DJNL", "Dow Jones Newsletters"),
+            ].iter().map(|(code, name)| NewsProvider {
+                code: code.to_string(), name: name.to_string(),
+            }).collect()
+        } else {
+            self.raw_news_providers.split(';').filter_map(|entry| {
+                let entry = entry.trim();
+                if entry.is_empty() { return None; }
+                let (code, name) = entry.split_once(',')?;
+                Some(NewsProvider {
+                    code: code.trim().to_string(),
+                    name: name.trim().to_string(),
+                })
+            }).collect()
+        };
         shared.reference.set_news_providers(news_providers);
 
         // Soft dollar tiers: parse from CCP logon tag 6560, fall back to defaults.
