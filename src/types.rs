@@ -54,7 +54,6 @@ pub enum OrderStatus {
 }
 
 /// Current quote for an instrument. Cache-line aligned for hot-path access.
-/// 88 bytes of data, padded to 128 bytes (2 cache lines).
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 pub struct Quote {
@@ -70,6 +69,11 @@ pub struct Quote {
     pub low: Price,
     pub close: Price,
     pub timestamp_ns: u64,
+    /// Bid-exchange bitmask. Each set bit indexes into smart_components by bit_number.
+    /// Hypothesis pending wire-format confirmation; see deepentropy/ib-agent#120.
+    pub bid_exch_mask: i64,
+    pub ask_exch_mask: i64,
+    pub last_exch_mask: i64,
 }
 
 impl Default for Quote {
@@ -87,6 +91,9 @@ impl Default for Quote {
             low: 0,
             close: 0,
             timestamp_ns: 0,
+            bid_exch_mask: 0,
+            ask_exch_mask: 0,
+            last_exch_mask: 0,
         }
     }
 }

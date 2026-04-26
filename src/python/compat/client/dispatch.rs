@@ -192,6 +192,9 @@ impl EClient {
                     call_wrapper!(self.wrapper, py, "tick_size", (tick.req_id, tick.tick_type, tick.value));
                 }
             }
+            for st in &result.string_ticks {
+                call_wrapper!(self.wrapper, py, "tick_string", (st.req_id, st.tick_type, st.value.as_str()));
+            }
             if let Some(ts) = &result.timestamp {
                 let ts_secs = ts.timestamp_ns / 1_000_000_000;
                 call_wrapper!(self.wrapper, py, "tick_string", (ts.req_id, TICK_LAST_TIMESTAMP, ts_secs.to_string().as_str()));

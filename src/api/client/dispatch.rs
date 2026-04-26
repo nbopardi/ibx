@@ -134,6 +134,9 @@ impl EClient {
                     wrapper.tick_size(tick.req_id, tick.tick_type, tick.value);
                 }
             }
+            for st in &result.string_ticks {
+                wrapper.tick_string(st.req_id, st.tick_type, &st.value);
+            }
             if let Some(ts) = &result.timestamp {
                 let ts_secs = ts.timestamp_ns / 1_000_000_000;
                 wrapper.tick_string(ts.req_id, 45, &ts_secs.to_string());

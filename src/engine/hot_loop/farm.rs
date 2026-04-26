@@ -290,6 +290,9 @@ impl FarmState {
                 tick_decoder::O_LAST_SIZE => { q.last_size = tick.magnitude; }
                 tick_decoder::O_VOLUME => { q.volume = tick.magnitude; }
                 tick_decoder::O_TIMESTAMP | tick_decoder::O_LAST_TS => { q.timestamp_ns = tick.magnitude as u64; }
+                tick_decoder::O_BID_EXCH => { q.bid_exch_mask = tick.magnitude; }
+                tick_decoder::O_ASK_EXCH => { q.ask_exch_mask = tick.magnitude; }
+                tick_decoder::O_LAST_EXCH => { q.last_exch_mask = tick.magnitude; }
                 _ => {}
             }
 

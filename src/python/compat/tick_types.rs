@@ -15,8 +15,11 @@ pub const TICK_LOW: i32 = 7;
 pub const TICK_VOLUME: i32 = 8;
 pub const TICK_CLOSE: i32 = 9;
 pub const TICK_OPEN: i32 = 14;
+pub const TICK_BID_EXCHANGE: i32 = 32;
+pub const TICK_ASK_EXCHANGE: i32 = 33;
 pub const TICK_LAST_TIMESTAMP: i32 = 45;
 pub const TICK_HALTED: i32 = 49;
+pub const TICK_LAST_EXCHANGE: i32 = 84;
 
 /// ibapi-compatible TickAttrib for tickPrice callbacks.
 #[pyclass]
@@ -122,6 +125,12 @@ impl TickTypeEnum {
     const LAST_TIMESTAMP: i32 = TICK_LAST_TIMESTAMP;
     #[classattr]
     const HALTED: i32 = TICK_HALTED;
+    #[classattr]
+    const BID_EXCHANGE: i32 = TICK_BID_EXCHANGE;
+    #[classattr]
+    const ASK_EXCHANGE: i32 = TICK_ASK_EXCHANGE;
+    #[classattr]
+    const LAST_EXCHANGE: i32 = TICK_LAST_EXCHANGE;
 }
 
 /// Register tick type classes and constants on the module.

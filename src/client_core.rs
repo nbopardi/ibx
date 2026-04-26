@@ -33,6 +33,10 @@ pub const TICK_BID_SIZE: i32 = 0;
 pub const TICK_ASK_SIZE: i32 = 3;
 pub const TICK_LAST_SIZE: i32 = 5;
 pub const TICK_VOLUME: i32 = 8;
+pub const TICK_LAST_TIMESTAMP: i32 = 45;
+pub const TICK_BID_EXCHANGE: i32 = 32;
+pub const TICK_ASK_EXCHANGE: i32 = 33;
+pub const TICK_LAST_EXCHANGE: i32 = 84;
 
 // ── Shared account field definitions ──
 
@@ -123,6 +127,29 @@ pub fn account_summary_values(acct: &AccountState) -> [f64; 16] {
     ]
 }
 
+/// Render an exchange-code bitmask to a letter string using the smart components
+/// table. Each set bit at position N picks `smart_components[N].exchange_letter`.
+///
+/// Wire encoding pending live confirmation (deepentropy/ib-agent#120). Bit
+/// ordering and width are inferred from TWS-API parity expectations; the
+/// dispatch path tolerates an empty result if the mask layout differs.
+pub fn render_exchange_mask(mask: i64, shared: &SharedState) -> String {
+    if mask == 0 {
+        return String::new();
+    }
+    let components = shared.reference.smart_components();
+    let mut out = String::with_capacity(8);
+    let mut bits = mask as u64;
+    while bits != 0 {
+        let bit = bits.trailing_zeros() as i32;
+        bits &= bits - 1;
+        if let Some(c) = components.iter().find(|c| c.bit_number == bit) {
+            out.push_str(&c.exchange_letter);
+        }
+    }
+    out
+}
+
 // ── Intermediate dispatch structs ──
 
 /// A single tick event produced by quote change detection.
@@ -140,9 +167,17 @@ pub struct TimestampTick {
     pub timestamp_ns: i64,
 }
 
+/// String-valued tick (e.g. exchange-code letters for tick_types 32/33/84).
+pub struct StringTickEvent {
+    pub req_id: i64,
+    pub tick_type: i32,
+    pub value: String,
+}
+
 /// Result of polling quotes for one instrument.
 pub struct QuotePollResult {
     pub ticks: Vec<TickEvent>,
+    pub string_ticks: Vec<StringTickEvent>,
     pub timestamp: Option<TimestampTick>,
     /// true if any tick was delivered (for snapshot detection).
     pub delivered: bool,
@@ -253,7 +288,7 @@ pub struct ClientCore {
     // con_id → InstrumentId for find_or_register_instrument lookup
     pub con_id_to_instrument: Mutex<HashMap<i64, InstrumentId>>,
     // Change detection for quote polling
-    pub last_quotes: Mutex<HashMap<InstrumentId, [i64; 12]>>,
+    pub last_quotes: Mutex<HashMap<InstrumentId, [i64; 15]>>,
     // Snapshot req_ids — deliver first ticks then auto-cancel
     pub snapshot_reqs: Mutex<HashSet<i64>>,
 
@@ -754,11 +789,12 @@ impl ClientCore {
         let fields = [
             q.bid, q.ask, q.last, q.bid_size, q.ask_size, q.last_size,
             q.high, q.low, q.volume, q.close, q.open, q.timestamp_ns as i64,
+            q.bid_exch_mask, q.ask_exch_mask, q.last_exch_mask,
         ];
 
         // Single lock acquisition for both read and write of last_quotes.
         let mut map = self.last_quotes.lock().unwrap();
-        let last = map.get(&iid).copied().unwrap_or([0i64; 12]);
+        let last = map.get(&iid).copied().unwrap_or([0i64; 15]);
 
         let mut ticks = Vec::new();
         let mut delivered = false;
@@ -801,9 +837,26 @@ impl ClientCore {
             None
         };
 
+        // Exchange-code string ticks: rendering is left to dispatch since it
+        // depends on shared.reference.smart_components(). Emit a delta record
+        // when the bitmask changes; dispatch resolves the letter string.
+        let mut string_ticks = Vec::new();
+        const EXCH_TICKS: &[(usize, i32)] = &[
+            (12, TICK_BID_EXCHANGE), (13, TICK_ASK_EXCHANGE), (14, TICK_LAST_EXCHANGE),
+        ];
+        for &(idx, tt) in EXCH_TICKS {
+            if fields[idx] != last[idx] {
+                let letters = render_exchange_mask(fields[idx], shared);
+                string_ticks.push(StringTickEvent {
+                    req_id, tick_type: tt, value: letters,
+                });
+                delivered = true;
+            }
+        }
+
         map.insert(iid, fields);
 
-        QuotePollResult { ticks, timestamp, delivered }
+        QuotePollResult { ticks, string_ticks, timestamp, delivered }
     }
 
     /// Check and consume snapshot completion for a req_id.
@@ -1224,5 +1277,52 @@ impl ClientCore {
         };
 
         Ok(ControlCommand::Order(req))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::SmartComponent;
+
+    fn shared_with_components(comps: Vec<(i32, &str)>) -> SharedState {
+        let s = SharedState::new();
+        s.reference.set_smart_components(
+            comps.into_iter().map(|(bit, letter)| SmartComponent {
+                bit_number: bit,
+                exchange: format!("EX{bit}"),
+                exchange_letter: letter.to_string(),
+            }).collect()
+        );
+        s
+    }
+
+    #[test]
+    fn render_exchange_mask_zero_is_empty() {
+        let s = shared_with_components(vec![(0, "Q"), (1, "N")]);
+        assert_eq!(render_exchange_mask(0, &s), "");
+    }
+
+    #[test]
+    fn render_exchange_mask_single_bit() {
+        let s = shared_with_components(vec![(0, "Q"), (1, "N"), (2, "P")]);
+        assert_eq!(render_exchange_mask(0b001, &s), "Q");
+        assert_eq!(render_exchange_mask(0b100, &s), "P");
+    }
+
+    #[test]
+    fn render_exchange_mask_multiple_bits() {
+        let s = shared_with_components(vec![
+            (0, "Q"), (1, "N"), (2, "P"), (3, "Z"),
+        ]);
+        // bits 0, 2, 3 set → letters in bit-order: Q, P, Z
+        assert_eq!(render_exchange_mask(0b1101, &s), "QPZ");
+    }
+
+    #[test]
+    fn render_exchange_mask_unknown_bit_skipped() {
+        let s = shared_with_components(vec![(0, "Q")]);
+        // bit 5 set, no component at bit 5 — skipped
+        assert_eq!(render_exchange_mask(0b100000, &s), "");
     }
 }

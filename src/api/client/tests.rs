@@ -1349,6 +1349,7 @@ fn process_msgs_dispatches_all_quote_fields() {
         volume: 10_000 * QTY_SCALE as i64,
         close: 149 * PRICE_SCALE, open: 150 * PRICE_SCALE,
         timestamp_ns: 1234567890,
+        bid_exch_mask: 0, ask_exch_mask: 0, last_exch_mask: 0,
     };
     shared.market.push_quote(0, &q);
 
