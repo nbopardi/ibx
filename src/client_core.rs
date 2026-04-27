@@ -445,6 +445,7 @@ impl ClientCore {
         multiplier: &str,
         snapshot: bool,
         generic_tick_list: &str,
+        mode_9887: i32,
     ) -> Result<InstrumentId, String> {
         // News subscription if generic_tick_list contains 292
         let wants_news = generic_tick_list.split(',')
@@ -471,6 +472,7 @@ impl ClientCore {
             strike,
             right: right.to_string(),
             multiplier: multiplier.to_string(),
+            mode_9887,
             reply_tx: Some(reply_tx),
         }).map_err(|e| format!("Engine stopped: {}", e))?;
 

@@ -177,6 +177,33 @@ fn req_mkt_data_sends_register_and_subscribe() {
 }
 
 #[test]
+fn req_mkt_data_defaults_to_realtime_mode() {
+    let (client, rx, _shared) = test_client();
+    let _ = client.req_mkt_data(1, &spy(), "", false, false);
+    let _register = rx.try_recv().unwrap();
+    match rx.try_recv().unwrap() {
+        ControlCommand::Subscribe { mode_9887, .. } => assert_eq!(mode_9887, 0),
+        other => panic!("expected Subscribe, got {:?}", other),
+    }
+}
+
+#[test]
+fn req_mkt_data_ex_propagates_mode_9887() {
+    for mode in [1_i32, 2, 3] {
+        let (client, rx, _shared) = test_client();
+        let _ = client.req_mkt_data_ex(1, &spy(), "", false, false, mode);
+        let _register = rx.try_recv().unwrap();
+        match rx.try_recv().unwrap() {
+            ControlCommand::Subscribe { mode_9887, con_id, .. } => {
+                assert_eq!(mode_9887, mode);
+                assert_eq!(con_id, 756733);
+            }
+            other => panic!("expected Subscribe, got {:?}", other),
+        }
+    }
+}
+
+#[test]
 fn cancel_mkt_data_sends_unsubscribe() {
     let (client, rx, _shared) = test_client();
     // Pre-register mapping

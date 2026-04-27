@@ -12,13 +12,35 @@ impl EClient {
     /// `tick_snapshot_end` and auto-cancels the subscription.
     pub fn req_mkt_data(
         &self, req_id: i64, contract: &Contract,
+        generic_tick_list: &str, snapshot: bool, regulatory_snapshot: bool,
+    ) -> Result<(), String> {
+        self.req_mkt_data_ex(req_id, contract, generic_tick_list, snapshot, regulatory_snapshot, 0)
+    }
+
+    /// Like [`req_mkt_data`], but encodes the market-data mode per-request via
+    /// FIX field 9887, allowing parallel realtime + frozen subscriptions for
+    /// the same contract:
+    ///
+    /// | `mode_9887` | mode             | wire shape |
+    /// |-------------|------------------|---|
+    /// | `0`         | REALTIME         | `264=442` (BID_ASK) + `264=443` (LAST), no 9887 |
+    /// | `1`         | DELAYED          | `264=1` (TOP) + `9887=1` |
+    /// | `2`         | FROZEN           | `264=1` (TOP) + `9887=2` |
+    /// | `3`         | DELAYED_FROZEN   | `264=1` (TOP) + `9887=3` |
+    ///
+    /// The frozen sub keeps thinly-traded names streaming after-hours when the
+    /// realtime feed is silent. Issue 3-4 parallel calls per contract with
+    /// different modes and pick whichever feed has data.
+    pub fn req_mkt_data_ex(
+        &self, req_id: i64, contract: &Contract,
         generic_tick_list: &str, snapshot: bool, _regulatory_snapshot: bool,
+        mode_9887: i32,
     ) -> Result<(), String> {
         self.core.register_mkt_data(
             &self.shared, &self.control_tx, req_id,
             contract.con_id, &contract.symbol, &contract.exchange, &contract.sec_type,
             &contract.last_trade_date_or_contract_month, contract.strike, &contract.right, &contract.multiplier,
-            snapshot, generic_tick_list,
+            snapshot, generic_tick_list, mode_9887,
         )?;
         Ok(())
     }

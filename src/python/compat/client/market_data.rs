@@ -33,7 +33,7 @@ impl EClient {
             &shared, &tx, req_id,
             contract.con_id, &contract.symbol, &contract.exchange, &contract.sec_type,
             &contract.last_trade_date_or_contract_month, contract.strike, &contract.right, &contract.multiplier,
-            snapshot, generic_tick_list,
+            snapshot, generic_tick_list, 0,
         ).map_err(|e| PyRuntimeError::new_err(e))?;
         self.core.cache_contract(contract.con_id, crate::api::types::Contract {
             con_id: contract.con_id,

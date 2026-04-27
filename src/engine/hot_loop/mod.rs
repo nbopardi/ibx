@@ -337,7 +337,7 @@ impl HotLoop {
         let cmds: Vec<ControlCommand> = self.cmd_buf.drain(..).collect();
         for cmd in cmds {
             match cmd {
-                ControlCommand::Subscribe { con_id, symbol, exchange, sec_type, last_trade_date, strike, right, multiplier, reply_tx } => {
+                ControlCommand::Subscribe { con_id, symbol, exchange, sec_type, last_trade_date, strike, right, multiplier, mode_9887, reply_tx } => {
                     let farm = crate::types::farm_for_instrument(&exchange, &sec_type);
                     let id = self.context.market.register(con_id);
                     self.context.market.set_symbol(id, symbol.clone());
@@ -346,7 +346,7 @@ impl HotLoop {
                     self.farm.send_mktdata_subscribe(
                         con_id, &symbol, &exchange, &sec_type,
                         &last_trade_date, strike, &right, &multiplier,
-                        id, farm,
+                        id, farm, mode_9887,
                         &mut self.farm_conn, &mut self.cashfarm_conn, &mut self.usfuture_conn,
                         &mut self.eufarm_conn, &mut self.jfarm_conn, &mut self.usopt_conn,
                         &mut self.hb,

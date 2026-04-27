@@ -119,6 +119,7 @@ impl BenchSession {
                 strike: 0.0,
                 right: String::new(),
                 multiplier: String::new(),
+                mode_9887: 0,
                 reply_tx: None,
             })
             .unwrap();

@@ -24,8 +24,8 @@ pub(crate) struct FarmState {
     depth_fanout_map: Vec<(u32, u32)>,
     /// Primary depth subscription params for reconnect: (req_id, con_id, exchange, sec_type, num_rows, is_smart_depth).
     depth_resub_info: Vec<(u32, i64, String, String, i32, bool)>,
-    /// Option resub info: (instrument, symbol, exchange, sec_type, last_trade_date, strike, right, multiplier).
-    md_resub_info: Vec<(InstrumentId, String, String, String, String, f64, String, String)>,
+    /// Option resub info: (instrument, symbol, exchange, sec_type, last_trade_date, strike, right, multiplier, mode_9887).
+    md_resub_info: Vec<(InstrumentId, String, String, String, String, f64, String, String, i32)>,
     pub(crate) disconnected: bool,
     pub(crate) tick_buf: Vec<tick_decoder::RawTick>,
     pub(crate) farm_msg_buf: Vec<Vec<u8>>,
@@ -387,6 +387,7 @@ impl FarmState {
         multiplier: &str,
         instrument: InstrumentId,
         farm: FarmSlot,
+        mode_9887: i32,
         farm_conn: &mut Option<Connection>,
         cashfarm_conn: &mut Option<Connection>,
         usfuture_conn: &mut Option<Connection>,
@@ -395,53 +396,79 @@ impl FarmState {
         usopt_conn: &mut Option<Connection>,
         hb: &mut HeartbeatState,
     ) {
+        // Realtime fans out into BID_ASK + LAST; frozen/delayed/delayed-frozen
+        // collapse to a single 264=1 (TOP) sub with 9887=mode_9887.
+        let realtime = mode_9887 == 0;
         let bid_ask_id = self.next_md_req_id;
         let last_id = self.next_md_req_id + 1;
-        self.next_md_req_id += 2;
+        if realtime {
+            self.next_md_req_id += 2;
+        } else {
+            self.next_md_req_id += 1;
+        }
 
         self.md_req_to_instrument.push((bid_ask_id, instrument));
-        self.md_req_to_instrument.push((last_id, instrument));
+        if realtime {
+            self.md_req_to_instrument.push((last_id, instrument));
+        }
 
         match self.instrument_md_reqs.iter_mut().find(|(id, _, _)| *id == instrument) {
-            Some((_, _, reqs)) => { reqs.push(bid_ask_id); reqs.push(last_id); }
-            None => self.instrument_md_reqs.push((instrument, farm, vec![bid_ask_id, last_id])),
+            Some((_, _, reqs)) => {
+                reqs.push(bid_ask_id);
+                if realtime { reqs.push(last_id); }
+            }
+            None => {
+                let reqs = if realtime { vec![bid_ask_id, last_id] } else { vec![bid_ask_id] };
+                self.instrument_md_reqs.push((instrument, farm, reqs));
+            }
         }
         if self.md_resub_info.iter().all(|(id, ..)| *id != instrument) {
-            self.md_resub_info.push((instrument, symbol.to_string(), exchange.to_string(), sec_type.to_string(), last_trade_date.to_string(), strike, right.to_string(), multiplier.to_string()));
+            self.md_resub_info.push((instrument, symbol.to_string(), exchange.to_string(), sec_type.to_string(), last_trade_date.to_string(), strike, right.to_string(), multiplier.to_string(), mode_9887));
         }
 
         if let Some(conn) = farm_conn_for_slot(farm, farm_conn, cashfarm_conn, usfuture_conn, eufarm_conn, jfarm_conn, usopt_conn) {
             let bid_ask_str = bid_ask_id.to_string();
             let last_str = last_id.to_string();
             let con_id_str = (con_id as u32).to_string();
+            let mode_str = mode_9887.to_string();
             let ts = chrono_free_timestamp();
+
+            // 146 = NoRelatedSym count: 2 entries for realtime fan-out, 1 for TOP.
+            let no_related_sym = if realtime { "2" } else { "1" };
 
             // When con_id is known, use the proven minimal format (con_id + BEST + CS).
             // The server resolves the full contract details from con_id regardless of sec_type.
             // When con_id is 0, include descriptive fields so the server can resolve by description.
             if con_id > 0 {
-                let _ = conn.send_fixcomp(&[
+                let mut tags: Vec<(u32, &str)> = vec![
                     (fix::TAG_MSG_TYPE, fix::MSG_MARKET_DATA_REQ),
                     (fix::TAG_SENDING_TIME, &ts),
                     (263, "1"),
-                    (146, "2"),
-                    (262, &bid_ask_str),
-                    (6008, &con_id_str),
-                    (207, "BEST"),
-                    (167, "CS"),
-                    (264, "442"),
-                    (6088, "Socket"),
-                    (9830, "1"),
-                    (9839, "1"),
-                    (262, &last_str),
-                    (6008, &con_id_str),
-                    (207, "BEST"),
-                    (167, "CS"),
-                    (264, "443"),
-                    (6088, "Socket"),
-                    (9830, "1"),
-                    (9839, "1"),
-                ]);
+                    (146, no_related_sym),
+                ];
+                if realtime {
+                    for (req_str, depth) in [(&bid_ask_str, "442"), (&last_str, "443")] {
+                        tags.push((262, req_str));
+                        tags.push((6008, &con_id_str));
+                        tags.push((207, "BEST"));
+                        tags.push((167, "CS"));
+                        tags.push((264, depth));
+                        tags.push((6088, "Socket"));
+                        tags.push((9830, "1"));
+                        tags.push((9839, "1"));
+                    }
+                } else {
+                    tags.push((262, &bid_ask_str));
+                    tags.push((6008, &con_id_str));
+                    tags.push((207, "BEST"));
+                    tags.push((167, "CS"));
+                    tags.push((264, "1"));
+                    tags.push((6088, "Socket"));
+                    tags.push((9830, "1"));
+                    tags.push((9839, "1"));
+                    tags.push((9887, &mode_str));
+                }
+                let _ = conn.send_fixcomp(&tags);
             } else {
                 // No con_id — send descriptive fields
                 let fix_exchange = crate::control::contracts::exchange_to_fix(exchange);
@@ -454,9 +481,14 @@ impl FarmState {
                     (fix::TAG_MSG_TYPE, fix::MSG_MARKET_DATA_REQ),
                     (fix::TAG_SENDING_TIME, &ts),
                     (263, "1"),
-                    (146, "2"),
+                    (146, no_related_sym),
                 ];
-                for (req_str, depth) in [(&bid_ask_str, "442"), (&last_str, "443")] {
+                let entries: &[(&String, &str)] = if realtime {
+                    &[(&bid_ask_str, "442"), (&last_str, "443")]
+                } else {
+                    &[(&bid_ask_str, "1")]
+                };
+                for (req_str, depth) in entries {
                     tags.push((262, req_str));
                     tags.push((55, symbol));
                     tags.push((207, fix_exchange));
@@ -469,11 +501,17 @@ impl FarmState {
                     tags.push((6088, "Socket"));
                     tags.push((9830, "1"));
                     tags.push((9839, "1"));
+                    if !realtime { tags.push((9887, &mode_str)); }
                 }
                 let _ = conn.send_fixcomp(&tags);
             }
-            log::info!("Sent 35=V subscribe: con_id={} sec_type={} farm={:?} ids={},{} seq={}",
-                con_id, sec_type, farm, bid_ask_id, last_id, conn.seq);
+            if realtime {
+                log::info!("Sent 35=V subscribe: con_id={} sec_type={} farm={:?} ids={},{} seq={}",
+                    con_id, sec_type, farm, bid_ask_id, last_id, conn.seq);
+            } else {
+                log::info!("Sent 35=V subscribe (9887={}): con_id={} sec_type={} farm={:?} id={} seq={}",
+                    mode_9887, con_id, sec_type, farm, bid_ask_id, conn.seq);
+            }
             hb.last_farm_sent = Instant::now();
         }
     }
@@ -956,22 +994,22 @@ impl FarmState {
         hb.pending_farm_test = None;
 
         // Preserve original farm slots and option fields for re-subscription
-        let active: Vec<(InstrumentId, FarmSlot, i64, String, String, String, String, f64, String, String)> = self.instrument_md_reqs.iter()
+        let active: Vec<(InstrumentId, FarmSlot, i64, String, String, String, String, f64, String, String, i32)> = self.instrument_md_reqs.iter()
             .filter_map(|(id, slot, _)| {
                 context.market.con_id(*id).map(|con_id| {
-                    let (sym, exch, st, ltd, strike, right, mult) = self.md_resub_info.iter()
+                    let (sym, exch, st, ltd, strike, right, mult, mode) = self.md_resub_info.iter()
                         .find(|(iid, ..)| *iid == *id)
-                        .map(|(_, s, e, st, l, k, r, m)| (s.clone(), e.clone(), st.clone(), l.clone(), *k, r.clone(), m.clone()))
+                        .map(|(_, s, e, st, l, k, r, m, mode)| (s.clone(), e.clone(), st.clone(), l.clone(), *k, r.clone(), m.clone(), *mode))
                         .unwrap_or_default();
-                    (*id, *slot, con_id, sym, exch, st, ltd, strike, right, mult)
+                    (*id, *slot, con_id, sym, exch, st, ltd, strike, right, mult, mode)
                 })
             })
             .collect();
         self.md_req_to_instrument.clear();
         self.instrument_md_reqs.clear();
         let old_resub = std::mem::take(&mut self.md_resub_info);
-        for (instrument, farm, con_id, sym, exch, st, ltd, strike, right, mult) in active {
-            self.send_mktdata_subscribe(con_id, &sym, &exch, &st, &ltd, strike, &right, &mult, instrument, farm, farm_conn, cashfarm_conn, usfuture_conn, eufarm_conn, jfarm_conn, usopt_conn, hb);
+        for (instrument, farm, con_id, sym, exch, st, ltd, strike, right, mult, mode) in active {
+            self.send_mktdata_subscribe(con_id, &sym, &exch, &st, &ltd, strike, &right, &mult, instrument, farm, mode, farm_conn, cashfarm_conn, usfuture_conn, eufarm_conn, jfarm_conn, usopt_conn, hb);
         }
         drop(old_resub);
 
