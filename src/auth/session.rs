@@ -15,12 +15,37 @@ use crate::protocol::ns::{self, *};
 use crate::protocol::xyz;
 
 /// Result of authentication.
+///
+/// `session_token` is the SRP-derived shared secret K as a `BigUint`. For wire-byte uses
+/// (e.g. SHA-1 challenge/response, token short hashes), prefer [`AuthResult::session_token_bytes`],
+/// which returns the canonical big-endian form with leading zeros stripped — matching the
+/// representation the server expects.
+///
+/// `token_type` is one of `"st"`, `"tst"`, or `"zenith"` and corresponds verbatim to the
+/// `stoken_type` value used by SSO authenticators in the upstream Java auth flow.
 pub struct AuthResult {
+    /// SRP shared secret K. Use [`session_token_bytes`](Self::session_token_bytes) for the
+    /// canonical big-endian wire form.
     pub session_token: BigUint,
+    /// Token type discriminator: `"st"`, `"tst"`, or `"zenith"`. Matches the `stoken_type`
+    /// field expected by the SSO `Authenticate-TWS` body.
     pub token_type: String,
     pub session_id: String,
     pub features: Vec<String>,
     pub authenticated: bool,
+}
+
+impl AuthResult {
+    /// Canonical big-endian byte form of [`Self::session_token`], with leading zeros
+    /// stripped (single `0x00` retained when the value is zero).
+    ///
+    /// This is the exact representation used as the second SHA-1 input for soft-token
+    /// challenge/response and SSO `Authenticate-TWS` bodies. Round-trips through
+    /// `BigUint::from_bytes_be`.
+    pub fn session_token_bytes(&self) -> Vec<u8> {
+        let raw = self.session_token.to_bytes_be();
+        crate::auth::crypto::strip_leading_zeros(&raw).to_vec()
+    }
 }
 
 /// Authenticated auth session.
@@ -787,6 +812,70 @@ mod tests {
         assert!(ar.session_id.is_empty());
         assert!(ar.features.is_empty());
         assert!(!ar.authenticated);
+    }
+
+    #[test]
+    fn session_token_bytes_roundtrip_nonzero() {
+        // 0x010203 → [0x01, 0x02, 0x03]; round-trip through BigUint::from_bytes_be.
+        let token = BigUint::from(0x010203u32);
+        let ar = AuthResult {
+            session_token: token.clone(),
+            token_type: "st".to_string(),
+            session_id: String::new(),
+            features: Vec::new(),
+            authenticated: true,
+        };
+        let bytes = ar.session_token_bytes();
+        assert_eq!(bytes, vec![0x01, 0x02, 0x03]);
+        assert_eq!(BigUint::from_bytes_be(&bytes), token);
+    }
+
+    #[test]
+    fn session_token_bytes_roundtrip_large() {
+        let token = BigUint::parse_bytes(
+            b"deadbeefcafebabe0123456789abcdef",
+            16,
+        ).unwrap();
+        let ar = AuthResult {
+            session_token: token.clone(),
+            token_type: "tst".to_string(),
+            session_id: String::new(),
+            features: Vec::new(),
+            authenticated: true,
+        };
+        let bytes = ar.session_token_bytes();
+        assert_eq!(BigUint::from_bytes_be(&bytes), token);
+    }
+
+    #[test]
+    fn session_token_bytes_zero_keeps_single_byte() {
+        // BigUint::ZERO → to_bytes_be returns [0x00] (or empty); strip_leading_zeros
+        // is documented to retain a single 0x00 byte for the all-zero case.
+        let ar = AuthResult {
+            session_token: BigUint::ZERO,
+            token_type: String::new(),
+            session_id: String::new(),
+            features: Vec::new(),
+            authenticated: false,
+        };
+        let bytes = ar.session_token_bytes();
+        assert_eq!(BigUint::from_bytes_be(&bytes), BigUint::ZERO);
+    }
+
+    #[test]
+    fn session_token_bytes_strips_leading_zero_high_bit() {
+        // BigUint with high bit set in first byte should not have leading zero padding.
+        let token = BigUint::parse_bytes(b"80ff", 16).unwrap();
+        let ar = AuthResult {
+            session_token: token.clone(),
+            token_type: "zenith".to_string(),
+            session_id: String::new(),
+            features: Vec::new(),
+            authenticated: true,
+        };
+        let bytes = ar.session_token_bytes();
+        assert_eq!(bytes, vec![0x80, 0xff]);
+        assert_eq!(BigUint::from_bytes_be(&bytes), token);
     }
 
     #[test]

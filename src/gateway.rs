@@ -271,6 +271,9 @@ pub struct ReconnectAuth {
 pub struct Gateway {
     pub account_id: String,
     pub session_token: BigUint,
+    /// Session ID surfaced to webapp REST clients as `x-ccp-session-id`.
+    /// Sourced from the post-auth FIX logon ACK, falling back to the locally generated
+    /// session ID when the gateway does not echo one back.
     pub server_session_id: String,
     pub ccp_token: String,
     pub heartbeat_interval: u64,
@@ -285,6 +288,10 @@ pub struct Gateway {
     pub raw_news_providers: String,
     /// White branding ID from CCP logon (empty for standard accounts).
     pub white_branding_id: String,
+    /// Logical-name → host URL map pushed by the gateway during logon. Empty when no
+    /// URL set was pushed (callers should then fall back to a documented literal,
+    /// e.g. `api.ibkr.com` for `region_dam`).
+    pub misc_urls: std::collections::HashMap<String, String>,
     /// CCP HMAC signing key (kb[64..84]) for selective signing of XML messages.
     pub ccp_sign_key: Vec<u8>,
     /// CCP HMAC initial IV (kb[48..64]) for selective signing.
@@ -1144,6 +1151,7 @@ impl Gateway {
             raw_family_codes,
             raw_news_providers,
             white_branding_id,
+            misc_urls: std::collections::HashMap::new(),
             ccp_sign_key,
             ccp_sign_iv,
             pending_secondary_farms: pending_secondary,
@@ -1251,6 +1259,10 @@ impl Gateway {
 
         // White branding ID (empty for standard accounts).
         shared.reference.set_white_branding_id(self.white_branding_id.clone());
+
+        // Webapp-REST-facing fields from the FIX logon roundtrip.
+        shared.reference.set_ccp_session_id(self.server_session_id.clone());
+        shared.reference.set_misc_urls(self.misc_urls.clone());
     }
 
     /// Create the control channel and build a HotLoop with connected sockets.
@@ -1293,6 +1305,12 @@ impl Gateway {
             hw_info: self.hw_info.clone(),
             encoded: self.encoded.clone(),
         };
+        if let Some(tx) = event_tx.as_ref() {
+            let _ = tx.send(Event::GatewayLogon {
+                ccp_session_id: self.server_session_id.clone(),
+                misc_urls: self.misc_urls.clone(),
+            });
+        }
         let mut hot_loop = HotLoop::new(shared, event_tx, core_id);
         hot_loop.set_control_rx(rx);
         hot_loop.set_account_id(self.account_id.clone());

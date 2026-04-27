@@ -65,6 +65,15 @@ pub enum Event {
     PositionUpdate { instrument: InstrumentId, con_id: i64, position: i64, avg_cost: Price },
     /// Connection lost.
     Disconnected,
+    /// Gateway logon completed. `ccp_session_id` matches the `x-ccp-session-id` header
+    /// expected by webapp REST endpoints. `misc_urls` maps logical names (e.g. `region_dam`)
+    /// to host URLs as pushed by the gateway during logon. The map is empty when the
+    /// gateway does not push a URL set; callers should fall back to a documented literal
+    /// (e.g. `api.ibkr.com`) in that case.
+    GatewayLogon {
+        ccp_session_id: String,
+        misc_urls: HashMap<String, String>,
+    },
 }
 
 /// SeqLock-protected quote slot. Writer (hot loop) never blocks.
@@ -324,6 +333,10 @@ pub struct ReferenceState {
     soft_dollar_tiers: Mutex<Vec<crate::types::SoftDollarTier>>,
     family_codes: Mutex<Vec<crate::types::FamilyCode>>,
     white_branding_id: Mutex<String>,
+    /// Session ID surfaced to webapp REST clients as `x-ccp-session-id`.
+    ccp_session_id: Mutex<String>,
+    /// Logical-name → host URL map pushed by the gateway during logon.
+    misc_urls: Mutex<HashMap<String, String>>,
 }
 
 impl ReferenceState {
@@ -351,6 +364,8 @@ impl ReferenceState {
             soft_dollar_tiers: Mutex::new(Vec::new()),
             family_codes: Mutex::new(Vec::new()),
             white_branding_id: Mutex::new(String::new()),
+            ccp_session_id: Mutex::new(String::new()),
+            misc_urls: Mutex::new(HashMap::new()),
         }
     }
 
@@ -540,6 +555,24 @@ impl ReferenceState {
         self.white_branding_id.lock().unwrap().clone()
     }
 
+    /// Session ID surfaced to webapp REST clients as the `x-ccp-session-id` header.
+    /// Empty until gateway logon completes.
+    pub fn ccp_session_id(&self) -> String {
+        self.ccp_session_id.lock().unwrap().clone()
+    }
+
+    /// Logical-name → host URL map pushed by the gateway during logon. Empty when
+    /// no URL set was pushed; consumers should fall back to a documented literal
+    /// (e.g. `api.ibkr.com` for `region_dam`).
+    pub fn misc_urls(&self) -> HashMap<String, String> {
+        self.misc_urls.lock().unwrap().clone()
+    }
+
+    /// Single lookup against the URL map. Returns `None` when missing.
+    pub fn misc_url(&self, key: &str) -> Option<String> {
+        self.misc_urls.lock().unwrap().get(key).cloned()
+    }
+
     #[doc(hidden)] pub fn set_smart_components(&self, components: Vec<crate::types::SmartComponent>) {
         *self.smart_components.lock().unwrap() = components;
     }
@@ -558,6 +591,14 @@ impl ReferenceState {
 
     #[doc(hidden)] pub fn set_white_branding_id(&self, id: String) {
         *self.white_branding_id.lock().unwrap() = id;
+    }
+
+    #[doc(hidden)] pub fn set_ccp_session_id(&self, id: String) {
+        *self.ccp_session_id.lock().unwrap() = id;
+    }
+
+    #[doc(hidden)] pub fn set_misc_urls(&self, urls: HashMap<String, String>) {
+        *self.misc_urls.lock().unwrap() = urls;
     }
 }
 
@@ -775,6 +816,46 @@ mod tests {
         ss.portfolio.set_account(&a);
         let read = ss.portfolio.account();
         assert_eq!(read.net_liquidation, 100_000 * PRICE_SCALE);
+    }
+
+    #[test]
+    fn reference_state_ccp_session_id_roundtrip() {
+        let ss = SharedState::new();
+        assert!(ss.reference.ccp_session_id().is_empty());
+        ss.reference.set_ccp_session_id("abc.0001".to_string());
+        assert_eq!(ss.reference.ccp_session_id(), "abc.0001");
+    }
+
+    #[test]
+    fn reference_state_misc_urls_roundtrip() {
+        let ss = SharedState::new();
+        assert!(ss.reference.misc_urls().is_empty());
+        assert!(ss.reference.misc_url("region_dam").is_none());
+        let mut urls = HashMap::new();
+        urls.insert("region_dam".to_string(), "api-east.example.com".to_string());
+        urls.insert("margin".to_string(), "margin.example.com".to_string());
+        ss.reference.set_misc_urls(urls);
+        let map = ss.reference.misc_urls();
+        assert_eq!(map.len(), 2);
+        assert_eq!(ss.reference.misc_url("region_dam").as_deref(), Some("api-east.example.com"));
+        assert_eq!(ss.reference.misc_url("missing"), None);
+    }
+
+    #[test]
+    fn event_gateway_logon_carries_fields() {
+        let mut urls = HashMap::new();
+        urls.insert("region_dam".to_string(), "api.example.com".to_string());
+        let event = Event::GatewayLogon {
+            ccp_session_id: "sid.abcd".to_string(),
+            misc_urls: urls,
+        };
+        match event {
+            Event::GatewayLogon { ccp_session_id, misc_urls } => {
+                assert_eq!(ccp_session_id, "sid.abcd");
+                assert_eq!(misc_urls.get("region_dam").map(String::as_str), Some("api.example.com"));
+            }
+            _ => panic!("expected GatewayLogon"),
+        }
     }
 
     #[test]
