@@ -2112,3 +2112,51 @@ fn disconnect_is_idempotent() {
     client.disconnect();
     assert!(!client.is_connected());
 }
+
+#[test]
+fn ccp_session_id_matches_shared_reference() {
+    let (client, _rx, shared) = test_client();
+    assert_eq!(client.ccp_session_id(), shared.reference.ccp_session_id());
+
+    shared.reference.set_ccp_session_id("sid.0001".to_string());
+    assert_eq!(client.ccp_session_id(), "sid.0001");
+    assert_eq!(client.ccp_session_id(), client.shared.reference.ccp_session_id());
+}
+
+#[test]
+fn misc_url_lookup_delegates_to_shared() {
+    let (client, _rx, shared) = test_client();
+    assert!(client.misc_url("region_dam").is_none());
+
+    let mut urls = std::collections::HashMap::new();
+    urls.insert("region_dam".to_string(), "api.example.com".to_string());
+    shared.reference.set_misc_urls(urls);
+
+    assert_eq!(client.misc_url("region_dam").as_deref(), Some("api.example.com"));
+    assert!(client.misc_url("missing").is_none());
+}
+
+#[test]
+fn session_token_bytes_roundtrip_through_biguint() {
+    use num_bigint::BigUint;
+
+    let shared = Arc::new(SharedState::new());
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let handle = std::thread::spawn(|| {});
+    let mut client = EClient::from_parts(shared, tx, handle, "DU123".into());
+
+    let session_token = BigUint::parse_bytes(
+        b"fedcba9876543210fedcba9876543210", 16,
+    ).unwrap();
+    client.session_token_bytes = crate::auth::crypto::strip_leading_zeros(
+        &session_token.to_bytes_be(),
+    ).to_vec();
+
+    assert_eq!(BigUint::from_bytes_be(client.session_token_bytes()), session_token);
+}
+
+#[test]
+fn token_type_default_is_empty() {
+    let (client, _rx, _shared) = test_client();
+    assert_eq!(client.token_type(), "");
+}

@@ -88,6 +88,8 @@ pub struct EClient {
     pub(crate) connected: AtomicBool,
     pub(crate) next_order_id: AtomicU64,
     pub(crate) core: ClientCore,
+    pub(crate) session_token_bytes: Vec<u8>,
+    pub(crate) token_type: String,
 }
 
 impl Drop for EClient {
@@ -113,6 +115,10 @@ impl EClient {
 
         let (gw, farm_conn, ccp_conn, hmds_conn, cashfarm, usfuture, eufarm, jfarm, usopt) = Gateway::connect(&gw_config)?;
         let account_id = gw.account_id.clone();
+        let session_token_bytes = crate::auth::crypto::strip_leading_zeros(
+            &gw.session_token.to_bytes_be(),
+        ).to_vec();
+        let token_type = String::new();
         let shared = Arc::new(SharedState::new());
         gw.populate_init_data(&shared);
 
@@ -138,6 +144,8 @@ impl EClient {
             connected: AtomicBool::new(true),
             next_order_id: AtomicU64::new(start_id),
             core: ClientCore::new(),
+            session_token_bytes,
+            token_type,
         })
     }
 
@@ -161,6 +169,8 @@ impl EClient {
             connected: AtomicBool::new(true),
             next_order_id: AtomicU64::new(start_id),
             core: ClientCore::new(),
+            session_token_bytes: Vec::new(),
+            token_type: String::new(),
         }
     }
 
@@ -197,5 +207,31 @@ impl EClient {
         }
         self.connected.store(false, Ordering::Release);
         self.core.reset();
+    }
+}
+
+impl EClient {
+    /// Session ID surfaced to webapp REST clients as `x-ccp-session-id`.
+    pub fn ccp_session_id(&self) -> String {
+        self.shared.reference.ccp_session_id()
+    }
+
+    /// Logical-name → host URL lookup from the gateway logon MiscUrls push
+    /// (e.g. `region_dam`). Returns `None` when the gateway did not push this key.
+    pub fn misc_url(&self, key: &str) -> Option<String> {
+        self.shared.reference.misc_url(key)
+    }
+
+    /// Canonical big-endian session-token bytes (leading zeros stripped) captured
+    /// at connect. Round-trips through `BigUint::from_bytes_be` to the SRP shared
+    /// secret K and is the second SHA-1 input for SSO `Authenticate-TWS` bodies.
+    pub fn session_token_bytes(&self) -> &[u8] {
+        &self.session_token_bytes
+    }
+
+    /// `stoken_type` discriminator captured at connect (`"st"`, `"tst"`, `"zenith"`,
+    /// or empty for the SRP-only path). Sent verbatim in SSO authenticator bodies.
+    pub fn token_type(&self) -> &str {
+        &self.token_type
     }
 }
