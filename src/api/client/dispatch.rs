@@ -1,7 +1,7 @@
 //! Event dispatch: drains SharedState queues and fires Wrapper callbacks.
 
 use crate::api::types::{
-    BarData, CommissionReport, ContractDetails, ContractDescription, Execution,
+    BarData, CommissionAndFeesReport, ContractDetails, ContractDescription, Execution,
     Order as ApiOrder, OrderState, TickAttribLast, TickAttribBidAsk, PRICE_SCALE_F,
 };
 use crate::api::wrapper::Wrapper;
@@ -24,10 +24,10 @@ impl EClient {
     // ── Order / Fill Dispatch ──
 
     fn dispatch_orders(&self, wrapper: &mut impl Wrapper) {
-        // Fills → order_status + exec_details + commission_report
+        // Fills → order_status + exec_details + commission_and_fees_report
         for fill in self.shared.orders.drain_fills() {
             let price_f = fill.price as f64 / PRICE_SCALE_F;
-            let commission_f = fill.commission as f64 / PRICE_SCALE_F;
+            let commission_and_fees_f = fill.commission as f64 / PRICE_SCALE_F;
             let status = if fill.remaining == 0 { "Filled" } else { "PartiallyFilled" };
             let (perm_id, parent_id) = self.shared.orders.get_order_info(fill.order_id)
                 .map(|info| (info.order.perm_id, info.order.parent_id))
@@ -66,15 +66,15 @@ impl EClient {
             let req_id = self.core.req_id_for_instrument(fill.instrument);
             wrapper.exec_details(req_id, &c, &exec);
 
-            let report = CommissionReport {
+            let report = CommissionAndFeesReport {
                 exec_id: exec.exec_id.clone(),
-                commission: commission_f,
+                commission_and_fees: commission_and_fees_f,
                 currency: "USD".into(),
                 realized_pnl: f64::MAX,
                 yield_amount: f64::MAX,
                 yield_redemption_date: String::new(),
             };
-            wrapper.commission_report(&report);
+            wrapper.commission_and_fees_report(&report);
 
             // Store for req_executions replay
             self.core.push_execution(req_id, c, exec, report);
@@ -114,7 +114,7 @@ impl EClient {
                 init_margin_after: fmt(wi.init_margin_after),
                 maint_margin_after: fmt(wi.maint_margin_after),
                 equity_with_loan_after: fmt(wi.equity_with_loan_after),
-                commission: wi.commission as f64 / PRICE_SCALE_F,
+                commission_and_fees: wi.commission as f64 / PRICE_SCALE_F,
                 ..Default::default()
             };
             let tracked = self.core.open_orders.lock().unwrap().get(&wi.order_id).cloned();

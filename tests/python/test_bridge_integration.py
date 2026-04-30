@@ -104,7 +104,7 @@ class RecordingWrapper(EWrapper):
             "init_margin_after": s.init_margin_after,
             "maint_margin_after": s.maint_margin_after,
             "equity_with_loan_after": s.equity_with_loan_after,
-            "commission": s.commission,
+            "commission_and_fees": s.commission_and_fees,
             # ibapi-iso extension fields
             "margin_currency": s.margin_currency,
             "init_margin_after_outside_rth": s.init_margin_after_outside_rth,
@@ -121,9 +121,9 @@ class RecordingWrapper(EWrapper):
             "status": order_state.status,
             "completed_status": order_state.completed_status,
             "completed_time": order_state.completed_time,
-            "commission_currency": order_state.commission_currency,
+            "commission_and_fees_currency": order_state.commission_and_fees_currency,
             "warning_text": order_state.warning_text,
-            "commission": order_state.commission,
+            "commission_and_fees": order_state.commission_and_fees,
         }))
 
     def completed_orders_end(self):
@@ -322,10 +322,10 @@ class TestOrderStateConversion:
     def test_all_fields(self):
         os_ = OrderState()
         os_.status = "Filled"
-        os_.commission = 1.50
+        os_.commission_and_fees = 1.50
         os_.init_margin_before = "1000.00"
         assert os_.status == "Filled"
-        assert os_.commission == 1.50
+        assert os_.commission_and_fees == 1.50
 
 
 class TestTickAttribConversion:
@@ -593,12 +593,12 @@ class TestReqOpenOrdersOrderState:
         assert state["status"] == "PendingSubmit"
         # Newly tracked orders have empty margin fields — populated only for what-if.
         assert state["init_margin_after"] == ""
-        assert state["commission"] == 0.0
+        assert state["commission_and_fees"] == 0.0
 
 
 class TestReqCompletedOrdersOrderState:
     """Regression: req_completed_orders must deliver an OrderState with
-    completed_status, completed_time, commission_currency, warning_text — iso ibapi."""
+    completed_status, completed_time, commission_and_fees_currency, warning_text — iso ibapi."""
 
     def test_state_carries_all_completed_fields(self):
         w, c = make_test_client()
@@ -606,7 +606,8 @@ class TestReqCompletedOrdersOrderState:
             order_id=99, instrument=0, status="Filled", filled_qty=100,
             symbol="SPY", action="BUY", total_quantity=100.0, lmt_price=400.0,
             completed_status="Filled", completed_time="20260430-15:30:00",
-            commission_currency="USD", warning_text="warning_xyz", commission=2.50,
+            commission_and_fees_currency="USD", warning_text="warning_xyz",
+            commission_and_fees=2.50,
         )
         c.req_completed_orders(False)
 
@@ -619,9 +620,9 @@ class TestReqCompletedOrdersOrderState:
         assert state["status"] == "Filled"
         assert state["completed_status"] == "Filled"
         assert state["completed_time"] == "20260430-15:30:00"
-        assert state["commission_currency"] == "USD"
+        assert state["commission_and_fees_currency"] == "USD"
         assert state["warning_text"] == "warning_xyz"
-        assert abs(state["commission"] - 2.50) < 1e-6
+        assert abs(state["commission_and_fees"] - 2.50) < 1e-6
 
         # completed_orders_end must fire after the per-order callbacks.
         end_events = [e for e in w.events if e[0] == "completed_orders_end"]
@@ -693,7 +694,7 @@ class TestWhatIfDispatch:
         assert state["equity_with_loan_before"] == "300.00"
         assert state["equity_with_loan_after"] == "600.00"
         assert state["equity_with_loan_change"] == "300.00"  # 600 - 300
-        assert abs(state["commission"] - 7.0) < 1e-6
+        assert abs(state["commission_and_fees"] - 7.0) < 1e-6
         # ibapi-iso fields default to empty/zero when wire data doesn't carry them
         assert state["margin_currency"] == ""
         assert state["init_margin_after_outside_rth"] == 0.0

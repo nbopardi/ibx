@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use crossbeam_channel::Sender;
 
 use crate::api::types::{
-    Contract as ApiContract, CommissionReport as ApiCommissionReport,
+    Contract as ApiContract, CommissionAndFeesReport as ApiCommissionAndFeesReport,
     Execution as ApiExecution, ExecutionFilter,
     Order as ApiOrder,
     PRICE_SCALE_F,
@@ -256,13 +256,13 @@ pub fn order_status_str(status: OrderStatus) -> &'static str {
 
 // ── Execution storage ──
 
-/// A stored execution + commission pair for `req_executions` replay.
+/// A stored execution + commission_and_fees pair for `req_executions` replay.
 /// Shared between Rust and Python adapters via `ClientCore`.
 pub struct StoredExecution {
     pub req_id: i64,
     pub contract: ApiContract,
     pub execution: ApiExecution,
-    pub commission: ApiCommissionReport,
+    pub commission_and_fees: ApiCommissionAndFeesReport,
 }
 
 // ── Order tracking ──
@@ -643,9 +643,9 @@ impl ClientCore {
     // ── Execution replay store ──
 
     /// Store an execution for later replay via `req_executions`.
-    pub fn push_execution(&self, req_id: i64, contract: ApiContract, execution: ApiExecution, commission: ApiCommissionReport) {
+    pub fn push_execution(&self, req_id: i64, contract: ApiContract, execution: ApiExecution, commission_and_fees: ApiCommissionAndFeesReport) {
         self.executions.lock().unwrap().push(StoredExecution {
-            req_id, contract, execution, commission,
+            req_id, contract, execution, commission_and_fees,
         });
     }
 

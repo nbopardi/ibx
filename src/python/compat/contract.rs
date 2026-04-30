@@ -1662,13 +1662,13 @@ pub struct OrderState {
     #[pyo3(get, set)]
     pub equity_with_loan_after: String,
     #[pyo3(get, set)]
-    pub commission: f64,
+    pub commission_and_fees: f64,
     #[pyo3(get, set)]
-    pub min_commission: f64,
+    pub min_commission_and_fees: f64,
     #[pyo3(get, set)]
-    pub max_commission: f64,
+    pub max_commission_and_fees: f64,
     #[pyo3(get, set)]
-    pub commission_currency: String,
+    pub commission_and_fees_currency: String,
     #[pyo3(get, set)]
     pub warning_text: String,
     #[pyo3(get, set)]
@@ -2066,16 +2066,16 @@ impl ContractDetails {
     }
 }
 
-// ── CommissionReport ──
+// ── CommissionAndFeesReport ──
 
-/// ibapi-compatible CommissionReport class.
+/// ibapi-compatible CommissionAndFeesReport class.
 #[pyclass]
 #[derive(Clone, Debug, Default)]
-pub struct CommissionReport {
+pub struct CommissionAndFeesReport {
     #[pyo3(get, set)]
     pub exec_id: String,
     #[pyo3(get, set)]
-    pub commission: f64,
+    pub commission_and_fees: f64,
     #[pyo3(get, set)]
     pub currency: String,
     #[pyo3(get, set)]
@@ -2087,7 +2087,7 @@ pub struct CommissionReport {
 }
 
 #[pymethods]
-impl CommissionReport {
+impl CommissionAndFeesReport {
     #[new]
     #[pyo3(signature = ())]
     fn new() -> Self { Self::default() }
@@ -2172,7 +2172,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BarData>()?;
     m.add_class::<ContractDetails>()?;
     m.add_class::<ContractDescription>()?;
-    m.add_class::<CommissionReport>()?;
+    m.add_class::<CommissionAndFeesReport>()?;
     m.add_class::<DepthMktDataDescriptionPy>()?;
     Ok(())
 }

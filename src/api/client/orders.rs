@@ -133,14 +133,14 @@ impl EClient {
 
     /// Request execution reports. Matches `reqExecutions` in C++.
     /// Replays stored executions (optionally filtered), firing `exec_details` +
-    /// `commission_report` for each, then `exec_details_end`.
+    /// `commission_and_fees_report` for each, then `exec_details_end`.
     pub fn req_executions(&self, req_id: i64, filter: &ExecutionFilter, wrapper: &mut impl Wrapper) {
         let indices = self.core.filter_executions(filter);
         let execs = self.core.executions.lock().unwrap();
         for i in indices {
             let se = &execs[i];
             wrapper.exec_details(req_id, &se.contract, &se.execution);
-            wrapper.commission_report(&se.commission);
+            wrapper.commission_and_fees_report(&se.commission_and_fees);
         }
         wrapper.exec_details_end(req_id);
     }

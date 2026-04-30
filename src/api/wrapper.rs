@@ -41,7 +41,7 @@ pub trait Wrapper {
     fn open_order_end(&mut self) {}
     fn exec_details(&mut self, req_id: i64, contract: &Contract, execution: &Execution) {}
     fn exec_details_end(&mut self, req_id: i64) {}
-    fn commission_report(&mut self, report: &CommissionReport) {}
+    fn commission_and_fees_report(&mut self, report: &CommissionAndFeesReport) {}
 
     // ── Account ──
 
@@ -255,7 +255,7 @@ pub mod tests {
                 state.init_margin_before, state.init_margin_change, state.init_margin_after,
                 state.maint_margin_before, state.maint_margin_change, state.maint_margin_after,
                 state.equity_with_loan_before, state.equity_with_loan_change, state.equity_with_loan_after,
-                state.commission,
+                state.commission_and_fees,
             ));
         }
         fn open_order_end(&mut self) {

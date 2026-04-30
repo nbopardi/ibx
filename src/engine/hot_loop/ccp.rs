@@ -664,7 +664,7 @@ impl CcpState {
 
             let order_state = api::OrderState {
                 status: status_str.to_string(),
-                commission,
+                commission_and_fees: commission,
                 completed_time,
                 completed_status,
                 ..Default::default()

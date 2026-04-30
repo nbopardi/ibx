@@ -130,14 +130,14 @@ impl EClient {
     #[pyo3(signature = (
         order_id, instrument, status, filled_qty,
         symbol, action, total_quantity, lmt_price,
-        completed_status, completed_time, commission_currency, warning_text, commission,
+        completed_status, completed_time, commission_and_fees_currency, warning_text, commission_and_fees,
     ))]
     fn _test_push_completed_order(
         &self,
         order_id: u64, instrument: u32, status: &str, filled_qty: i64,
         symbol: &str, action: &str, total_quantity: f64, lmt_price: f64,
-        completed_status: &str, completed_time: &str, commission_currency: &str,
-        warning_text: &str, commission: f64,
+        completed_status: &str, completed_time: &str, commission_and_fees_currency: &str,
+        warning_text: &str, commission_and_fees: f64,
     ) -> PyResult<()> {
         use crate::api::types::{Contract as ApiContract, Order as ApiOrder, Execution as ApiExecution, OrderState as ApiOrderState};
         let shared = self.shared_state()?;
@@ -170,9 +170,9 @@ impl EClient {
                 status: status.to_string(),
                 completed_status: completed_status.to_string(),
                 completed_time: completed_time.to_string(),
-                commission_currency: commission_currency.to_string(),
+                commission_and_fees_currency: commission_and_fees_currency.to_string(),
                 warning_text: warning_text.to_string(),
-                commission,
+                commission_and_fees,
                 ..Default::default()
             },
             last_exec: ApiExecution::default(),

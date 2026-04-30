@@ -93,7 +93,7 @@ class Wrapper(EWrapper):
     def exec_details_end(self, req_id):
         self.got_exec_end.set()
 
-    def commission_report(self, commission_report):
+    def commission_and_fees_report(self, commission_and_fees_report):
         pass
 
     def error(self, req_id, error_code, error_string, advanced_order_reject_json=""):

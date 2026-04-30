@@ -61,7 +61,7 @@ impl EWrapper {
 
     fn exec_details_end(&self, _req_id: i64) {}
 
-    fn commission_report(&self, _commission_report: PyObject) {}
+    fn commission_and_fees_report(&self, _commission_and_fees_report: PyObject) {}
 
     // ── Account ──
 

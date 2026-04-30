@@ -11,7 +11,7 @@ use crate::api::types::{
 use crate::client_core::ClientCore;
 use crate::types::*;
 use super::EClient;
-use super::super::contract::{Contract, Order, CommissionReport};
+use super::super::contract::{Contract, Order, CommissionAndFeesReport};
 
 #[pymethods]
 impl EClient {
@@ -222,16 +222,16 @@ impl EClient {
                 None,
             )?;
 
-            let report = CommissionReport {
-                exec_id: se.commission.exec_id.clone(),
-                commission: se.commission.commission,
-                currency: se.commission.currency.clone(),
-                realized_pnl: se.commission.realized_pnl,
-                yield_amount: se.commission.yield_amount,
-                yield_redemption_date: se.commission.yield_redemption_date.clone(),
+            let report = CommissionAndFeesReport {
+                exec_id: se.commission_and_fees.exec_id.clone(),
+                commission_and_fees: se.commission_and_fees.commission_and_fees,
+                currency: se.commission_and_fees.currency.clone(),
+                realized_pnl: se.commission_and_fees.realized_pnl,
+                yield_amount: se.commission_and_fees.yield_amount,
+                yield_redemption_date: se.commission_and_fees.yield_redemption_date.clone(),
             };
             let report_py = Py::new(py, report)?.into_any();
-            self.wrapper.call_method1(py, "commission_report", (&report_py,))?;
+            self.wrapper.call_method1(py, "commission_and_fees_report", (&report_py,))?;
         }
         self.wrapper.call_method1(py, "exec_details_end", (req_id,))?;
         Ok(())
@@ -275,10 +275,10 @@ impl EClient {
                         init_margin_after: s.init_margin_after.clone(),
                         maint_margin_after: s.maint_margin_after.clone(),
                         equity_with_loan_after: s.equity_with_loan_after.clone(),
-                        commission: s.commission,
-                        min_commission: s.min_commission,
-                        max_commission: s.max_commission,
-                        commission_currency: s.commission_currency.clone(),
+                        commission_and_fees: s.commission_and_fees,
+                        min_commission_and_fees: s.min_commission_and_fees,
+                        max_commission_and_fees: s.max_commission_and_fees,
+                        commission_and_fees_currency: s.commission_and_fees_currency.clone(),
                         warning_text: s.warning_text.clone(),
                         completed_time: s.completed_time.clone(),
                         completed_status: s.completed_status.clone(),

@@ -488,10 +488,10 @@ pub struct OrderState {
     pub init_margin_after: String,
     pub maint_margin_after: String,
     pub equity_with_loan_after: String,
-    pub commission: f64,
-    pub min_commission: f64,
-    pub max_commission: f64,
-    pub commission_currency: String,
+    pub commission_and_fees: f64,
+    pub min_commission_and_fees: f64,
+    pub max_commission_and_fees: f64,
+    pub commission_and_fees_currency: String,
     pub warning_text: String,
     pub completed_time: String,
     pub completed_status: String,
@@ -550,13 +550,13 @@ pub struct ExecutionFilter {
     pub side: String,
 }
 
-// ── CommissionReport ──
+// ── CommissionAndFeesReport ──
 
-/// ibapi-compatible CommissionReport.
+/// ibapi-compatible CommissionAndFeesReport.
 #[derive(Clone, Debug, Default)]
-pub struct CommissionReport {
+pub struct CommissionAndFeesReport {
     pub exec_id: String,
-    pub commission: f64,
+    pub commission_and_fees: f64,
     pub currency: String,
     pub realized_pnl: f64,
     pub yield_amount: f64,
@@ -840,7 +840,7 @@ mod tests {
     fn order_state_default() {
         let os = OrderState::default();
         assert_eq!(os.status, "");
-        assert_eq!(os.commission, 0.0);
+        assert_eq!(os.commission_and_fees, 0.0);
     }
 
     // ── Execution ──
@@ -891,13 +891,13 @@ mod tests {
         assert_eq!(cd.symbol, "");
     }
 
-    // ── CommissionReport ──
+    // ── CommissionAndFeesReport ──
 
     #[test]
-    fn commission_report_default() {
-        let cr = CommissionReport::default();
+    fn commission_and_fees_report_default() {
+        let cr = CommissionAndFeesReport::default();
         assert_eq!(cr.exec_id, "");
-        assert_eq!(cr.commission, 0.0);
+        assert_eq!(cr.commission_and_fees, 0.0);
     }
 
     // ── PriceIncrement ──

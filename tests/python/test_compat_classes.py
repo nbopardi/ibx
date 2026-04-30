@@ -124,7 +124,7 @@ def test_contract_details_defaults():
 def test_order_state_defaults():
     os = OrderState()
     assert os.status == ""
-    assert os.commission == 0.0
+    assert os.commission_and_fees == 0.0
 
 
 # ── TagValue ──

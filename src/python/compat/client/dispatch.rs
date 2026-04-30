@@ -11,10 +11,10 @@ use crate::types::*;
 
 use crate::api::types::{
     Contract as ApiContract, Execution as ApiExecution,
-    CommissionReport as ApiCommissionReport,
+    CommissionAndFeesReport as ApiCommissionAndFeesReport,
 };
 use super::EClient;
-use super::super::contract::{Contract, ContractDescription, ContractDetails, BarData, CommissionReport, DepthMktDataDescriptionPy, Order, OrderState};
+use super::super::contract::{Contract, ContractDescription, ContractDetails, BarData, CommissionAndFeesReport, DepthMktDataDescriptionPy, Order, OrderState};
 use super::super::tick_types::*;
 use super::super::super::types::PRICE_SCALE_F;
 
@@ -94,9 +94,9 @@ impl EClient {
                 avg_price,
                 ..Default::default()
             };
-            let api_commission = ApiCommissionReport {
+            let api_commission = ApiCommissionAndFeesReport {
                 exec_id: exec_id.clone(),
-                commission,
+                commission_and_fees: commission,
                 currency: "USD".into(),
                 realized_pnl: f64::MAX,
                 yield_amount: f64::MAX,
@@ -139,17 +139,17 @@ impl EClient {
             // Update open order tracking
             self.core.update_order_fill(fill.order_id, status, fill.qty as f64, fill.remaining as f64);
 
-            // Dispatch commission_report
-            let report = CommissionReport {
+            // Dispatch commission_and_fees_report
+            let report = CommissionAndFeesReport {
                 exec_id,
-                commission,
+                commission_and_fees: commission,
                 currency: "USD".to_string(),
                 realized_pnl: f64::MAX,
                 yield_amount: f64::MAX,
                 yield_redemption_date: String::new(),
             };
             let report_py = Py::new(py, report)?.into_any();
-            call_wrapper!(self.wrapper, py, "commission_report", (&report_py,));
+            call_wrapper!(self.wrapper, py, "commission_and_fees_report", (&report_py,));
         }
 
         // Drain order updates -> orderStatus
@@ -276,7 +276,7 @@ impl EClient {
             state.init_margin_after = fmt(wi.init_margin_after);
             state.maint_margin_after = fmt(wi.maint_margin_after);
             state.equity_with_loan_after = fmt(wi.equity_with_loan_after);
-            state.commission = wi.commission as f64 / PRICE_SCALE_F;
+            state.commission_and_fees = wi.commission as f64 / PRICE_SCALE_F;
 
             let tracked = self.core.open_orders.lock().unwrap().get(&wi.order_id).cloned();
             let (contract_py, order_py) = if let Some(t) = tracked {
