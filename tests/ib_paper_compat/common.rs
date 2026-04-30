@@ -5,6 +5,9 @@ use std::env;
 pub(super) use std::sync::Arc;
 pub(super) use std::time::{Duration, Instant};
 
+pub(super) use ibx::api::client::EClient;
+pub(super) use ibx::api::types::{Contract as ApiContract, Order as ApiOrder};
+pub(super) use ibx::api::wrapper::tests::RecordingWrapper;
 pub(super) use ibx::bridge::{Event, SharedState};
 pub(super) use ibx::engine::hot_loop::HotLoop;
 pub(super) use ibx::gateway::{self, GatewayConfig};

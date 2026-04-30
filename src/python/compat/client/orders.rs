@@ -130,12 +130,12 @@ impl EClient {
             o.trail_stop_price = tracked.order.trail_stop_price;
             o.algo_strategy = tracked.order.algo_strategy.clone();
             let o_py = Py::new(py, o)?.into_any();
-            let state = pyo3::types::PyDict::new(py);
-            state.set_item("status", tracked.status.as_str())?;
-            state.set_item("completedTime", "")?;
+            let mut state = super::super::contract::OrderState::default();
+            state.status = tracked.status.clone();
+            let state_py = Py::new(py, state)?.into_any();
             self.wrapper.call_method(
                 py, "open_order",
-                (*order_id as i64, &c_py, &o_py, state.as_any()),
+                (*order_id as i64, &c_py, &o_py, &state_py),
                 None,
             )?;
             self.wrapper.call_method(
@@ -246,12 +246,62 @@ impl EClient {
             for co in &completed {
                 let status_str = crate::client_core::order_status_str(co.status);
                 let rich_info = shared.orders.get_order_info(co.order_id);
-                let state = pyo3::types::PyDict::new(py);
-                state.set_item("status", status_str)?;
-                state.set_item("completedTime",
-                    rich_info.as_ref().map(|i| i.order_state.completed_time.as_str()).unwrap_or(""))?;
-                state.set_item("completedStatus",
-                    rich_info.as_ref().map(|i| i.order_state.completed_status.as_str()).unwrap_or(""))?;
+
+                // Build OrderState iso with Rust API path (api/client/orders.rs:101-125):
+                // start from rich_info.order_state when available, override status with the
+                // canonical status_str, fall back to defaults otherwise.
+                let state = if let Some(info) = rich_info.as_ref() {
+                    let s = &info.order_state;
+                    let allocations: Vec<super::super::contract::OrderAllocation> = s
+                        .order_allocations.iter().map(|a| {
+                            super::super::contract::OrderAllocation {
+                                account: a.account.clone(),
+                                position: a.position.clone(),
+                                position_desired: a.position_desired.clone(),
+                                position_after: a.position_after.clone(),
+                                desired_alloc_qty: a.desired_alloc_qty.clone(),
+                                allowed_alloc_qty: a.allowed_alloc_qty.clone(),
+                                is_monetary: a.is_monetary,
+                            }
+                        }).collect();
+                    super::super::contract::OrderState {
+                        status: status_str.into(),
+                        init_margin_before: s.init_margin_before.clone(),
+                        maint_margin_before: s.maint_margin_before.clone(),
+                        equity_with_loan_before: s.equity_with_loan_before.clone(),
+                        init_margin_change: s.init_margin_change.clone(),
+                        maint_margin_change: s.maint_margin_change.clone(),
+                        equity_with_loan_change: s.equity_with_loan_change.clone(),
+                        init_margin_after: s.init_margin_after.clone(),
+                        maint_margin_after: s.maint_margin_after.clone(),
+                        equity_with_loan_after: s.equity_with_loan_after.clone(),
+                        commission: s.commission,
+                        min_commission: s.min_commission,
+                        max_commission: s.max_commission,
+                        commission_currency: s.commission_currency.clone(),
+                        warning_text: s.warning_text.clone(),
+                        completed_time: s.completed_time.clone(),
+                        completed_status: s.completed_status.clone(),
+                        margin_currency: s.margin_currency.clone(),
+                        init_margin_before_outside_rth: s.init_margin_before_outside_rth,
+                        maint_margin_before_outside_rth: s.maint_margin_before_outside_rth,
+                        equity_with_loan_before_outside_rth: s.equity_with_loan_before_outside_rth,
+                        init_margin_change_outside_rth: s.init_margin_change_outside_rth,
+                        maint_margin_change_outside_rth: s.maint_margin_change_outside_rth,
+                        equity_with_loan_change_outside_rth: s.equity_with_loan_change_outside_rth,
+                        init_margin_after_outside_rth: s.init_margin_after_outside_rth,
+                        maint_margin_after_outside_rth: s.maint_margin_after_outside_rth,
+                        equity_with_loan_after_outside_rth: s.equity_with_loan_after_outside_rth,
+                        suggested_size: s.suggested_size.clone(),
+                        reject_reason: s.reject_reason.clone(),
+                        order_allocations: allocations,
+                    }
+                } else {
+                    let mut s = super::super::contract::OrderState::default();
+                    s.status = status_str.into();
+                    s
+                };
+                let state_py = Py::new(py, state)?.into_any();
 
                 let tracked = self.core.open_orders.lock().unwrap().get(&co.order_id).map(|o| {
                     (Contract {
@@ -278,7 +328,7 @@ impl EClient {
                 if let Some((c, o)) = tracked {
                     let c_py = Py::new(py, c)?.into_any();
                     let o_py = Py::new(py, o)?.into_any();
-                    self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, state.as_any()))?;
+                    self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, &state_py))?;
                 } else if let Some(info) = rich_info {
                     let c = Contract {
                         con_id: info.contract.con_id,
@@ -300,11 +350,11 @@ impl EClient {
                     o.perm_id = info.order.perm_id;
                     let c_py = Py::new(py, c)?.into_any();
                     let o_py = Py::new(py, o)?.into_any();
-                    self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, state.as_any()))?;
+                    self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, &state_py))?;
                 } else {
                     let c_py = Py::new(py, Contract::default())?.into_any();
                     let o_py = Py::new(py, Order::default())?.into_any();
-                    self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, state.as_any()))?;
+                    self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, &state_py))?;
                 }
             }
             self.wrapper.call_method0(py, "completed_orders_end")?;

@@ -14,7 +14,7 @@ use crate::api::types::{
     CommissionReport as ApiCommissionReport,
 };
 use super::EClient;
-use super::super::contract::{Contract, ContractDescription, ContractDetails, BarData, CommissionReport, DepthMktDataDescriptionPy};
+use super::super::contract::{Contract, ContractDescription, ContractDetails, BarData, CommissionReport, DepthMktDataDescriptionPy, Order, OrderState};
 use super::super::tick_types::*;
 use super::super::super::types::PRICE_SCALE_F;
 
@@ -260,17 +260,54 @@ impl EClient {
             }
         }
 
-        // Drain what-if responses -> orderStatus with margin info
+        // Drain what-if responses -> open_order(contract, order, OrderState) + order_status
+        // (iso with official ibapi: server delivers margin via openOrder.orderState)
         let what_ifs = shared.orders.drain_what_if_responses();
         for wi in what_ifs {
-            let msg = format!(
-                "WhatIf: initMargin={:.2}, maintMargin={:.2}, commission={:.2}",
-                wi.init_margin_after as f64 / PRICE_SCALE_F,
-                wi.maint_margin_after as f64 / PRICE_SCALE_F,
-                wi.commission as f64 / PRICE_SCALE_F,
-            );
+            let fmt = |p: Price| format!("{:.2}", p as f64 / PRICE_SCALE_F);
+            let mut state = OrderState::default();
+            state.status = "PreSubmitted".into();
+            state.init_margin_before = fmt(wi.init_margin_before);
+            state.maint_margin_before = fmt(wi.maint_margin_before);
+            state.equity_with_loan_before = fmt(wi.equity_with_loan_before);
+            state.init_margin_change = fmt(wi.init_margin_after - wi.init_margin_before);
+            state.maint_margin_change = fmt(wi.maint_margin_after - wi.maint_margin_before);
+            state.equity_with_loan_change = fmt(wi.equity_with_loan_after - wi.equity_with_loan_before);
+            state.init_margin_after = fmt(wi.init_margin_after);
+            state.maint_margin_after = fmt(wi.maint_margin_after);
+            state.equity_with_loan_after = fmt(wi.equity_with_loan_after);
+            state.commission = wi.commission as f64 / PRICE_SCALE_F;
+
+            let tracked = self.core.open_orders.lock().unwrap().get(&wi.order_id).cloned();
+            let (contract_py, order_py) = if let Some(t) = tracked {
+                let c = Contract {
+                    con_id: t.contract.con_id,
+                    symbol: t.contract.symbol,
+                    sec_type: t.contract.sec_type,
+                    exchange: t.contract.exchange,
+                    currency: t.contract.currency,
+                    ..Default::default()
+                };
+                let mut o = Order::default();
+                o.order_id = t.order.order_id;
+                o.action = t.order.action;
+                o.total_quantity = t.order.total_quantity;
+                o.order_type = t.order.order_type;
+                o.lmt_price = t.order.lmt_price;
+                o.aux_price = t.order.aux_price;
+                o.tif = t.order.tif;
+                o.what_if = t.order.what_if;
+                (Py::new(py, c)?.into_any(), Py::new(py, o)?.into_any())
+            } else {
+                (Py::new(py, Contract::default())?.into_any(),
+                 Py::new(py, Order::default())?.into_any())
+            };
+            let state_py = Py::new(py, state)?.into_any();
+            call_wrapper!(self.wrapper, py, "open_order",
+                (wi.order_id as i64, &contract_py, &order_py, &state_py));
             call_wrapper!(self.wrapper, py, "order_status", (wi.order_id as i64, "PreSubmitted", 0.0f64, 0.0f64,
-                 0.0f64, 0i64, 0i64, 0.0f64, 0i64, msg.as_str(), 0.0f64));
+                 0.0f64, 0i64, 0i64, 0.0f64, 0i64, "", 0.0f64));
+            self.core.open_orders.lock().unwrap().remove(&wi.order_id);
         }
 
         // Drain historical data -> historicalData + historicalDataEnd / historicalDataUpdate

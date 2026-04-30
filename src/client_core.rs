@@ -268,6 +268,7 @@ pub struct StoredExecution {
 // ── Order tracking ──
 
 /// A locally tracked order for `req_open_orders` / dispatch status updates.
+#[derive(Clone)]
 pub struct TrackedOrder {
     pub contract: ApiContract,
     pub order: ApiOrder,

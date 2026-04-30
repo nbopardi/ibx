@@ -118,6 +118,38 @@ pub trait Wrapper {
     // ── Historical Ticks ──
 
     fn historical_ticks(&mut self, req_id: i64, ticks: &HistoricalTickData, done: bool) {}
+    fn historical_ticks_bid_ask(
+        &mut self, req_id: i64, ticks: &HistoricalTickData, done: bool,
+    ) { let _ = (req_id, ticks, done); }
+    fn historical_ticks_last(
+        &mut self, req_id: i64, ticks: &HistoricalTickData, done: bool,
+    ) { let _ = (req_id, ticks, done); }
+
+    // ── Option Computations / Definitions ──
+
+    fn tick_option_computation(
+        &mut self, req_id: i64, tick_type: i32, tick_attrib: i32,
+        implied_vol: f64, delta: f64, opt_price: f64, pv_dividend: f64,
+        gamma: f64, vega: f64, theta: f64, und_price: f64,
+    ) {
+        let _ = (req_id, tick_type, tick_attrib, implied_vol, delta, opt_price,
+                 pv_dividend, gamma, vega, theta, und_price);
+    }
+    fn security_definition_option_parameter(
+        &mut self, req_id: i64, exchange: &str, underlying_con_id: i64,
+        trading_class: &str, multiplier: &str, expirations: &[String], strikes: &[f64],
+    ) {
+        let _ = (req_id, exchange, underlying_con_id, trading_class, multiplier, expirations, strikes);
+    }
+    fn security_definition_option_parameter_end(&mut self, req_id: i64) { let _ = req_id; }
+
+    // ── Delta-Neutral ──
+
+    fn delta_neutral_validation(
+        &mut self, req_id: i64, con_id: i64, delta: f64, price: f64,
+    ) {
+        let _ = (req_id, con_id, delta, price);
+    }
 
     // ── Histogram ──
 
@@ -215,6 +247,19 @@ pub mod tests {
             avg_fill_price: f64, _: i64, _: i64, _: f64, _: i64, _: &str, _: f64,
         ) {
             self.events.push(format!("order_status:{order_id}:{status}:{filled}:{remaining}:{avg_fill_price}"));
+        }
+        fn open_order(&mut self, order_id: i64, _contract: &Contract, _order: &Order, state: &OrderState) {
+            self.events.push(format!(
+                "open_order:{order_id}:{}:initB={}:initC={}:initA={}:maintB={}:maintC={}:maintA={}:eqlB={}:eqlC={}:eqlA={}:comm={}",
+                state.status,
+                state.init_margin_before, state.init_margin_change, state.init_margin_after,
+                state.maint_margin_before, state.maint_margin_change, state.maint_margin_after,
+                state.equity_with_loan_before, state.equity_with_loan_change, state.equity_with_loan_after,
+                state.commission,
+            ));
+        }
+        fn open_order_end(&mut self) {
+            self.events.push("open_order_end".into());
         }
         fn exec_details(&mut self, req_id: i64, _contract: &Contract, execution: &Execution) {
             self.events.push(format!("exec_details:{req_id}:{}:{}", execution.side, execution.shares));

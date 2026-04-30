@@ -1122,6 +1122,7 @@ pub(super) fn phase_what_if_order(conns: Conns) -> Conns {
 
     let account_id = conns.account_id;
     let shared = Arc::new(SharedState::new());
+    let shared_for_client = shared.clone();  // for EClient dispatcher validation
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
     let (mut hot_loop, control_tx) = HotLoop::with_connections(
         shared, Some(event_tx), account_id.clone(), conns.farm, conns.ccp, conns.hmds, None,
@@ -1138,12 +1139,12 @@ pub(super) fn phase_what_if_order(conns: Conns) -> Conns {
 
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut what_if_received = false;
-    let mut commission = 0i64;
+    let mut response_snapshot: Option<WhatIfResponse> = None;
 
     while Instant::now() < deadline {
         match event_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Event::WhatIf(response)) => {
-                commission = response.commission;
+                response_snapshot = Some(response);
                 what_if_received = true;
                 break;
             }
@@ -1151,11 +1152,53 @@ pub(super) fn phase_what_if_order(conns: Conns) -> Conns {
         }
     }
 
+    // Validate the dispatcher path (open_order with full OrderState — iso ibapi).
+    // Construct an EClient on the same shared state and run process_msgs.
+    // The engine pushes to shared.orders BEFORE emitting Event::WhatIf, so the
+    // response is still in shared.orders here even though we drained event_rx.
+    let dispatcher_validated = if what_if_received {
+        let (dummy_tx, _dummy_rx) = crossbeam_channel::unbounded();
+        let dummy_handle = std::thread::spawn(|| {});
+        let eclient = EClient::from_parts(
+            shared_for_client, dummy_tx, dummy_handle, account_id.clone(),
+        );
+        // Pre-track the order so the dispatcher can populate contract/order in open_order.
+        eclient.core.track_order(
+            order_id,
+            ApiContract { con_id: 756733, symbol: "SPY".into(), ..Default::default() },
+            ApiOrder::default(),
+            inst_id,
+        );
+        // Re-push the response since the engine already pushed it (we didn't drain
+        // shared.orders.drain_what_if_responses anywhere; only drained event_rx).
+        // Actually the response IS still in shared.orders.what_if_responses queue.
+        let mut w = RecordingWrapper::default();
+        eclient.process_msgs(&mut w);
+
+        let open_event = w.events.iter().find(|e| e.starts_with(&format!("open_order:{}:", order_id)));
+        let status_event = w.events.iter().find(|e|
+            e.starts_with(&format!("order_status:{}:PreSubmitted", order_id)));
+        match (open_event, status_event) {
+            (Some(oe), Some(_)) => {
+                println!("  Dispatcher: open_order fired with state: {}", oe);
+                true
+            }
+            _ => {
+                println!("  Dispatcher: FAIL — open_order or order_status missing. events={:?}", w.events);
+                false
+            }
+        }
+    } else {
+        false
+    };
+
     let conns = shutdown_and_reclaim(&control_tx, join, account_id);
 
     assert!(what_if_received, "What-if response was never received");
+    let commission = response_snapshot.map(|r| r.commission).unwrap_or(0);
     if commission > 0 {
         println!("  Commission: ${:.2}", commission as f64 / PRICE_SCALE as f64);
+        assert!(dispatcher_validated, "Dispatcher path (open_order + order_status) failed validation");
         println!("  PASS\n");
     } else {
         println!("  SKIP: Commission=0 (pre-market / no active quote)\n");

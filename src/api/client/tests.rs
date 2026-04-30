@@ -1521,6 +1521,40 @@ fn process_msgs_dispatches_what_if() {
     assert!(w.events.iter().any(|e| e.starts_with("order_status:42:PreSubmitted")));
 }
 
+/// Regression: what-if dispatch must populate all 8 OrderState fields and call
+/// open_order BEFORE order_status, matching official ibapi contract.
+#[test]
+fn process_msgs_what_if_emits_full_order_state() {
+    let (client, _rx, shared) = test_client();
+    // Distinct values per field so any swap/typo is detectable.
+    shared.orders.push_what_if(WhatIfResponse {
+        order_id: 7, instrument: 0,
+        init_margin_before:    100 * PRICE_SCALE,
+        maint_margin_before:   200 * PRICE_SCALE,
+        equity_with_loan_before: 300 * PRICE_SCALE,
+        init_margin_after:     400 * PRICE_SCALE,
+        maint_margin_after:    500 * PRICE_SCALE,
+        equity_with_loan_after: 600 * PRICE_SCALE,
+        commission:            7 * PRICE_SCALE,
+    });
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+
+    let open_idx = w.events.iter().position(|e| e.starts_with("open_order:7:"))
+        .expect("open_order callback missing for what-if");
+    let status_idx = w.events.iter().position(|e| e.starts_with("order_status:7:PreSubmitted"))
+        .expect("order_status callback missing for what-if");
+    assert!(open_idx < status_idx, "open_order must be emitted before order_status");
+
+    let evt = &w.events[open_idx];
+    // status, all 9 margin fields (before/change/after × init/maint/eql), commission.
+    assert!(evt.contains(":PreSubmitted:"), "status field missing: {evt}");
+    assert!(evt.contains("initB=100.00:initC=300.00:initA=400.00"), "init margin wrong: {evt}");
+    assert!(evt.contains("maintB=200.00:maintC=300.00:maintA=500.00"), "maint margin wrong: {evt}");
+    assert!(evt.contains("eqlB=300.00:eqlC=300.00:eqlA=600.00"), "equity-with-loan wrong: {evt}");
+    assert!(evt.contains("comm=7"), "commission wrong: {evt}");
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  process_msgs — historical data
 // ═══════════════════════════════════════════════════════════════════

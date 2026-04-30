@@ -462,6 +462,19 @@ pub struct TagValue {
 
 // ── OrderState ──
 
+/// Per-account allocation for grouped/allocation orders (ibapi-compatible).
+/// Decimal fields are carried as strings to preserve precision.
+#[derive(Clone, Debug, Default)]
+pub struct OrderAllocation {
+    pub account: String,
+    pub position: String,
+    pub position_desired: String,
+    pub position_after: String,
+    pub desired_alloc_qty: String,
+    pub allowed_alloc_qty: String,
+    pub is_monetary: bool,
+}
+
 /// ibapi-compatible OrderState (used in openOrder callback).
 #[derive(Clone, Debug, Default)]
 pub struct OrderState {
@@ -482,6 +495,20 @@ pub struct OrderState {
     pub warning_text: String,
     pub completed_time: String,
     pub completed_status: String,
+    // ── ibapi-iso extension (2026-04-30): RTH-split margin + allocations ──
+    pub margin_currency: String,
+    pub init_margin_before_outside_rth: f64,
+    pub maint_margin_before_outside_rth: f64,
+    pub equity_with_loan_before_outside_rth: f64,
+    pub init_margin_change_outside_rth: f64,
+    pub maint_margin_change_outside_rth: f64,
+    pub equity_with_loan_change_outside_rth: f64,
+    pub init_margin_after_outside_rth: f64,
+    pub maint_margin_after_outside_rth: f64,
+    pub equity_with_loan_after_outside_rth: f64,
+    pub suggested_size: String,
+    pub reject_reason: String,
+    pub order_allocations: Vec<OrderAllocation>,
 }
 
 // ── Execution ──

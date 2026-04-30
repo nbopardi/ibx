@@ -68,6 +68,7 @@ impl EClient {
             volume: volume * QTY_SCALE,
             open: (open * ps) as i64, high: (high * ps) as i64,
             low: (low * ps) as i64, close: (close * ps) as i64,
+            bid_exch_mask: 0, ask_exch_mask: 0, last_exch_mask: 0,
             timestamp_ns: 1,
         };
         shared.market.push_quote(instrument, &q);
@@ -120,6 +121,117 @@ impl EClient {
         };
         shared.orders.push_order_update(OrderUpdate {
             order_id, instrument, status: st, filled_qty, remaining_qty, perm_id: 0, parent_id: 0, timestamp_ns: 100,
+        });
+        Ok(())
+    }
+
+    /// Push a completed order + rich info into SharedState (for req_completed_orders regression tests).
+    #[doc(hidden)]
+    #[pyo3(signature = (
+        order_id, instrument, status, filled_qty,
+        symbol, action, total_quantity, lmt_price,
+        completed_status, completed_time, commission_currency, warning_text, commission,
+    ))]
+    fn _test_push_completed_order(
+        &self,
+        order_id: u64, instrument: u32, status: &str, filled_qty: i64,
+        symbol: &str, action: &str, total_quantity: f64, lmt_price: f64,
+        completed_status: &str, completed_time: &str, commission_currency: &str,
+        warning_text: &str, commission: f64,
+    ) -> PyResult<()> {
+        use crate::api::types::{Contract as ApiContract, Order as ApiOrder, Execution as ApiExecution, OrderState as ApiOrderState};
+        let shared = self.shared_state()?;
+        let st = match status {
+            "Filled" => OrderStatus::Filled,
+            "Cancelled" => OrderStatus::Cancelled,
+            "Rejected" => OrderStatus::Rejected,
+            _ => return Err(PyRuntimeError::new_err(format!("Invalid status: {}", status))),
+        };
+        shared.orders.push_completed_order(crate::types::CompletedOrder {
+            order_id, instrument, status: st, filled_qty, timestamp_ns: 100,
+        });
+        shared.orders.push_order_info(order_id, crate::bridge::RichOrderInfo {
+            contract: ApiContract {
+                symbol: symbol.to_string(),
+                sec_type: "STK".into(),
+                exchange: "SMART".into(),
+                currency: "USD".into(),
+                ..Default::default()
+            },
+            order: ApiOrder {
+                order_id: order_id as i64,
+                action: action.to_string(),
+                total_quantity,
+                order_type: "LMT".into(),
+                lmt_price,
+                ..Default::default()
+            },
+            order_state: ApiOrderState {
+                status: status.to_string(),
+                completed_status: completed_status.to_string(),
+                completed_time: completed_time.to_string(),
+                commission_currency: commission_currency.to_string(),
+                warning_text: warning_text.to_string(),
+                commission,
+                ..Default::default()
+            },
+            last_exec: ApiExecution::default(),
+        });
+        Ok(())
+    }
+
+    /// Track an order locally (for req_open_orders regression tests).
+    #[doc(hidden)]
+    fn _test_track_order(
+        &self, order_id: u64, instrument: u32,
+        symbol: &str, action: &str, total_quantity: f64, lmt_price: f64,
+    ) -> PyResult<()> {
+        use crate::api::types::{Contract as ApiContract, Order as ApiOrder};
+        let contract = ApiContract {
+            symbol: symbol.to_string(),
+            sec_type: "STK".into(),
+            exchange: "SMART".into(),
+            currency: "USD".into(),
+            ..Default::default()
+        };
+        let order = ApiOrder {
+            order_id: order_id as i64,
+            action: action.to_string(),
+            total_quantity,
+            order_type: "LMT".into(),
+            lmt_price,
+            ..Default::default()
+        };
+        self.core.track_order(order_id, contract, order, instrument);
+        Ok(())
+    }
+
+    /// Push a what-if response into SharedState (for dispatch regression tests).
+    #[doc(hidden)]
+    #[pyo3(signature = (
+        order_id, instrument,
+        init_margin_before, maint_margin_before, equity_with_loan_before,
+        init_margin_after, maint_margin_after, equity_with_loan_after,
+        commission,
+    ))]
+    fn _test_push_what_if(
+        &self,
+        order_id: u64, instrument: u32,
+        init_margin_before: f64, maint_margin_before: f64, equity_with_loan_before: f64,
+        init_margin_after: f64, maint_margin_after: f64, equity_with_loan_after: f64,
+        commission: f64,
+    ) -> PyResult<()> {
+        let shared = self.shared_state()?;
+        let ps = PRICE_SCALE as f64;
+        shared.orders.push_what_if(crate::types::WhatIfResponse {
+            order_id, instrument,
+            init_margin_before: (init_margin_before * ps) as i64,
+            maint_margin_before: (maint_margin_before * ps) as i64,
+            equity_with_loan_before: (equity_with_loan_before * ps) as i64,
+            init_margin_after: (init_margin_after * ps) as i64,
+            maint_margin_after: (maint_margin_after * ps) as i64,
+            equity_with_loan_after: (equity_with_loan_after * ps) as i64,
+            commission: (commission * ps) as i64,
         });
         Ok(())
     }

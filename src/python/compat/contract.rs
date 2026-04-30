@@ -1608,6 +1608,33 @@ impl TagValue {
     }
 }
 
+// ── OrderAllocation (per-account allocation in OrderState) ──
+
+/// ibapi-compatible OrderAllocation class.
+/// Decimal fields are carried as strings to preserve precision.
+#[pyclass]
+#[derive(Clone, Default)]
+pub struct OrderAllocation {
+    #[pyo3(get, set)] pub account: String,
+    #[pyo3(get, set)] pub position: String,
+    #[pyo3(get, set)] pub position_desired: String,
+    #[pyo3(get, set)] pub position_after: String,
+    #[pyo3(get, set)] pub desired_alloc_qty: String,
+    #[pyo3(get, set)] pub allowed_alloc_qty: String,
+    #[pyo3(get, set)] pub is_monetary: bool,
+}
+
+#[pymethods]
+impl OrderAllocation {
+    #[new]
+    #[pyo3(signature = ())]
+    fn new() -> Self { Self::default() }
+
+    fn __repr__(&self) -> String {
+        format!("OrderAllocation(account='{}', position={})", self.account, self.position)
+    }
+}
+
 // ── OrderState (for what-if responses) ──
 
 /// ibapi-compatible OrderState class (used in openOrder callback).
@@ -1623,6 +1650,12 @@ pub struct OrderState {
     #[pyo3(get, set)]
     pub equity_with_loan_before: String,
     #[pyo3(get, set)]
+    pub init_margin_change: String,
+    #[pyo3(get, set)]
+    pub maint_margin_change: String,
+    #[pyo3(get, set)]
+    pub equity_with_loan_change: String,
+    #[pyo3(get, set)]
     pub init_margin_after: String,
     #[pyo3(get, set)]
     pub maint_margin_after: String,
@@ -1634,6 +1667,28 @@ pub struct OrderState {
     pub min_commission: f64,
     #[pyo3(get, set)]
     pub max_commission: f64,
+    #[pyo3(get, set)]
+    pub commission_currency: String,
+    #[pyo3(get, set)]
+    pub warning_text: String,
+    #[pyo3(get, set)]
+    pub completed_time: String,
+    #[pyo3(get, set)]
+    pub completed_status: String,
+    // ── ibapi-iso extension: RTH-split margin + allocations ──
+    #[pyo3(get, set)] pub margin_currency: String,
+    #[pyo3(get, set)] pub init_margin_before_outside_rth: f64,
+    #[pyo3(get, set)] pub maint_margin_before_outside_rth: f64,
+    #[pyo3(get, set)] pub equity_with_loan_before_outside_rth: f64,
+    #[pyo3(get, set)] pub init_margin_change_outside_rth: f64,
+    #[pyo3(get, set)] pub maint_margin_change_outside_rth: f64,
+    #[pyo3(get, set)] pub equity_with_loan_change_outside_rth: f64,
+    #[pyo3(get, set)] pub init_margin_after_outside_rth: f64,
+    #[pyo3(get, set)] pub maint_margin_after_outside_rth: f64,
+    #[pyo3(get, set)] pub equity_with_loan_after_outside_rth: f64,
+    #[pyo3(get, set)] pub suggested_size: String,
+    #[pyo3(get, set)] pub reject_reason: String,
+    #[pyo3(get, set)] pub order_allocations: Vec<OrderAllocation>,
 }
 
 #[pymethods]
@@ -2107,6 +2162,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Order>()?;
     m.add_class::<TagValue>()?;
     m.add_class::<OrderState>()?;
+    m.add_class::<OrderAllocation>()?;
     m.add_class::<PriceCondition>()?;
     m.add_class::<TimeCondition>()?;
     m.add_class::<MarginCondition>()?;

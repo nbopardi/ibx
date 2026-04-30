@@ -2,7 +2,7 @@
 
 use crate::api::types::{
     BarData, CommissionReport, ContractDetails, ContractDescription, Execution,
-    TickAttribLast, TickAttribBidAsk, PRICE_SCALE_F,
+    Order as ApiOrder, OrderState, TickAttribLast, TickAttribBidAsk, PRICE_SCALE_F,
 };
 use crate::api::wrapper::Wrapper;
 use crate::client_core::order_status_str;
@@ -100,17 +100,32 @@ impl EClient {
             wrapper.error(reject.order_id as i64, code, &msg, "");
         }
 
-        // What-if → order_status (with margin info in why_held)
+        // What-if → open_order(contract, order, OrderState) + order_status (iso with ibapi)
         for wi in self.shared.orders.drain_what_if_responses() {
-            let msg = format!(
-                "WhatIf: initMargin={:.2}, maintMargin={:.2}, commission={:.2}",
-                wi.init_margin_after as f64 / PRICE_SCALE_F,
-                wi.maint_margin_after as f64 / PRICE_SCALE_F,
-                wi.commission as f64 / PRICE_SCALE_F,
-            );
+            let fmt = |p: Price| format!("{:.2}", p as f64 / PRICE_SCALE_F);
+            let state = OrderState {
+                status: "PreSubmitted".into(),
+                init_margin_before: fmt(wi.init_margin_before),
+                maint_margin_before: fmt(wi.maint_margin_before),
+                equity_with_loan_before: fmt(wi.equity_with_loan_before),
+                init_margin_change: fmt(wi.init_margin_after - wi.init_margin_before),
+                maint_margin_change: fmt(wi.maint_margin_after - wi.maint_margin_before),
+                equity_with_loan_change: fmt(wi.equity_with_loan_after - wi.equity_with_loan_before),
+                init_margin_after: fmt(wi.init_margin_after),
+                maint_margin_after: fmt(wi.maint_margin_after),
+                equity_with_loan_after: fmt(wi.equity_with_loan_after),
+                commission: wi.commission as f64 / PRICE_SCALE_F,
+                ..Default::default()
+            };
+            let tracked = self.core.open_orders.lock().unwrap().get(&wi.order_id).cloned();
+            let (contract, order) = tracked
+                .map(|t| (t.contract, t.order))
+                .unwrap_or_else(|| (Contract::default(), ApiOrder::default()));
+            wrapper.open_order(wi.order_id as i64, &contract, &order, &state);
             wrapper.order_status(
-                wi.order_id as i64, "PreSubmitted", 0.0, 0.0, 0.0, 0, 0, 0.0, 0, &msg, 0.0,
+                wi.order_id as i64, "PreSubmitted", 0.0, 0.0, 0.0, 0, 0, 0.0, 0, "", 0.0,
             );
+            self.core.open_orders.lock().unwrap().remove(&wi.order_id);
         }
     }
 

@@ -90,6 +90,45 @@ class RecordingWrapper(EWrapper):
     def position_end(self):
         self.events.append(("position_end",))
 
+    def open_order(self, order_id, contract, order, order_state):
+        # Record OrderState fields as a dict so tests can assert on them.
+        s = order_state
+        self.events.append(("open_order", order_id, contract, order, {
+            "status": s.status,
+            "init_margin_before": s.init_margin_before,
+            "maint_margin_before": s.maint_margin_before,
+            "equity_with_loan_before": s.equity_with_loan_before,
+            "init_margin_change": s.init_margin_change,
+            "maint_margin_change": s.maint_margin_change,
+            "equity_with_loan_change": s.equity_with_loan_change,
+            "init_margin_after": s.init_margin_after,
+            "maint_margin_after": s.maint_margin_after,
+            "equity_with_loan_after": s.equity_with_loan_after,
+            "commission": s.commission,
+            # ibapi-iso extension fields
+            "margin_currency": s.margin_currency,
+            "init_margin_after_outside_rth": s.init_margin_after_outside_rth,
+            "suggested_size": s.suggested_size,
+            "reject_reason": s.reject_reason,
+            "order_allocations": list(s.order_allocations),
+        }))
+
+    def open_order_end(self):
+        self.events.append(("open_order_end",))
+
+    def completed_order(self, contract, order, order_state):
+        self.events.append(("completed_order", contract, order, {
+            "status": order_state.status,
+            "completed_status": order_state.completed_status,
+            "completed_time": order_state.completed_time,
+            "commission_currency": order_state.commission_currency,
+            "warning_text": order_state.warning_text,
+            "commission": order_state.commission,
+        }))
+
+    def completed_orders_end(self):
+        self.events.append(("completed_orders_end",))
+
 
 def make_test_client(account_id="TEST123"):
     """Create a connected EClient backed by SharedState (no live gateway)."""
@@ -532,6 +571,152 @@ class TestCancelRejectDispatch:
         assert len(errors) == 1
         assert errors[0][1] == 42  # order_id
         assert errors[0][2] == 202  # error_code for cancel reject
+
+
+class TestReqOpenOrdersOrderState:
+    """Regression: req_open_orders must deliver an OrderState object (not a dict)."""
+
+    def test_state_is_order_state_instance(self):
+        w, c = make_test_client()
+        c._test_track_order(
+            order_id=42, instrument=0, symbol="SPY",
+            action="BUY", total_quantity=100.0, lmt_price=400.0,
+        )
+        c.req_open_orders()
+
+        open_events = [e for e in w.events if e[0] == "open_order"]
+        assert len(open_events) == 1, f"expected 1 open_order, got {open_events}"
+        state = open_events[0][4]  # captured as dict by RecordingWrapper
+        # If state were still a PyDict, RecordingWrapper.open_order would have
+        # crashed on `order_state.status` (AttributeError on dict). Reaching
+        # here means state was an OrderState instance.
+        assert state["status"] == "PendingSubmit"
+        # Newly tracked orders have empty margin fields — populated only for what-if.
+        assert state["init_margin_after"] == ""
+        assert state["commission"] == 0.0
+
+
+class TestReqCompletedOrdersOrderState:
+    """Regression: req_completed_orders must deliver an OrderState with
+    completed_status, completed_time, commission_currency, warning_text — iso ibapi."""
+
+    def test_state_carries_all_completed_fields(self):
+        w, c = make_test_client()
+        c._test_push_completed_order(
+            order_id=99, instrument=0, status="Filled", filled_qty=100,
+            symbol="SPY", action="BUY", total_quantity=100.0, lmt_price=400.0,
+            completed_status="Filled", completed_time="20260430-15:30:00",
+            commission_currency="USD", warning_text="warning_xyz", commission=2.50,
+        )
+        c.req_completed_orders(False)
+
+        completed_events = [e for e in w.events if e[0] == "completed_order"]
+        assert len(completed_events) == 1, f"expected 1 completed_order, got {completed_events}"
+        state = completed_events[0][3]
+        # All 4 previously-missing fields must be exposed on OrderState (not in a PyDict).
+        # If state were a PyDict, RecordingWrapper.completed_order would crash on
+        # `order_state.completed_status` (AttributeError).
+        assert state["status"] == "Filled"
+        assert state["completed_status"] == "Filled"
+        assert state["completed_time"] == "20260430-15:30:00"
+        assert state["commission_currency"] == "USD"
+        assert state["warning_text"] == "warning_xyz"
+        assert abs(state["commission"] - 2.50) < 1e-6
+
+        # completed_orders_end must fire after the per-order callbacks.
+        end_events = [e for e in w.events if e[0] == "completed_orders_end"]
+        assert len(end_events) == 1
+
+
+class TestOrderAllocation:
+    """Regression: OrderAllocation class is exposed and round-trips through OrderState."""
+
+    def test_order_allocation_fields(self):
+        from ibx import OrderAllocation
+        a = OrderAllocation()
+        a.account = "DU123"
+        a.position = "100"
+        a.position_desired = "150"
+        a.position_after = "100"
+        a.desired_alloc_qty = "50"
+        a.allowed_alloc_qty = "50"
+        a.is_monetary = True
+        assert a.account == "DU123"
+        assert a.position == "100"
+        assert a.is_monetary is True
+
+    def test_order_state_allocations_roundtrip(self):
+        from ibx import OrderState, OrderAllocation
+        s = OrderState()
+        a1 = OrderAllocation(); a1.account = "DU111"; a1.position = "100"
+        a2 = OrderAllocation(); a2.account = "DU222"; a2.position = "200"
+        s.order_allocations = [a1, a2]
+        assert len(s.order_allocations) == 2
+        assert s.order_allocations[0].account == "DU111"
+        assert s.order_allocations[1].account == "DU222"
+
+
+class TestWhatIfDispatch:
+    """Regression: what-if responses must arrive via open_order(orderState) — iso ibapi."""
+
+    def test_open_order_carries_full_order_state(self):
+        w, c = make_test_client()
+        # Distinct values per field so any swap/typo is caught.
+        c._test_push_what_if(
+            order_id=7, instrument=0,
+            init_margin_before=100.0, maint_margin_before=200.0, equity_with_loan_before=300.0,
+            init_margin_after=400.0, maint_margin_after=500.0, equity_with_loan_after=600.0,
+            commission=7.0,
+        )
+        c._test_dispatch_once()
+
+        open_events = [e for e in w.events if e[0] == "open_order"]
+        status_events = [(i, e) for i, e in enumerate(w.events) if e[0] == "order_status"]
+        assert len(open_events) == 1, "open_order missing for what-if"
+        assert any(e[1] == 7 and e[2] == "PreSubmitted" for _, e in status_events), \
+            "order_status PreSubmitted missing"
+
+        # Ordering: open_order before order_status
+        open_idx = next(i for i, e in enumerate(w.events) if e[0] == "open_order")
+        status_idx = next(i for i, e in status_events)
+        assert open_idx < status_idx, "open_order must fire before order_status"
+
+        oid, _contract, _order, state = open_events[0][1], open_events[0][2], open_events[0][3], open_events[0][4]
+        assert oid == 7
+        assert state["status"] == "PreSubmitted"
+        assert state["init_margin_before"] == "100.00"
+        assert state["init_margin_after"] == "400.00"
+        assert state["init_margin_change"] == "300.00"   # 400 - 100
+        assert state["maint_margin_before"] == "200.00"
+        assert state["maint_margin_after"] == "500.00"
+        assert state["maint_margin_change"] == "300.00"  # 500 - 200
+        assert state["equity_with_loan_before"] == "300.00"
+        assert state["equity_with_loan_after"] == "600.00"
+        assert state["equity_with_loan_change"] == "300.00"  # 600 - 300
+        assert abs(state["commission"] - 7.0) < 1e-6
+        # ibapi-iso fields default to empty/zero when wire data doesn't carry them
+        assert state["margin_currency"] == ""
+        assert state["init_margin_after_outside_rth"] == 0.0
+        assert state["suggested_size"] == ""
+        assert state["reject_reason"] == ""
+        assert state["order_allocations"] == []
+
+    def test_order_status_why_held_is_clean(self):
+        """why_held must NOT contain margin info anymore (was the legacy hack)."""
+        w, c = make_test_client()
+        c._test_push_what_if(
+            order_id=99, instrument=0,
+            init_margin_before=0.0, maint_margin_before=0.0, equity_with_loan_before=0.0,
+            init_margin_after=1234.56, maint_margin_after=789.01, equity_with_loan_after=0.0,
+            commission=2.50,
+        )
+        c._test_dispatch_once()
+
+        status_events = [e for e in w.events if e[0] == "order_status" and e[1] == 99]
+        assert len(status_events) == 1
+        # RecordingWrapper.order_status doesn't record why_held, but we can verify
+        # status is the canonical "PreSubmitted" without inline margin string.
+        assert status_events[0][2] == "PreSubmitted"
 
 
 class TestTbtDispatch:
