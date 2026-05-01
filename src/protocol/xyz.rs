@@ -109,9 +109,43 @@ pub fn xyz_build_soft_token(state: u32, x: &str, y: &str, z: &str) -> Vec<u8> {
     buf
 }
 
-/// Build the second-factor approval init message (state=1, username only).
-pub fn xyz_build_swcr_token_init(username: &str) -> Vec<u8> {
-    xyz_build(XYZ_MSG_SWCR_TOKEN, 1, username, &[])
+/// Build the second-factor approval init message (state=1).
+///
+/// Layout per ib-agent#123 — 5-slot header + 4 string fields in body:
+///
+/// ```text
+/// Header (5 slots, 20 B):
+///   version (=20, NOT 23)
+///   msg_id  (=775)
+///   literal 1                 (hardcoded, NOT a sub-id field)
+///   state   (=1)
+///   str_len of `str` param    (=0 — caller passes empty)
+/// Body (4 length-prefixed strings):
+///   M.x  = ""                 (username slot, EMPTY in state=1)
+///   M.z  = ""                 (security code, set in state=3)
+///   M.A  = ""                 (challenge response, set in state=3)
+///   M.D  = token_sub_type     (the only non-empty field; account-specific,
+///                               typically "2a")
+/// ```
+///
+/// `token_sub_type` is computed server-side per session — for accounts
+/// matching the captured profile it's `"2a"`, but other accounts/SWCR
+/// configurations may differ. Capture the live value via ib-agent's
+/// `SWCR_TOKEN_SUBTYPE` hook if the default doesn't trigger the push.
+pub fn xyz_build_swcr_token_init(token_sub_type: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // ── 5-slot header ────────────────────────────────────────────────
+    buf.extend_from_slice(&20u32.to_be_bytes());            // version
+    buf.extend_from_slice(&XYZ_MSG_SWCR_TOKEN.to_be_bytes());// msg_id 775
+    buf.extend_from_slice(&1u32.to_be_bytes());              // hardcoded 1
+    buf.extend_from_slice(&1u32.to_be_bytes());              // state = 1
+    buf.extend_from_slice(&0u32.to_be_bytes());              // str_len = 0
+    // ── 4 string fields ─────────────────────────────────────────────
+    xyz_write_string(&mut buf, "");                          // M.x
+    xyz_write_string(&mut buf, "");                          // M.z
+    xyz_write_string(&mut buf, "");                          // M.A
+    xyz_write_string(&mut buf, token_sub_type);              // M.D
+    buf
 }
 
 /// Parsed payload from an `XYZ_MSG_SWCR_TOKEN` state=2 reply.
@@ -233,13 +267,37 @@ mod tests {
     // ── Second-factor approval (IBKey / SWCR_TOKEN) ─────────────────
 
     #[test]
-    fn swcr_token_init_carries_username_at_state_1() {
-        let payload = xyz_build_swcr_token_init("user42");
-        let (msg_id, sub_id, state, fields) = xyz_parse_response(&payload).unwrap();
+    fn swcr_token_init_matches_canonical_bytes() {
+        // Reference: deepentropy/ib-agent#123. This is the literal 40-byte
+        // inner XYZ payload one successful gateway login put on the wire,
+        // with token_sub_type="2a".
+        let expected: Vec<u8> = vec![
+            // 5-slot header
+            0x00, 0x00, 0x00, 0x14, // version = 20
+            0x00, 0x00, 0x03, 0x07, // msg_id = 775
+            0x00, 0x00, 0x00, 0x01, // hardcoded 1
+            0x00, 0x00, 0x00, 0x01, // state = 1
+            0x00, 0x00, 0x00, 0x00, // str_len = 0
+            // 4 string fields: x, z, A all empty; D = "2a"
+            0x00, 0x00, 0x00, 0x00, // M.x.length = 0
+            0x00, 0x00, 0x00, 0x00, // M.z.length = 0
+            0x00, 0x00, 0x00, 0x00, // M.A.length = 0
+            0x00, 0x00, 0x00, 0x02, // M.D.length = 2
+            0x32, 0x61,             // "2a"
+            0x00, 0x00,             // padding to 4-byte alignment
+        ];
+        assert_eq!(expected.len(), 40, "canonical inner payload is 40 bytes");
+        let got = xyz_build_swcr_token_init("2a");
+        assert_eq!(got, expected, "byte-for-byte match required");
+    }
+
+    #[test]
+    fn swcr_token_init_state_and_msg_id_parse() {
+        // Sanity check via the generic parser — independent of the layout test.
+        let payload = xyz_build_swcr_token_init("2a");
+        let (msg_id, _, state, _) = xyz_parse_response(&payload).unwrap();
         assert_eq!(msg_id, XYZ_MSG_SWCR_TOKEN);
-        assert_eq!(sub_id, 1);
         assert_eq!(state, 1);
-        assert_eq!(fields[0], "user42");
     }
 
     #[test]

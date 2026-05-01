@@ -157,6 +157,7 @@ fn main() {
         paper: true,
         accept_invalid_certs: false,
         ib_key_timeout_secs: ibx::auth::session::IB_KEY_DEFAULT_TIMEOUT_SECS,
+        ib_key_token_sub_type: ibx::auth::session::IB_KEY_DEFAULT_TOKEN_SUB_TYPE.into(),
     };
 
     println!("========================================");

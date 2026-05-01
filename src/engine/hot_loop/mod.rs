@@ -807,7 +807,7 @@ impl HotLoop {
                     &auth.host, "usfarm",
                     &auth.username, &auth.password, auth.paper,
                     &auth.server_session_id, &auth.session_key,
-                    &auth.hw_info, &auth.encoded,
+                    &auth.hw_info, &auth.encoded, 18,
                 );
                 let _ = tx.send(result);
             })

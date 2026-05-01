@@ -1,6 +1,6 @@
 [package]
 name = "ibx"
-version = "0.4.7"
+version = "0.4.8-dev"
 edition = "2024"
 
 [lib]
@@ -53,13 +53,14 @@ log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+env_logger = "0.11"
+mac_address = "1"
 
 # Python bindings (optional)
 pyo3 = { version = "0.24", features = ["extension-module", "multiple-pymethods"], optional = true }
 
 [dev-dependencies]
 serde_json = "1"
-env_logger = "0.11"
 
 [profile.release]
 lto = "fat"

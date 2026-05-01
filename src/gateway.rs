@@ -55,14 +55,36 @@ pub fn parse_misc_urls(s: &str) -> std::collections::HashMap<String, String> {
     out
 }
 
-/// Compute token short hash for farm logon.
+/// Parse a farm-route string from the auth-server's routing tags.
+///
+/// Three accepted shapes (per ib-agent#128):
+///   "<host>/<farm>"             — tag 6145 (trading)
+///   "<host>/<farm>/<port>"      — tags 6171 (mktdata) / 8008 (secdef)
+///
+/// Port is informational only — ibx routes all farm channels to the same
+/// data-port discovered via `misc_port()`. We just need (host, farm).
+/// Returns `None` for empty or malformed input.
+pub fn parse_farm_route(route: &str) -> Option<(String, String)> {
+    if route.is_empty() { return None; }
+    let mut parts = route.splitn(3, '/');
+    let host = parts.next()?.to_string();
+    let farm = parts.next()?.to_string();
+    if host.is_empty() || farm.is_empty() { return None; }
+    Some((host, farm))
+}
+
+/// Compute token short hash for farm logon (FIX tag 8483).
+///
+/// Per ib-agent#125: gateway always emits this as **8 hex chars padded with
+/// leading zeros**. `format!("{:x}", n)` is wrong when `hash_int`'s high
+/// nibble is zero — server silently rejects the FIX 35=A logon in that case.
 pub fn token_short_hash(session_token: &BigUint) -> String {
     let token_bytes = session_token.to_bytes_be();
     let stripped = strip_leading_zeros(&token_bytes);
     let digest = Sha1::digest(stripped);
     // Take last 4 bytes as u32 (Java BigInteger.intValue() truncates to low 32 bits)
     let hash_int = u32::from_be_bytes([digest[16], digest[17], digest[18], digest[19]]);
-    format!("{:x}", hash_int)
+    format!("{:08x}", hash_int)
 }
 
 /// Build auth server logon message.
@@ -70,7 +92,7 @@ pub fn build_ccp_logon(hw_info: &str, encoded: &str, heartbeat: u64, seq: u32) -
     let now = chrono_free_timestamp();
     let tz = "UTC";
     let hb_str = heartbeat.to_string();
-    let hw_field = format!("<{}|127.0.0.1>", hw_info);
+    let hw_field = format!("<{}|{}>", hw_info, session::get_lan_ip());
     fix_build(
         &[
             (fix::TAG_MSG_TYPE, fix::MSG_LOGON),
@@ -96,29 +118,22 @@ pub fn build_ccp_logon(hw_info: &str, encoded: &str, heartbeat: u64, seq: u32) -
 pub fn build_farm_encrypted_logon(
     channel: &mut SecureChannel,
     username: &str,
-    paper: bool,
+    _paper: bool,
     farm_name: &str,
     session_id: &str,
     session_token: &BigUint,
     hw_info: &str,
     encoded: &str,
+    slot: u32,
 ) -> Vec<u8> {
-    let display_name = if paper {
-        format!("S{}", username)
-    } else {
-        username.to_string()
-    };
-    let slot = match farm_name {
-        "usfarm" => 18,
-        _ => 17,
-    };
+    let display_name = format!("S{}", username);
     let farm_id = format!("{}/{}/{}", display_name, slot, farm_name);
     let farm_id_len = farm_id.len().to_string();
     let token_hash = token_short_hash(session_token);
     let ns_range = format!("{}..{}", NS_VERSION_MIN, NS_VERSION);
     let now = chrono_free_timestamp();
     let hb_str = FARM_HEARTBEAT.to_string();
-    let hw_field = format!("<{}|127.0.0.1>", hw_info);
+    let hw_field = format!("<{}|{}>", hw_info, session::get_lan_ip());
 
     let inner = fix_build(
         &[
@@ -140,6 +155,12 @@ pub fn build_farm_encrypted_logon(
         0,
     );
 
+    log::info!(
+        "{} FIX 35=A pre-encrypt ({} bytes): {}",
+        farm_name,
+        inner.len(),
+        String::from_utf8_lossy(&inner).replace('\x01', "|"),
+    );
     let encrypted_raw = channel.encrypt(&inner);
     let b64_str = B64.encode(&encrypted_raw);
 
@@ -341,6 +362,7 @@ pub fn connect_farm(
     session_key: &BigUint,
     hw_info: &str,
     encoded: &str,
+    slot: u32,
 ) -> io::Result<Connection> {
     let port = misc_port();
     let farm_host = farm_host_override().unwrap_or_else(|| host.to_string());
@@ -371,6 +393,9 @@ pub fn connect_farm(
         ));
     }
     channel.process_server_hello(&parts[2..]);
+    // Farm channels HMAC over `ciphertext` only (auth channel uses
+    // `iv || ciphertext`). See ib-agent#126.
+    channel.set_farm_mode(true);
     log::info!("{} key exchange complete", farm_id);
 
     // Encrypted logon
@@ -381,7 +406,7 @@ pub fn connect_farm(
     };
     let logon_bytes = build_farm_encrypted_logon(
         &mut channel, username, paper, farm_id,
-        &farm_session_id, session_key, hw_info, encoded,
+        &farm_session_id, session_key, hw_info, encoded, slot,
     );
     stream.write_all(&logon_bytes)?;
     log::info!("{} encrypted logon sent", farm_id);
@@ -769,6 +794,12 @@ pub struct GatewayConfig {
     /// server-side deadline). Set lower to fail fast for unattended logins.
     /// Only consulted on non-paper logins; paper logins skip the gate entirely.
     pub ib_key_timeout_secs: u64,
+    /// Account-specific second-factor token sub-type used in the SWCR_TOKEN
+    /// state=1 init body (`M.D` field). Default `"2a"` matches the captured
+    /// reference profile; other accounts may use a different value. Capture
+    /// the live value via ib-agent's `SWCR_TOKEN_SUBTYPE` hook if the default
+    /// doesn't trigger the IBKey push for your account.
+    pub ib_key_token_sub_type: String,
 }
 
 impl Gateway {
@@ -884,19 +915,30 @@ impl Gateway {
         // Per-session second-factor approval gate (IBKey / seamless push).
         // Skipped on paper logins; live logins enter a wait state if the
         // account has a second factor configured server-side.
+        // Captures the SOFT session token from AUTH_FINISH PASSED — this is
+        // the token used for downstream farm logons (NOT the SRP session_key).
+        let mut soft_token: Option<BigUint> = None;
         if !config.paper {
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_secs(config.ib_key_timeout_secs);
-            match session::do_ib_key_2fa(&mut tls, &config.username, deadline)? {
+            match session::do_ib_key_2fa(&mut tls, &config.ib_key_token_sub_type, deadline)? {
                 session::IbKeyOutcome::Skipped => {
                     log::info!("2FA gate: skipped (no second factor)");
                 }
-                session::IbKeyOutcome::Approved { approval_url, session_id } => {
+                session::IbKeyOutcome::Approved { approval_url, session_id, soft_token_hex } => {
                     log::info!(
-                        "2FA gate: approved (session_id={}, approval_url={})",
+                        "2FA gate: approved (session_id={}, approval_url={}, token_hex_len={})",
                         if session_id.is_empty() { "<none>" } else { &session_id },
                         if approval_url.is_empty() { "<none>" } else { &approval_url },
+                        soft_token_hex.len(),
                     );
+                    if !soft_token_hex.is_empty() {
+                        if let Some(tok) = BigUint::parse_bytes(soft_token_hex.as_bytes(), 16) {
+                            soft_token = Some(tok);
+                        } else {
+                            log::warn!("2FA gate: SOFT token hex did not parse — falling back to session_key");
+                        }
+                    }
                 }
             }
         }
@@ -983,12 +1025,43 @@ impl Gateway {
         let mut raw_news_providers = String::new();
         let mut white_branding_id = String::new();
         let mut raw_misc_urls = String::new();
+        // Per ib-agent#128: the auth-logon ACK tells us which farms this
+        // account is routed to. Hardcoding `usfarm`/`ushmds` only works for
+        // US accounts; EU accounts need eufarm/euhmds/secdefeu, etc.
+        // Format of 6145: "<host>/<farm>"; 6171/8008: "<host>/<farm>/<port>"
+        let mut trading_route = String::new();    // tag 6145
+        let mut mktdata_route = String::new();    // tag 6171
+        let mut secdef_route  = String::new();    // tag 8008
 
         for _ in 0..5 {
-            let response = fix_read(&mut tls)?;
+            let raw_response = fix_read(&mut tls)?;
+            // The auth-logon ACK arrives as `8=FIXCOMP` with a DEFLATE-
+            // compressed inner body containing the per-account routing tags
+            // (6145/6171/8008) and other init data. Inflate before parsing.
+            // (See ib-agent#128 + #129.)
+            let mut response = raw_response.clone();
+            if raw_response.starts_with(b"8=FIXCOMP\x01") {
+                let inflated_msgs = fixcomp::fixcomp_decompress(&raw_response);
+                let total: usize = inflated_msgs.iter().map(|m| m.len()).sum();
+                log::info!("Auth FIXCOMP envelope: {} bytes compressed → {} inner messages, ~{} inflated bytes",
+                    raw_response.len(), inflated_msgs.len(), total);
+                // Concatenate all inner messages so a single fix_parse pass
+                // sees every tag.
+                response.clear();
+                for inner in inflated_msgs {
+                    response.extend_from_slice(&inner);
+                    response.push(b'\x01');
+                }
+            }
             let fields = fix_parse(&response);
             let msg_type = fields.get(&35).map(|s| s.as_str()).unwrap_or("");
-            log::info!("Auth msg type={}", msg_type);
+            log::info!("Auth msg type={} ({} bytes raw / {} bytes parsed)",
+                msg_type, raw_response.len(), response.len());
+            for tag in [6144u32, 6145, 6146, 6147, 6171, 6172, 8008, 8009, 6160, 6161] {
+                if let Some(v) = fields.get(&tag) {
+                    log::info!("Auth msg type={} tag={}: {:?}", msg_type, tag, v);
+                }
+            }
 
             match msg_type {
                 "3" | "5" => {
@@ -1008,7 +1081,12 @@ impl Gateway {
                 if let Ok(hb) = v.parse() { heartbeat_interval = hb; }
             }
             if let Some(v) = fields.get(&6386) {
-                if ccp_token.is_empty() { ccp_token = v.clone(); }
+                if ccp_token.is_empty() {
+                    ccp_token = v.clone();
+                    log::info!("Auth: captured ccp_token (FIX 6386, len={}, prefix={:?})",
+                        ccp_token.len(),
+                        if ccp_token.len() > 16 { &ccp_token[..16] } else { &ccp_token });
+                }
             }
             // Tag 8035: try parsed fields first, then raw byte search
             if server_session_id.is_empty() {
@@ -1024,6 +1102,28 @@ impl Gateway {
                             ).to_string();
                         }
                     }
+                }
+            }
+
+            // Farm routing (per ib-agent#128) — server tells us which farms
+            // this account is permissioned for. EU accounts get `eufarm`,
+            // US get `usfarm`, etc. Read once from whichever auth msg has it.
+            if let Some(v) = fields.get(&6145) {
+                if trading_route.is_empty() {
+                    trading_route = v.clone();
+                    log::info!("Auth: trading farm route = {}", trading_route);
+                }
+            }
+            if let Some(v) = fields.get(&6171) {
+                if mktdata_route.is_empty() {
+                    mktdata_route = v.clone();
+                    log::info!("Auth: market-data farm route = {}", mktdata_route);
+                }
+            }
+            if let Some(v) = fields.get(&8008) {
+                if secdef_route.is_empty() {
+                    secdef_route = v.clone();
+                    log::info!("Auth: secdef farm route = {}", secdef_route);
                 }
             }
 
@@ -1110,21 +1210,94 @@ impl Gateway {
         tls.flush()?;
         log::info!("Init sequence sent ({} messages, seq now {})", 101, ccp_seq);
 
-        // Drain init responses — extract account ID if found
-        tls.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
+        // Drain init responses — extract account ID + farm routing tags.
+        // The 35=A logon ACK body for live accounts is ~48 kB and arrives in
+        // bursts: per ib-agent#129 the routing tags 6145/6171/8008 sit at byte
+        // offsets ~22000-32000. The previous 3-second timeout was firing
+        // mid-burst and truncating around 29.7 kB, hiding the routing.
+        // Use a longer timeout AND tolerate one spurious idle gap before
+        // declaring the burst complete.
+        tls.get_ref().set_read_timeout(Some(Duration::from_secs(15)))?;
         let mut init_data = Vec::new();
         let mut tmp_buf = vec![0u8; 65536];
+        let mut idle_gaps = 0usize;
         loop {
             match tls.read(&mut tmp_buf) {
                 Ok(0) => break,
-                Ok(n) => init_data.extend_from_slice(&tmp_buf[..n]),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => break,
+                Ok(n) => {
+                    init_data.extend_from_slice(&tmp_buf[..n]);
+                    idle_gaps = 0;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    // Tolerate one timeout if we have less than the
+                    // typical-live-ACK threshold (~40 kB). This catches
+                    // mid-burst pauses without hanging when the server
+                    // genuinely has no more to send (paper accounts emit
+                    // ~30 kB so one spurious gap there is also fine).
+                    idle_gaps += 1;
+                    if idle_gaps >= 2 || init_data.len() >= 60_000 {
+                        break;
+                    }
+                }
                 Err(e) => return Err(e),
             }
         }
-        log::info!("Init response: {} bytes", init_data.len());
+        log::info!("Init response: {} bytes (idle gaps: {})", init_data.len(), idle_gaps);
+
+        // The auth-server's logon ACK arrives DEFLATE-compressed inside one or
+        // more `8=FIXCOMP` envelopes (per ib-agent#129). The compressed body
+        // is ~30 kB on the wire but expands to ~48 kB plaintext containing
+        // the routing tags 6145/6171/8008. Walk the buffer, decompress every
+        // FIXCOMP segment, and concatenate the plaintext with init_data so the
+        // existing tag-scan loop below sees the inflated content.
+        let mut inflated_extra: Vec<u8> = Vec::new();
+        let mut cursor = 0usize;
+        while cursor + 12 < init_data.len() {
+            if init_data[cursor..].starts_with(b"8=FIXCOMP\x01") {
+                if let Some(total_len) = fixcomp::fixcomp_length(&init_data[cursor..]) {
+                    let segment = &init_data[cursor..cursor + total_len.min(init_data.len() - cursor)];
+                    let inflated = fixcomp::fixcomp_decompress(segment);
+                    let inflated_bytes: usize = inflated.iter().map(|m| m.len() + 1).sum();
+                    log::info!(
+                        "Init FIXCOMP segment at offset {}: {} compressed → {} inner messages, ~{} inflated bytes",
+                        cursor, total_len, inflated.len(), inflated_bytes,
+                    );
+                    for inner in inflated {
+                        inflated_extra.extend_from_slice(&inner);
+                        inflated_extra.push(b'\x01');
+                    }
+                    cursor += total_len;
+                    continue;
+                }
+            }
+            cursor += 1;
+        }
+        if !inflated_extra.is_empty() {
+            log::info!("Inflated {} bytes of FIXCOMP content; appending to scan buffer", inflated_extra.len());
+            // TEMP: dump inflated content to disk so we can grep for routing
+            // tags / verify what's actually in the auth-logon ACK body.
+            if let Err(e) = std::fs::write(
+                std::path::Path::new(r"D:\RustroverProjects\ibx\scripts\.tmp\logs\inflated_init.bin"),
+                &inflated_extra,
+            ) {
+                log::warn!("Could not write inflated_init.bin: {}", e);
+            } else {
+                log::info!("Dumped inflated content to scripts/.tmp/logs/inflated_init.bin");
+            }
+            init_data.extend_from_slice(&inflated_extra);
+        }
+
         // Scan init response for account ID and gateway-local init tags
         let init_str = String::from_utf8_lossy(&init_data);
+        // TEMP diagnostic (ib-agent#128 follow-up): log every part containing
+        // "farm" or "hmds" so we can locate the routing tags.
+        for part in init_str.split('\x01') {
+            if part.contains("farm") || part.contains("hmds") || part.contains("secdef") {
+                log::info!("Init scan: routing-shaped part = {:?}", part);
+            }
+        }
         for part in init_str.split('\x01') {
             if part.starts_with("1=") && part.len() > 2 {
                 let val = &part[2..];
@@ -1149,6 +1322,15 @@ impl Gateway {
             } else if part.starts_with("6321=") && raw_misc_urls.is_empty() {
                 raw_misc_urls = part[5..].to_string();
                 log::info!("Found misc URLs from init response ({} bytes)", raw_misc_urls.len());
+            } else if part.starts_with("6145=") && trading_route.is_empty() {
+                trading_route = part[5..].to_string();
+                log::info!("Found trading farm route in init response: {}", trading_route);
+            } else if part.starts_with("6171=") && mktdata_route.is_empty() {
+                mktdata_route = part[5..].to_string();
+                log::info!("Found market-data farm route in init response: {}", mktdata_route);
+            } else if part.starts_with("8008=") && secdef_route.is_empty() {
+                secdef_route = part[5..].to_string();
+                log::info!("Found secdef farm route in init response: {}", secdef_route);
             }
         }
         tls.get_ref().set_read_timeout(None)?;
@@ -1176,24 +1358,49 @@ impl Gateway {
         // Secondary farms (cashfarm, usfuture, eufarm, jfarm) connect via background
         // threads so the hot loop can start immediately and service heartbeats on
         // already-connected farms without starvation.
-        let (farm_conn, hmds_conn) =
-            std::thread::scope(|s| {
-                let farm_h = s.spawn(|| connect_farm(
-                    host, "usfarm", &config.username, &config.password, config.paper,
-                    &server_session_id, &session_key, &hw_info, &encoded,
-                ));
-                let hmds_h = s.spawn(|| connect_farm(
-                    host, "ushmds", &config.username, &config.password, config.paper,
-                    &server_session_id, &session_key, &hw_info, &encoded,
-                ));
+        // Per ib-agent#133: the SOFT token is `SHA1(strip(K_srp))`, computed
+        // client-side. Paper accounts receive the pre-hashed token via the XYZ
+        // AUTH_FINISH(771) state=5 side channel; live accounts have no side
+        // channel and must recompute. (Tag 6386 is an S3 object key, not a
+        // token source.)
+        let farm_token: BigUint = soft_token.clone()
+            .unwrap_or_else(|| {
+                let k_bytes = session_key.to_bytes_be();
+                let stripped = strip_leading_zeros(&k_bytes);
+                let soft_bytes = Sha1::digest(stripped);
+                log::info!("Farm token: derived SOFT = SHA1(strip(K)) ({} bytes)",
+                    soft_bytes.len());
+                BigUint::from_bytes_be(&soft_bytes)
+            });
+        // Per ib-agent#128: read the farm names from the auth-server's
+        // routing tags rather than hardcoding `usfarm`/`ushmds`. EU accounts
+        // are routed to `eufarm`/`euhmds`/`secdefeu`, US to `usfarm`/`ushmds`,
+        // etc. Format of the route strings:
+        //   trading (6145):  "<host>/<farm>"            (port from tag 6146, default 4000)
+        //   mktdata (6171):  "<host>/<farm>/<port>"
+        //   secdef  (8008):  "<host>/<farm>/<port>"
+        let (trading_host, trading_farm) = parse_farm_route(&trading_route)
+            .unwrap_or_else(|| (host.to_string(), "usfarm".to_string()));
+        let (mktdata_host, mktdata_farm) = parse_farm_route(&mktdata_route)
+            .map(|(h, f)| (h, f))
+            .unwrap_or_else(|| (host.to_string(), "ushmds".to_string()));
+        log::info!("Farm routing: trading={}/{}, mktdata={}/{}",
+            trading_host, trading_farm, mktdata_host, mktdata_farm);
 
-                let farm_conn = farm_h.join().unwrap()?;
-                let hmds_conn = match hmds_h.join().unwrap() {
-                    Ok(c) => { log::info!("Historical data farm connected"); Some(c) }
-                    Err(e) => { log::warn!("Historical data farm connection failed (non-fatal): {}", e); None }
-                };
-                Ok::<_, io::Error>((farm_conn, hmds_conn))
-            })?;
+        // Serialize farm logons (avoids any "competing login" rejection
+        // the live server may emit; paper tolerates parallelism but serial
+        // is harmless there).
+        let farm_conn = connect_farm(
+            &trading_host, &trading_farm, &config.username, &config.password,
+            config.paper, &server_session_id, &farm_token, &hw_info, &encoded, 18,
+        )?;
+        let hmds_conn = match connect_farm(
+            &mktdata_host, &mktdata_farm, &config.username, &config.password,
+            config.paper, &server_session_id, &farm_token, &hw_info, &encoded, 17,
+        ) {
+            Ok(c) => { log::info!("Historical data farm connected"); Some(c) }
+            Err(e) => { log::warn!("Historical data farm connection failed (non-fatal): {}", e); None }
+        };
 
         // Spawn deferred connection threads for secondary farms.
         let mut pending_secondary = Vec::new();
@@ -1204,14 +1411,14 @@ impl Gateway {
             let p = config.password.clone();
             let paper = config.paper;
             let ssid = server_session_id.clone();
-            let skey = session_key.clone();
+            let skey = farm_token.clone();
             let hw = hw_info.clone();
             let enc = encoded.clone();
             let farm = farm_id.to_string();
             if let Err(e) = std::thread::Builder::new()
                 .name(format!("{}-connect", farm_id))
                 .spawn(move || {
-                    let _ = tx.send(connect_farm(&h, &farm, &u, &p, paper, &ssid, &skey, &hw, &enc));
+                    let _ = tx.send(connect_farm(&h, &farm, &u, &p, paper, &ssid, &skey, &hw, &enc, 18));
                 }) {
                 log::warn!("{} connection thread spawn failed: {}", farm_id, e);
             }
@@ -1475,6 +1682,56 @@ mod tests {
         assert_ne!(token_short_hash(&t1), token_short_hash(&t2));
     }
 
+    /// Oracle from ib-agent#131 — captured live session.
+    /// Confirms `token_short_hash` is byte-correct against the Java reference:
+    /// `SHA1(strip(token)).intValue() & 0xFFFFFFFF` formatted as 8 hex chars.
+    #[test]
+    fn token_short_hash_matches_live_oracle() {
+        let token_bytes = hex::decode("00000000000000000000000000000000000000aa").unwrap();
+        let token = BigUint::from_bytes_be(&token_bytes);
+        assert_eq!(token_short_hash(&token), "22103688");
+    }
+
+    #[test]
+    fn parse_farm_route_two_segments() {
+        let parsed = parse_farm_route("zdc1.ibllc.com/eufarm").unwrap();
+        assert_eq!(parsed, ("zdc1.ibllc.com".to_string(), "eufarm".to_string()));
+    }
+
+    #[test]
+    fn parse_farm_route_three_segments_drops_port() {
+        let parsed = parse_farm_route("zdc1.ibllc.com/euhmds/4000").unwrap();
+        assert_eq!(parsed, ("zdc1.ibllc.com".to_string(), "euhmds".to_string()));
+    }
+
+    #[test]
+    fn parse_farm_route_us_account() {
+        let parsed = parse_farm_route("cdc1.ibllc.com/usfarm").unwrap();
+        assert_eq!(parsed, ("cdc1.ibllc.com".to_string(), "usfarm".to_string()));
+    }
+
+    #[test]
+    fn parse_farm_route_rejects_empty_and_malformed() {
+        assert_eq!(parse_farm_route(""), None);
+        assert_eq!(parse_farm_route("nofarm.example.com"), None);
+        assert_eq!(parse_farm_route("/farm"), None);
+        assert_eq!(parse_farm_route("host/"), None);
+    }
+
+    #[test]
+    fn token_short_hash_always_8_chars() {
+        // Per ib-agent#125: gateway pads to 8 hex chars. Brute-force search
+        // over small inputs to find one whose SHA1 ends in a high-nibble
+        // zero, then assert padding kicks in.
+        for n in 0u64..10_000 {
+            let token = BigUint::from(n);
+            let h = token_short_hash(&token);
+            assert_eq!(h.len(), 8,
+                "token_short_hash must always be 8 chars; n={n} produced {h:?}");
+            assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
     #[test]
     fn build_ccp_logon_structure() {
         let msg = build_ccp_logon("abc123|00:00:00:00:00:00", "17.0.10.0.101/W/en/G", 10, 1);
@@ -1732,6 +1989,7 @@ mod tests {
             paper: true,
             accept_invalid_certs: false,
             ib_key_timeout_secs: session::IB_KEY_DEFAULT_TIMEOUT_SECS,
+            ib_key_token_sub_type: session::IB_KEY_DEFAULT_TOKEN_SUB_TYPE.into(),
         };
         assert_eq!(config.username, "user");
         assert!(config.paper);

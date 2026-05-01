@@ -26,6 +26,9 @@ pub struct SecureChannel {
     read_iv: Option<Vec<u8>>,
     write_mac_key: Option<Vec<u8>>,
     read_mac_key: Option<Vec<u8>>,
+    /// Per ib-agent#126, farm channels HMAC over `ciphertext` only;
+    /// the auth channel HMACs over `iv || ciphertext`. Default false (auth).
+    farm_mode: bool,
 }
 
 impl SecureChannel {
@@ -56,6 +59,7 @@ impl SecureChannel {
             read_iv: None,
             write_mac_key: None,
             read_mac_key: None,
+            farm_mode: false,
         }
     }
 
@@ -129,6 +133,14 @@ impl SecureChannel {
         self.key_block = Some(key_block);
     }
 
+    /// Switch the channel to farm-channel HMAC semantics.
+    /// Auth-channel default: HMAC over `iv || ciphertext`. Farm channels per
+    /// ib-agent#126: HMAC over `ciphertext` only. Set this immediately after
+    /// key derivation on per-farm channels.
+    pub fn set_farm_mode(&mut self, on: bool) {
+        self.farm_mode = on;
+    }
+
     /// Encrypt plaintext using Encrypt-then-MAC.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Vec<u8> {
         let aes_key = self.write_aes_key.as_ref().unwrap();
@@ -138,13 +150,18 @@ impl SecureChannel {
         // AES-CBC encrypt with PKCS7
         let ciphertext = aes_cbc_encrypt(aes_key, iv, plaintext);
 
-        // MAC over IV + ciphertext
-        let mut mac_input = Vec::with_capacity(iv.len() + ciphertext.len());
-        mac_input.extend_from_slice(iv);
-        mac_input.extend_from_slice(&ciphertext);
-        let mac = hmac_sha1(mac_key, &mac_input);
+        // HMAC-SHA1: farm channels hash ciphertext only; auth channel hashes
+        // iv || ciphertext (see ib-agent#126).
+        let mac = if self.farm_mode {
+            hmac_sha1(mac_key, &ciphertext)
+        } else {
+            let mut mac_input = Vec::with_capacity(iv.len() + ciphertext.len());
+            mac_input.extend_from_slice(iv);
+            mac_input.extend_from_slice(&ciphertext);
+            hmac_sha1(mac_key, &mac_input)
+        };
 
-        // Update IV to last ciphertext block
+        // CBC chaining: next message's IV = last 16 bytes of THIS ciphertext.
         self.write_iv = Some(ciphertext[ciphertext.len() - 16..].to_vec());
 
         let mut result = ciphertext;
@@ -163,11 +180,14 @@ impl SecureChannel {
         let iv = self.read_iv.as_ref().unwrap();
         let mac_key = self.read_mac_key.as_ref().unwrap();
 
-        // Verify MAC over IV + ciphertext
-        let mut mac_input = Vec::with_capacity(iv.len() + ciphertext.len());
-        mac_input.extend_from_slice(iv);
-        mac_input.extend_from_slice(ciphertext);
-        let expected_mac = hmac_sha1(mac_key, &mac_input);
+        let expected_mac = if self.farm_mode {
+            hmac_sha1(mac_key, ciphertext)
+        } else {
+            let mut mac_input = Vec::with_capacity(iv.len() + ciphertext.len());
+            mac_input.extend_from_slice(iv);
+            mac_input.extend_from_slice(ciphertext);
+            hmac_sha1(mac_key, &mac_input)
+        };
 
         if received_mac != expected_mac {
             return Err("HMAC verification failed");
@@ -176,7 +196,7 @@ impl SecureChannel {
         let aes_key = self.read_aes_key.as_ref().unwrap();
         let plaintext = aes_cbc_decrypt(aes_key, iv, ciphertext)?;
 
-        // Update IV to last ciphertext block
+        // CBC chaining: next message's IV = last 16 bytes of THIS ciphertext.
         self.read_iv = Some(ciphertext[ciphertext.len() - 16..].to_vec());
 
         Ok(plaintext)
@@ -191,10 +211,8 @@ impl SecureChannel {
 
         let ciphertext = aes_cbc_encrypt(aes_key, iv, plaintext);
 
-        let mut mac_input = Vec::with_capacity(16 + ciphertext.len());
-        mac_input.extend_from_slice(iv);
-        mac_input.extend_from_slice(&ciphertext);
-        let mac = hmac_sha1(mac_key, &mac_input);
+        // HMAC-SHA1 over ciphertext only (#126).
+        let mac = hmac_sha1(mac_key, &ciphertext);
 
         let mut result = ciphertext;
         result.extend_from_slice(&mac);
@@ -234,6 +252,7 @@ mod tests {
             read_iv: Some(vec![0u8; 16]),
             write_mac_key: Some(vec![0u8; 20]),
             read_mac_key: Some(vec![0u8; 20]),
+            farm_mode: false,
         };
         // Set key_block for encrypt_fresh
         let mut kb = vec![0u8; 104];

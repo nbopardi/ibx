@@ -93,7 +93,7 @@ impl EClient {
     }
 
     /// Connect to IB and start the engine.
-    #[pyo3(signature = (host="cdc1.ibllc.com".to_string(), port=0, client_id=0, username="".to_string(), password="".to_string(), paper=true, core_id=None))]
+    #[pyo3(signature = (host="cdc1.ibllc.com".to_string(), port=0, client_id=0, username="".to_string(), password="".to_string(), paper=true, core_id=None, ib_key_timeout_secs=None, ib_key_token_sub_type=None))]
     fn connect(
         &self,
         py: Python<'_>,
@@ -104,6 +104,8 @@ impl EClient {
         password: String,
         paper: bool,
         core_id: Option<usize>,
+        ib_key_timeout_secs: Option<u64>,
+        ib_key_token_sub_type: Option<String>,
     ) -> PyResult<()> {
         if self.connected.load(Ordering::Relaxed) {
             return Err(PyRuntimeError::new_err("Already connected"));
@@ -115,7 +117,10 @@ impl EClient {
             host,
             paper,
             accept_invalid_certs: false,
-            ib_key_timeout_secs: crate::auth::session::IB_KEY_DEFAULT_TIMEOUT_SECS,
+            ib_key_timeout_secs: ib_key_timeout_secs
+                .unwrap_or(crate::auth::session::IB_KEY_DEFAULT_TIMEOUT_SECS),
+            ib_key_token_sub_type: ib_key_token_sub_type
+                .unwrap_or_else(|| crate::auth::session::IB_KEY_DEFAULT_TOKEN_SUB_TYPE.into()),
         };
 
         let result = py.allow_threads(|| Gateway::connect(&config));

@@ -94,15 +94,114 @@ pub fn get_session_id() -> String {
     format!("{:x}.{:04x}", secs, ms)
 }
 
+/// Path of the persistent 8-hex machine_id file used in tag 6351.
+///
+/// Per ib-agent#132: the Java client reads/creates `%USERPROFILE%\hwid`
+/// on Windows or `$HOME/.hwid` elsewhere, persists 8 hex chars there, and
+/// reuses it across logons. IB binds that prefix to the IBKey enrollment
+/// at first-login time; live farms silent-drop logons whose prefix isn't
+/// in the registered set.
+///
+/// Override with the `IBX_HWID_PATH` env var to point elsewhere (containers,
+/// CI, sharing one cookie across multiple machines, etc.).
+fn hwid_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("IBX_HWID_PATH") {
+        return std::path::PathBuf::from(p);
+    }
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    if cfg!(windows) {
+        home.join("hwid")
+    } else {
+        home.join(".hwid")
+    }
+}
+
+/// Read the existing 8-hex machine_id, or generate+persist a fresh one.
+///
+/// `IBX_HWID` env var, if set to a hex string, short-circuits the file lookup
+/// and is used verbatim (left-padded to 8 chars). Useful for one-shot scripts
+/// or when injecting an already-enrolled cookie via secrets management.
+fn read_or_create_hwid() -> String {
+    if let Ok(v) = std::env::var("IBX_HWID") {
+        let v = v.trim();
+        if !v.is_empty() && v.chars().all(|c| c.is_ascii_hexdigit()) {
+            return format!("{:0>8}", v);
+        }
+    }
+    let path = hwid_path();
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let s = s.trim();
+        if !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit()) {
+            return format!("{:0>8}", s);
+        }
+    }
+    let mut buf = [0u8; 4];
+    rand::rng().fill_bytes(&mut buf);
+    let new_hwid = format!("{:08x}", u32::from_be_bytes(buf));
+    let _ = std::fs::write(&path, &new_hwid);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444));
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("attrib")
+            .args(["+H", "+R"])
+            .arg(&path)
+            .status();
+    }
+    new_hwid
+}
+
 /// Generate hardware info string: `{machine_id}|{MAC}`.
+///
+/// Live data farms validate the MAC field; an all-zero MAC causes the FIX
+/// 35=A logon to be silently rejected (paper farms don't validate).
+/// `machine_id` is the persistent 8-hex value from `~/hwid` (see #132).
 pub fn get_hw_info() -> String {
-    let machine_id = {
-        let mut buf = [0u8; 4];
-        rand::rng().fill_bytes(&mut buf);
-        hex::encode(buf)
+    let machine_id = read_or_create_hwid();
+    let mac = first_real_mac().unwrap_or_else(|| "00:00:00:00:00:00".to_string());
+    format!("{}|{}", machine_id, mac)
+}
+
+/// Probe the OS for the first non-zero MAC address. Returns `None` if no NIC
+/// has a usable MAC (e.g. no networking, all interfaces virtual).
+fn first_real_mac() -> Option<String> {
+    let all = mac_address::MacAddressIterator::new().ok()?;
+    for mac in all {
+        let bytes = mac.bytes();
+        if bytes.iter().any(|&b| b != 0) {
+            return Some(format!(
+                "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+            ));
+        }
+    }
+    None
+}
+
+/// Discover the local LAN IP that would route to the public internet.
+/// Returns "127.0.0.1" if no external route is configured.
+///
+/// Uses the standard `UdpSocket::connect` trick: connecting a UDP socket to
+/// a public address doesn't send any packets, but lets the OS pick the
+/// outbound interface, exposed via `local_addr()`.
+pub fn get_lan_ip() -> String {
+    use std::net::UdpSocket;
+    let sock = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(_) => return "127.0.0.1".into(),
     };
-    // Use a deterministic fallback MAC — real implementation would probe NIC
-    format!("{}|00:00:00:00:00:00", machine_id)
+    if sock.connect("8.8.8.8:80").is_err() {
+        return "127.0.0.1".into();
+    }
+    sock.local_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| "127.0.0.1".into())
 }
 
 /// Send an encrypted protocol message.
@@ -450,12 +549,18 @@ pub enum IbKeyOutcome {
     /// Server bypassed the second-factor gate (no second factor configured for
     /// this account, or the server short-circuited to PASSED on its own).
     Skipped,
-    /// User approved on their device. The optional fields carry information
-    /// the server emitted in the SWCR_TOKEN state=2 reply, useful for surfacing
-    /// "tap your phone (or open this URL)" prompts to the caller.
+    /// User approved on their device.
     Approved {
+        /// URL the IBKey app posts to when the user approves; useful for
+        /// "tap your phone (or open this URL)" prompts.
         approval_url: String,
+        /// Per-session 6-digit identifier the user can verify visually.
         session_id: String,
+        /// SOFT session token issued by `XYZ AUTH_FINISH(771) state=5 PASSED`,
+        /// hex-encoded. This is the token that downstream farm logons must
+        /// hash for tag 8483 (NOT the SRP-derived `session_key`). Empty if the
+        /// AUTH_FINISH body didn't carry an extractable token.
+        soft_token_hex: String,
     },
 }
 
@@ -465,9 +570,20 @@ fn ib_key_err(kind: io::ErrorKind, msg: impl Into<String>) -> io::Error {
     io::Error::new(kind, msg.into())
 }
 
+/// Compact hex dump for diagnostic logging.
+fn hex_dump(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+}
+
 /// Default deadline for the second-factor gate, matching the server-side
 /// timeout measured in capture run B (~18 min).
 pub const IB_KEY_DEFAULT_TIMEOUT_SECS: u64 = 1080;
+
+/// Default IBKey token sub-type used in the SWCR_TOKEN state=1 body. Matches
+/// the captured reference profile in ib-agent#123. Some accounts/SWCR
+/// configurations require a different value — override via
+/// [`crate::gateway::GatewayConfig::ib_key_token_sub_type`].
+pub const IB_KEY_DEFAULT_TOKEN_SUB_TYPE: &str = "2a";
 
 /// Cadence at which the server probes during the wait window.
 const IB_KEY_HEARTBEAT_CADENCE_SECS: u64 = 20;
@@ -492,19 +608,27 @@ const IB_KEY_HEARTBEAT_CADENCE_SECS: u64 = 20;
 /// state=2.)
 pub fn do_ib_key_2fa<S: Read + Write>(
     stream: &mut S,
-    username: &str,
+    token_sub_type: &str,
     deadline: std::time::Instant,
 ) -> io::Result<IbKeyOutcome> {
     use std::time::Instant;
 
-    // Send SWCR_TOKEN state=1 (username only).
-    let init = xyz::xyz_build_swcr_token_init(username);
-    stream.write_all(&xyz::xyz_wrap(&init))?;
-    log::info!("2FA gate: sent SWCR_TOKEN state=1");
+    // Send SWCR_TOKEN state=1. The username slot is empty in state=1; the
+    // tokenSubType (account-specific, typically "2a") is the only non-empty
+    // body field. See ib-agent#123 for the canonical wire layout.
+    let init = xyz::xyz_build_swcr_token_init(token_sub_type);
+    let framed = xyz::xyz_wrap(&init);
+    stream.write_all(&framed)?;
+    log::info!(
+        "2FA gate: sent SWCR_TOKEN state=1 ({} bytes inner, {} bytes framed)",
+        init.len(), framed.len(),
+    );
+    log::debug!("2FA gate: SWCR_TOKEN bytes (framed) = {}", hex_dump(&framed));
 
     let mut approval_url = String::new();
     let mut session_id = String::new();
     let mut announced_wait = false;
+    let mut saw_challenge = false;
 
     loop {
         if Instant::now() >= deadline {
@@ -520,16 +644,28 @@ pub fn do_ib_key_2fa<S: Read + Write>(
                 || e.kind() == io::ErrorKind::ConnectionReset
                 || e.kind() == io::ErrorKind::ConnectionAborted =>
             {
-                return Err(ib_key_err(
-                    io::ErrorKind::ConnectionAborted,
-                    "2FA approval timed out (server closed socket)",
-                ));
+                // Server closed the socket. Two distinct cases:
+                //   - We never received state=2: server rejected the SWCR_TOKEN
+                //     init, the account doesn't have IBKey enabled, or the wire
+                //     format is wrong. Fast (seconds).
+                //   - We received state=2 then got socket-close: the real ~18 min
+                //     server-side approval deadline fired (see ib-agent#76).
+                let msg = if saw_challenge {
+                    "2FA approval timed out (server closed socket; ~18 min server-side deadline)"
+                } else {
+                    "2FA gate: server closed socket before issuing a challenge — \
+                     likely the account doesn't have IBKey 2FA enabled, or the \
+                     server rejected the SWCR_TOKEN format. (Set RUST_LOG=info \
+                     for stage-by-stage logs.)"
+                };
+                return Err(ib_key_err(io::ErrorKind::ConnectionAborted, msg));
             }
             Err(e) => return Err(e),
         };
 
         match recv {
             RecvMsg::Xyz { msg_id, state, fields, .. } if msg_id == xyz::XYZ_MSG_SWCR_TOKEN && state == 2 => {
+                saw_challenge = true;
                 let challenge = xyz::parse_swcr_token_challenge(&fields);
                 approval_url = challenge.approval_url;
                 session_id = challenge.session_id;
@@ -543,14 +679,34 @@ pub fn do_ib_key_2fa<S: Read + Write>(
                 }
             }
             RecvMsg::Xyz { msg_id, state, fields, .. } if msg_id == xyz::XYZ_MSG_TOKEN_AUTH && state == 5 => {
-                let result = fields.iter().rev().find(|s| !s.is_empty()).map(|s| s.as_str()).unwrap_or("");
-                if result.eq_ignore_ascii_case("PASSED") {
+                // Look for "PASSED" sentinel and the SOFT token (long hex string).
+                let mut passed = false;
+                let mut soft_token_hex = String::new();
+                for f in &fields {
+                    if f.eq_ignore_ascii_case("PASSED") { passed = true; }
+                    else if f.len() >= 32 && f.chars().all(|c| c.is_ascii_hexdigit())
+                        && soft_token_hex.is_empty()
+                    {
+                        soft_token_hex = f.clone();
+                    }
+                }
+                if passed {
                     log::info!("2FA gate: approved");
-                    if approval_url.is_empty() && session_id.is_empty() {
+                    // Per ib-agent#125: AUTH_FINISH carries no token — body is
+                    // just `["", "PASSED"]`. The SOFT token used for downstream
+                    // farm logons (tag 8483) is the SRP-derived K_soft, which
+                    // ibx already computes correctly via `srp_compute_k`
+                    // (= SHA1(strip_leading_zeros(S))). No extraction needed.
+                    if approval_url.is_empty() && session_id.is_empty()
+                        && soft_token_hex.is_empty()
+                    {
                         return Ok(IbKeyOutcome::Skipped);
                     }
-                    return Ok(IbKeyOutcome::Approved { approval_url, session_id });
+                    return Ok(IbKeyOutcome::Approved {
+                        approval_url, session_id, soft_token_hex,
+                    });
                 }
+                let result = fields.iter().rev().find(|s| !s.is_empty()).map(|s| s.as_str()).unwrap_or("");
                 return Err(ib_key_err(
                     io::ErrorKind::PermissionDenied,
                     format!("2FA approval rejected: {}", result),
@@ -847,12 +1003,25 @@ mod tests {
     }
 
     #[test]
-    fn hw_info_mac_always_zeroed() {
-        for _ in 0..5 {
-            let info = get_hw_info();
-            let mac = info.split('|').nth(1).unwrap();
-            assert_eq!(mac, "00:00:00:00:00:00");
+    fn hw_info_mac_format_is_six_hex_octets() {
+        let info = get_hw_info();
+        let mac = info.split('|').nth(1).unwrap();
+        let octets: Vec<&str> = mac.split(':').collect();
+        assert_eq!(octets.len(), 6, "MAC must be 6 colon-separated octets, got {mac:?}");
+        for o in &octets {
+            assert_eq!(o.len(), 2);
+            assert!(o.chars().all(|c| c.is_ascii_hexdigit()), "non-hex octet {o:?}");
         }
+        // Either a real NIC MAC, or the documented zero fallback when no NIC
+        // exposes one (e.g. CI runners with no networking).
+    }
+
+    #[test]
+    fn lan_ip_returns_a_valid_ipv4_or_loopback_fallback() {
+        let ip = get_lan_ip();
+        // Either a routable address or the documented loopback fallback.
+        let parsed: Result<std::net::IpAddr, _> = ip.parse();
+        assert!(parsed.is_ok(), "get_lan_ip returned non-parseable address {ip:?}");
     }
 
     // ── extract_srp_data ────────────────────────────────────────────────
@@ -1168,15 +1337,18 @@ mod tests {
         // no SWCR_TOKEN(state=2) preceded it, so this is the no-2FA fast path.
         let auth_finish = xyz::xyz_build(xyz::XYZ_MSG_TOKEN_AUTH, 5, "user", &["PASSED"]);
         let mut stream = ScriptedStream::new(frame_xyz(&auth_finish));
-        let outcome = do_ib_key_2fa(&mut stream, "user", far_future_deadline()).unwrap();
+        let outcome = do_ib_key_2fa(&mut stream, "2a", far_future_deadline()).unwrap();
         assert_eq!(outcome, IbKeyOutcome::Skipped);
 
-        // Verify we sent the SWCR_TOKEN init.
+        // Verify we sent the SWCR_TOKEN init carrying the tokenSubType.
         let written_payload = &stream.written[8..]; // skip NS frame header
         let (msg_id, _, state, fields) = xyz::xyz_parse_response(written_payload).unwrap();
         assert_eq!(msg_id, xyz::XYZ_MSG_SWCR_TOKEN);
         assert_eq!(state, 1);
-        assert_eq!(fields[0], "user");
+        // Per the canonical layout (see ib-agent#123), tokenSubType is the
+        // last (and only non-empty) string field; preceding slots are empty.
+        assert_eq!(fields.last().map(|s| s.as_str()), Some("2a"),
+            "tokenSubType must be the last field; got {:?}", fields);
     }
 
     #[test]
@@ -1193,11 +1365,12 @@ mod tests {
         incoming.extend_from_slice(&frame_xyz(&auth_finish));
         let mut stream = ScriptedStream::new(incoming);
 
-        let outcome = do_ib_key_2fa(&mut stream, "user", far_future_deadline()).unwrap();
+        let outcome = do_ib_key_2fa(&mut stream, "2a", far_future_deadline()).unwrap();
         match outcome {
-            IbKeyOutcome::Approved { approval_url, session_id } => {
+            IbKeyOutcome::Approved { approval_url, session_id, soft_token_hex } => {
                 assert_eq!(approval_url, "https://www.example.com/seamless?S=YWJjZA==");
                 assert_eq!(session_id, "580 820");
+                let _ = soft_token_hex;
             }
             other => panic!("expected Approved, got {:?}", other),
         }
@@ -1220,7 +1393,7 @@ mod tests {
         incoming.extend_from_slice(&frame_xyz(&auth_finish));
         let mut stream = ScriptedStream::new(incoming);
 
-        let outcome = do_ib_key_2fa(&mut stream, "user", far_future_deadline()).unwrap();
+        let outcome = do_ib_key_2fa(&mut stream, "2a", far_future_deadline()).unwrap();
         assert!(matches!(outcome, IbKeyOutcome::Approved { .. }));
 
         // The captured write stream contains: SWCR_TOKEN init, then HEART_BEAT.
@@ -1247,17 +1420,34 @@ mod tests {
     #[test]
     fn ib_key_2fa_socket_close_during_wait_is_aborted() {
         // Server sends state=2 then closes the socket — the ~18 min server-side
-        // deadline. The function must surface this as ConnectionAborted, not a
-        // generic IO error.
+        // deadline. The function must surface this as ConnectionAborted with
+        // the long-deadline message (saw_challenge=true).
         let challenge = xyz::xyz_build(xyz::XYZ_MSG_SWCR_TOKEN, 2, "user", &[
             "e7429fde5b4c26f81fff956be6749908a8653558e7429fde5b4c26f81fff956b",
             "580 820",
             "https://x.example/u",
         ]);
         let mut stream = ScriptedStream::new(frame_xyz(&challenge));
-        let err = do_ib_key_2fa(&mut stream, "user", far_future_deadline()).unwrap_err();
+        let err = do_ib_key_2fa(&mut stream, "2a", far_future_deadline()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
-        assert!(err.to_string().contains("server closed socket"));
+        assert!(err.to_string().contains("18 min server-side deadline"),
+            "expected the long-deadline message; got {}", err);
+    }
+
+    #[test]
+    fn ib_key_2fa_socket_close_before_challenge_says_likely_rejection() {
+        // Server closes the socket immediately after our SWCR_TOKEN init —
+        // no challenge ever arrived. The diagnostic message must NOT blame
+        // the 18 min deadline (which would mislead users into "approve faster"
+        // when the real fix is "your account doesn't use IBKey").
+        let mut stream = ScriptedStream::new(Vec::new());
+        let err = do_ib_key_2fa(&mut stream, "2a", far_future_deadline()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        let msg = err.to_string();
+        assert!(msg.contains("before issuing a challenge"),
+            "expected rejection-style message; got {}", msg);
+        assert!(!msg.contains("18 min"),
+            "must not mention the 18 min deadline when no challenge was seen; got {}", msg);
     }
 
     #[test]
@@ -1265,7 +1455,7 @@ mod tests {
         // Server replies AUTH_FINISH state=5 but payload says FAILED — denial.
         let auth_finish = xyz::xyz_build(xyz::XYZ_MSG_TOKEN_AUTH, 5, "user", &["FAILED"]);
         let mut stream = ScriptedStream::new(frame_xyz(&auth_finish));
-        let err = do_ib_key_2fa(&mut stream, "user", far_future_deadline()).unwrap_err();
+        let err = do_ib_key_2fa(&mut stream, "2a", far_future_deadline()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(err.to_string().contains("rejected"));
     }
