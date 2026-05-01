@@ -10,6 +10,7 @@ fn config() -> GatewayConfig {
         host: std::env::var("IB_HOST").unwrap_or_else(|_| "cdc1.ibllc.com".to_string()),
         paper: true,
         accept_invalid_certs: false,
+        ib_key_timeout_secs: ibx::auth::session::IB_KEY_DEFAULT_TIMEOUT_SECS,
     }
 }
 

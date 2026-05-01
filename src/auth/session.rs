@@ -202,6 +202,7 @@ pub fn recv_msg<R: Read>(stream: &mut R) -> io::Result<RecvMsg> {
 }
 
 /// Classified received message.
+#[derive(Debug)]
 pub enum RecvMsg {
     Ns {
         version: u32,
@@ -440,6 +441,142 @@ fn extract_xyz(msg: &[u8]) -> &[u8] {
         &msg[idx + marker.len()..]
     } else {
         msg
+    }
+}
+
+/// Outcome of the per-session second-factor approval gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IbKeyOutcome {
+    /// Server bypassed the second-factor gate (no second factor configured for
+    /// this account, or the server short-circuited to PASSED on its own).
+    Skipped,
+    /// User approved on their device. The optional fields carry information
+    /// the server emitted in the SWCR_TOKEN state=2 reply, useful for surfacing
+    /// "tap your phone (or open this URL)" prompts to the caller.
+    Approved {
+        approval_url: String,
+        session_id: String,
+    },
+}
+
+/// Errors specific to the second-factor approval gate. Wrapped into
+/// `io::Error` so the call site can stay uniform.
+fn ib_key_err(kind: io::ErrorKind, msg: impl Into<String>) -> io::Error {
+    io::Error::new(kind, msg.into())
+}
+
+/// Default deadline for the second-factor gate, matching the server-side
+/// timeout measured in capture run B (~18 min).
+pub const IB_KEY_DEFAULT_TIMEOUT_SECS: u64 = 1080;
+
+/// Cadence at which the server probes during the wait window.
+const IB_KEY_HEARTBEAT_CADENCE_SECS: u64 = 20;
+
+/// Execute the second-factor approval gate that follows SRP on a live login.
+///
+/// Sends `XYZ_MSG_SWCR_TOKEN` state=1 carrying the username, then loops over
+/// inbound messages until one of:
+///
+/// 1. `XYZ_MSG_TOKEN_AUTH` (771) state=5 with `PASSED` arrives → user approved
+/// 2. `XYZ_MSG_SWCR_TOKEN` (775) state=2 arrives → wait state, capture
+///    `approval_url` / `session_id`, keep looping
+/// 3. An `NS_TEST_REQUEST` (530) arrives → reply with `NS_HEART_BEAT` (531),
+///    keep looping
+/// 4. `deadline` expires → `TimedOut` error
+/// 5. Underlying socket close → `ConnectionAborted` error (server's deadline)
+///
+/// If the server jumps straight to a non-XYZ NS message (e.g. CONNECT_RESPONSE),
+/// returns `Skipped` and logs the path — the unread NS message is then handled
+/// by the post-auth loop. (We can't `unread`, so this branch is reached only
+/// when the very first reply is XYZ AUTH_FINISH PASSED with no preceding
+/// state=2.)
+pub fn do_ib_key_2fa<S: Read + Write>(
+    stream: &mut S,
+    username: &str,
+    deadline: std::time::Instant,
+) -> io::Result<IbKeyOutcome> {
+    use std::time::Instant;
+
+    // Send SWCR_TOKEN state=1 (username only).
+    let init = xyz::xyz_build_swcr_token_init(username);
+    stream.write_all(&xyz::xyz_wrap(&init))?;
+    log::info!("2FA gate: sent SWCR_TOKEN state=1");
+
+    let mut approval_url = String::new();
+    let mut session_id = String::new();
+    let mut announced_wait = false;
+
+    loop {
+        if Instant::now() >= deadline {
+            return Err(ib_key_err(
+                io::ErrorKind::TimedOut,
+                "2FA approval timed out (client deadline)",
+            ));
+        }
+
+        let recv = match recv_msg(stream) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof
+                || e.kind() == io::ErrorKind::ConnectionReset
+                || e.kind() == io::ErrorKind::ConnectionAborted =>
+            {
+                return Err(ib_key_err(
+                    io::ErrorKind::ConnectionAborted,
+                    "2FA approval timed out (server closed socket)",
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+
+        match recv {
+            RecvMsg::Xyz { msg_id, state, fields, .. } if msg_id == xyz::XYZ_MSG_SWCR_TOKEN && state == 2 => {
+                let challenge = xyz::parse_swcr_token_challenge(&fields);
+                approval_url = challenge.approval_url;
+                session_id = challenge.session_id;
+                if !announced_wait {
+                    log::info!(
+                        "2FA gate: awaiting approval (session_id={}, approval_url={})",
+                        if session_id.is_empty() { "<unknown>" } else { &session_id },
+                        if approval_url.is_empty() { "<not-provided>" } else { &approval_url },
+                    );
+                    announced_wait = true;
+                }
+            }
+            RecvMsg::Xyz { msg_id, state, fields, .. } if msg_id == xyz::XYZ_MSG_TOKEN_AUTH && state == 5 => {
+                let result = fields.iter().rev().find(|s| !s.is_empty()).map(|s| s.as_str()).unwrap_or("");
+                if result.eq_ignore_ascii_case("PASSED") {
+                    log::info!("2FA gate: approved");
+                    if approval_url.is_empty() && session_id.is_empty() {
+                        return Ok(IbKeyOutcome::Skipped);
+                    }
+                    return Ok(IbKeyOutcome::Approved { approval_url, session_id });
+                }
+                return Err(ib_key_err(
+                    io::ErrorKind::PermissionDenied,
+                    format!("2FA approval rejected: {}", result),
+                ));
+            }
+            RecvMsg::Ns { msg_type, fields, .. } if msg_type == NS_TEST_REQUEST => {
+                let ts = fields.iter().find(|f| !f.is_empty()).cloned().unwrap_or_default();
+                let reply = ns_build_heart_beat(NS_VERSION, &ts);
+                stream.write_all(&reply)?;
+                log::debug!("2FA gate: heartbeat {} -> 531", ts);
+            }
+            RecvMsg::Ns { msg_type, .. } if msg_type == NS_ERROR_RESPONSE
+                || msg_type == NS_SECURE_ERROR =>
+            {
+                return Err(ib_key_err(
+                    io::ErrorKind::Other,
+                    format!("2FA gate: server error type={}", msg_type),
+                ));
+            }
+            other => {
+                // Unknown message during 2FA wait. Log and keep looping —
+                // the server may send other informational frames.
+                log::warn!("2FA gate: unexpected message {:?}", other);
+                let _ = IB_KEY_HEARTBEAT_CADENCE_SECS;  // referenced for docs
+            }
+        }
     }
 }
 
@@ -973,5 +1110,163 @@ mod tests {
         assert_ne!(combined & FLAG_SOFT_TOKEN, 0);
         // A flag we did NOT set should be absent
         assert_eq!(combined & FLAG_IS_FARM, 0);
+    }
+
+    // ── do_ib_key_2fa ───────────────────────────────────────────────────
+
+    /// Bidirectional in-memory stream for testing: scripted reads, captured writes.
+    struct ScriptedStream {
+        incoming: Vec<u8>,
+        read_pos: usize,
+        written: Vec<u8>,
+    }
+
+    impl ScriptedStream {
+        fn new(incoming: Vec<u8>) -> Self {
+            Self { incoming, read_pos: 0, written: Vec::new() }
+        }
+    }
+
+    impl io::Read for ScriptedStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let remaining = self.incoming.len().saturating_sub(self.read_pos);
+            if remaining == 0 {
+                // Mirrors a server socket close.
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "scripted EOF"));
+            }
+            let n = remaining.min(buf.len());
+            buf[..n].copy_from_slice(&self.incoming[self.read_pos..self.read_pos + n]);
+            self.read_pos += n;
+            Ok(n)
+        }
+    }
+
+    impl io::Write for ScriptedStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
+    /// Wrap an XYZ binary payload in `#%#%` framing.
+    fn frame_xyz(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(ns::NS_MAGIC);
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn far_future_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+
+    #[test]
+    fn ib_key_2fa_skipped_when_server_passes_immediately() {
+        // Server replies AUTH_FINISH(771) state=5 PASSED right after our init —
+        // no SWCR_TOKEN(state=2) preceded it, so this is the no-2FA fast path.
+        let auth_finish = xyz::xyz_build(xyz::XYZ_MSG_TOKEN_AUTH, 5, "user", &["PASSED"]);
+        let mut stream = ScriptedStream::new(frame_xyz(&auth_finish));
+        let outcome = do_ib_key_2fa(&mut stream, "user", far_future_deadline()).unwrap();
+        assert_eq!(outcome, IbKeyOutcome::Skipped);
+
+        // Verify we sent the SWCR_TOKEN init.
+        let written_payload = &stream.written[8..]; // skip NS frame header
+        let (msg_id, _, state, fields) = xyz::xyz_parse_response(written_payload).unwrap();
+        assert_eq!(msg_id, xyz::XYZ_MSG_SWCR_TOKEN);
+        assert_eq!(state, 1);
+        assert_eq!(fields[0], "user");
+    }
+
+    #[test]
+    fn ib_key_2fa_approved_after_state_2_and_passed() {
+        // Server sends SWCR_TOKEN(state=2) carrying the approval URL, then
+        // AUTH_FINISH(state=5) PASSED after the user "approves".
+        let challenge = xyz::xyz_build(xyz::XYZ_MSG_SWCR_TOKEN, 2, "user", &[
+            "e7429fde5b4c26f81fff956be6749908a8653558e7429fde5b4c26f81fff956b",
+            "580 820",
+            "https://www.example.com/seamless?S=YWJjZA==",
+        ]);
+        let auth_finish = xyz::xyz_build(xyz::XYZ_MSG_TOKEN_AUTH, 5, "user", &["PASSED"]);
+        let mut incoming = frame_xyz(&challenge);
+        incoming.extend_from_slice(&frame_xyz(&auth_finish));
+        let mut stream = ScriptedStream::new(incoming);
+
+        let outcome = do_ib_key_2fa(&mut stream, "user", far_future_deadline()).unwrap();
+        match outcome {
+            IbKeyOutcome::Approved { approval_url, session_id } => {
+                assert_eq!(approval_url, "https://www.example.com/seamless?S=YWJjZA==");
+                assert_eq!(session_id, "580 820");
+            }
+            other => panic!("expected Approved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ib_key_2fa_echoes_test_request_timestamp() {
+        // Mid-wait: server probes with NS_TEST_REQUEST. Client must echo the
+        // timestamp in an NS_HEART_BEAT before the final AUTH_FINISH PASSED.
+        let challenge = xyz::xyz_build(xyz::XYZ_MSG_SWCR_TOKEN, 2, "user", &[
+            "e7429fde5b4c26f81fff956be6749908a8653558e7429fde5b4c26f81fff956b",
+            "580 820",
+            "https://x.example/u",
+        ]);
+        let test_req = ns::ns_build(NS_VERSION, ns::NS_TEST_REQUEST,
+            &["20260430-22:58:25"], "MISC");
+        let auth_finish = xyz::xyz_build(xyz::XYZ_MSG_TOKEN_AUTH, 5, "user", &["PASSED"]);
+        let mut incoming = frame_xyz(&challenge);
+        incoming.extend_from_slice(&test_req);
+        incoming.extend_from_slice(&frame_xyz(&auth_finish));
+        let mut stream = ScriptedStream::new(incoming);
+
+        let outcome = do_ib_key_2fa(&mut stream, "user", far_future_deadline()).unwrap();
+        assert!(matches!(outcome, IbKeyOutcome::Approved { .. }));
+
+        // The captured write stream contains: SWCR_TOKEN init, then HEART_BEAT.
+        // Walk the frames and find the HEART_BEAT.
+        let mut offset = 0;
+        let mut saw_heartbeat = false;
+        while offset + 8 <= stream.written.len() {
+            assert_eq!(&stream.written[offset..offset + 4], ns::NS_MAGIC);
+            let len = u32::from_be_bytes(
+                stream.written[offset + 4..offset + 8].try_into().unwrap(),
+            ) as usize;
+            let payload = &stream.written[offset + 8..offset + 8 + len];
+            if let Some((_, msg_type, fields)) = ns::ns_parse(payload) {
+                if msg_type == ns::NS_HEART_BEAT {
+                    assert_eq!(fields, vec!["20260430-22:58:25".to_string()]);
+                    saw_heartbeat = true;
+                }
+            }
+            offset += 8 + len;
+        }
+        assert!(saw_heartbeat, "client must echo the test-request timestamp in a HEART_BEAT");
+    }
+
+    #[test]
+    fn ib_key_2fa_socket_close_during_wait_is_aborted() {
+        // Server sends state=2 then closes the socket — the ~18 min server-side
+        // deadline. The function must surface this as ConnectionAborted, not a
+        // generic IO error.
+        let challenge = xyz::xyz_build(xyz::XYZ_MSG_SWCR_TOKEN, 2, "user", &[
+            "e7429fde5b4c26f81fff956be6749908a8653558e7429fde5b4c26f81fff956b",
+            "580 820",
+            "https://x.example/u",
+        ]);
+        let mut stream = ScriptedStream::new(frame_xyz(&challenge));
+        let err = do_ib_key_2fa(&mut stream, "user", far_future_deadline()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(err.to_string().contains("server closed socket"));
+    }
+
+    #[test]
+    fn ib_key_2fa_rejected_when_passed_string_is_failed() {
+        // Server replies AUTH_FINISH state=5 but payload says FAILED — denial.
+        let auth_finish = xyz::xyz_build(xyz::XYZ_MSG_TOKEN_AUTH, 5, "user", &["FAILED"]);
+        let mut stream = ScriptedStream::new(frame_xyz(&auth_finish));
+        let err = do_ib_key_2fa(&mut stream, "user", far_future_deadline()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("rejected"));
     }
 }

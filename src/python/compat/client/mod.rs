@@ -115,6 +115,7 @@ impl EClient {
             host,
             paper,
             accept_invalid_certs: false,
+            ib_key_timeout_secs: crate::auth::session::IB_KEY_DEFAULT_TIMEOUT_SECS,
         };
 
         let result = py.allow_threads(|| Gateway::connect(&config));

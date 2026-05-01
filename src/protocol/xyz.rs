@@ -12,6 +12,10 @@ pub const XYZ_PROTOCOL_VERSION: u32 = 23;
 pub const XYZ_MSG_SRP: u32 = 777;
 pub const XYZ_MSG_TOKEN_AUTH: u32 = 771;
 pub const XYZ_MSG_SOFT_TOKEN: u32 = 772;
+/// Per-session two-factor approval handshake (IBKey seamless / push notification).
+/// Sent by the client immediately after SRP completes; server reply at state=2
+/// carries the per-session approval URL the user's mobile device taps to approve.
+pub const XYZ_MSG_SWCR_TOKEN: u32 = 775;
 
 /// Build an XYZ binary message.
 pub fn xyz_build(msg_id: u32, state: u32, username: &str, fields: &[&str]) -> Vec<u8> {
@@ -105,6 +109,51 @@ pub fn xyz_build_soft_token(state: u32, x: &str, y: &str, z: &str) -> Vec<u8> {
     buf
 }
 
+/// Build the second-factor approval init message (state=1, username only).
+pub fn xyz_build_swcr_token_init(username: &str) -> Vec<u8> {
+    xyz_build(XYZ_MSG_SWCR_TOKEN, 1, username, &[])
+}
+
+/// Parsed payload from an `XYZ_MSG_SWCR_TOKEN` state=2 reply.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SwcrTokenChallenge {
+    /// Per-session challenge token (hex-encoded).
+    pub challenge: String,
+    /// Per-session 6-digit identifier the user can verify visually.
+    pub session_id: String,
+    /// URL the IBKey mobile app posts to when the user approves.
+    /// Useful to surface to the user for the seamless web fallback.
+    pub approval_url: String,
+}
+
+/// Parse the string fields of a state=2 SWCR_TOKEN reply into a structured
+/// challenge. Identifies fields by content rather than position so that minor
+/// payload reordering on the server side doesn't break parsing.
+pub fn parse_swcr_token_challenge(fields: &[String]) -> SwcrTokenChallenge {
+    let mut out = SwcrTokenChallenge::default();
+    for f in fields {
+        if f.is_empty() { continue; }
+        if f.starts_with("https://") || f.starts_with("http://") {
+            // First URL wins. The seamless field has a `?S=` query param.
+            if out.approval_url.is_empty() {
+                out.approval_url = f.clone();
+            }
+        } else if f.chars().all(|c| c.is_ascii_hexdigit()) && f.len() >= 32 {
+            if out.challenge.is_empty() {
+                out.challenge = f.clone();
+            }
+        } else if f.chars().all(|c| c.is_ascii_digit() || c == ' ') && !f.trim().is_empty() {
+            // Per-session id is a short numeric string ("580 820") — but
+            // reject the challenge token (already captured above by the
+            // hex/length test).
+            if out.session_id.is_empty() && f.len() < 16 {
+                out.session_id = f.clone();
+            }
+        }
+    }
+    out
+}
+
 /// Write a length-prefixed, 4-byte-aligned string.
 pub fn xyz_write_string(buf: &mut Vec<u8>, s: &str) {
     let data = s.as_bytes();
@@ -179,6 +228,57 @@ mod tests {
         assert_eq!(msg_id, XYZ_MSG_SOFT_TOKEN);
         assert_eq!(state, 3);
         assert_eq!(fields[2], "response_hex"); // y field
+    }
+
+    // ── Second-factor approval (IBKey / SWCR_TOKEN) ─────────────────
+
+    #[test]
+    fn swcr_token_init_carries_username_at_state_1() {
+        let payload = xyz_build_swcr_token_init("user42");
+        let (msg_id, sub_id, state, fields) = xyz_parse_response(&payload).unwrap();
+        assert_eq!(msg_id, XYZ_MSG_SWCR_TOKEN);
+        assert_eq!(sub_id, 1);
+        assert_eq!(state, 1);
+        assert_eq!(fields[0], "user42");
+    }
+
+    #[test]
+    fn swcr_challenge_parses_url_and_session_id() {
+        let fields = vec![
+            "user".to_string(),
+            "e7429fde5b4c26f81fff956be6749908a8653558e7429fde5b4c26f81fff956b".to_string(),
+            "580 820".to_string(),
+            "https://www.example.com/seamless?S=YWJjZA==".to_string(),
+        ];
+        let parsed = parse_swcr_token_challenge(&fields);
+        assert_eq!(parsed.challenge.len(), 64);
+        assert!(parsed.challenge.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(parsed.session_id, "580 820");
+        assert_eq!(parsed.approval_url, "https://www.example.com/seamless?S=YWJjZA==");
+    }
+
+    #[test]
+    fn swcr_challenge_ignores_empty_and_short_fields() {
+        let fields = vec![
+            "".to_string(),
+            "abc".to_string(),  // too short for challenge
+            "deadbeef".to_string(),  // hex but too short for challenge
+            "https://x.example/u".to_string(),
+        ];
+        let parsed = parse_swcr_token_challenge(&fields);
+        assert_eq!(parsed.challenge, "");
+        assert_eq!(parsed.session_id, "");
+        assert_eq!(parsed.approval_url, "https://x.example/u");
+    }
+
+    #[test]
+    fn swcr_challenge_first_url_wins() {
+        let fields = vec![
+            "https://first.example/a".to_string(),
+            "https://second.example/b".to_string(),
+        ];
+        let parsed = parse_swcr_token_challenge(&fields);
+        assert_eq!(parsed.approval_url, "https://first.example/a");
     }
 
     // ── New tests ───────────────────────────────────────────────────

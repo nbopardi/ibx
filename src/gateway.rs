@@ -764,6 +764,11 @@ pub struct GatewayConfig {
     /// Accept invalid TLS certificates during auth. Default: `false` (secure).
     /// Only set to `true` for local testing against self-signed gateways.
     pub accept_invalid_certs: bool,
+    /// Per-session second-factor approval timeout. Defaults to
+    /// [`session::IB_KEY_DEFAULT_TIMEOUT_SECS`] (~18 min, matching the
+    /// server-side deadline). Set lower to fail fast for unattended logins.
+    /// Only consulted on non-paper logins; paper logins skip the gate entirely.
+    pub ib_key_timeout_secs: u64,
 }
 
 impl Gateway {
@@ -875,6 +880,26 @@ impl Gateway {
         log::info!("Starting auth for {}", config.username);
         let session_key = do_srp(&mut tls, &config.username, &config.password)?;
         log::info!("Auth complete");
+
+        // Per-session second-factor approval gate (IBKey / seamless push).
+        // Skipped on paper logins; live logins enter a wait state if the
+        // account has a second factor configured server-side.
+        if !config.paper {
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(config.ib_key_timeout_secs);
+            match session::do_ib_key_2fa(&mut tls, &config.username, deadline)? {
+                session::IbKeyOutcome::Skipped => {
+                    log::info!("2FA gate: skipped (no second factor)");
+                }
+                session::IbKeyOutcome::Approved { approval_url, session_id } => {
+                    log::info!(
+                        "2FA gate: approved (session_id={}, approval_url={})",
+                        if session_id.is_empty() { "<none>" } else { &session_id },
+                        if approval_url.is_empty() { "<none>" } else { &approval_url },
+                    );
+                }
+            }
+        }
 
         // Receive post-auth messages (encrypted via 534)
         let mut fix_ready = false;
@@ -1706,6 +1731,7 @@ mod tests {
             host: "cdc1.ibllc.com".to_string(),
             paper: true,
             accept_invalid_certs: false,
+            ib_key_timeout_secs: session::IB_KEY_DEFAULT_TIMEOUT_SECS,
         };
         assert_eq!(config.username, "user");
         assert!(config.paper);

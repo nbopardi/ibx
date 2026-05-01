@@ -111,6 +111,7 @@ impl EClient {
             host: config.host.clone(),
             paper: config.paper,
             accept_invalid_certs: false,
+            ib_key_timeout_secs: crate::auth::session::IB_KEY_DEFAULT_TIMEOUT_SECS,
         };
 
         let (gw, farm_conn, ccp_conn, hmds_conn, cashfarm, usfuture, eufarm, jfarm, usopt) = Gateway::connect(&gw_config)?;

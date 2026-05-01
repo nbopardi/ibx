@@ -22,6 +22,13 @@ pub const NS_SECURE_CONNECT: u32 = 532;
 pub const NS_SECURE_CONNECTION_START: u32 = 533;
 pub const NS_SECURE_MESSAGE: u32 = 534;
 pub const NS_SECURE_ERROR: u32 = 535;
+/// Server keepalive probe sent during second-factor approval wait.
+/// Payload: `MISC{ns_version};530;{server_timestamp};` — the client must echo
+/// `server_timestamp` verbatim in an `NS_HEART_BEAT` reply.
+pub const NS_TEST_REQUEST: u32 = 530;
+/// Client keepalive reply matching a prior `NS_TEST_REQUEST`.
+/// Payload: `MISC{ns_version};531;{server_timestamp};`.
+pub const NS_HEART_BEAT: u32 = 531;
 
 /// Build an NS message with `#%#%` framing.
 ///
@@ -62,6 +69,20 @@ pub fn ns_parse(payload: &[u8]) -> Option<(u32, u32, Vec<String>)> {
     Some((version, msg_type, fields))
 }
 
+/// Build an `NS_HEART_BEAT` reply that echoes the timestamp from a paired
+/// `NS_TEST_REQUEST`. Uses the `MISC` prefix variant the gateway client uses.
+pub fn ns_build_heart_beat(ns_version: u32, test_req_timestamp: &str) -> Vec<u8> {
+    ns_build(ns_version, NS_HEART_BEAT, &[test_req_timestamp], "MISC")
+}
+
+/// Extract the timestamp from an inbound `NS_TEST_REQUEST` payload. Returns
+/// `None` if the payload doesn't parse or carries the wrong message type.
+pub fn parse_test_request_timestamp(payload: &[u8]) -> Option<String> {
+    let (_, msg_type, fields) = ns_parse(payload)?;
+    if msg_type != NS_TEST_REQUEST { return None; }
+    fields.into_iter().find(|f| !f.is_empty())
+}
+
 /// Receive one `#%#%` framed message. Returns (payload_bytes, total_len).
 pub fn ns_recv<R: Read>(reader: &mut R) -> io::Result<(Vec<u8>, usize)> {
     let mut header = [0u8; 8];
@@ -80,9 +101,14 @@ pub fn ns_recv<R: Read>(reader: &mut R) -> io::Result<(Vec<u8>, usize)> {
 
 /// Classify a `#%#%` framed payload as NS text or XYZ binary.
 ///
-/// Returns `true` if the payload looks like NS text (starts with ASCII digit).
+/// Returns `true` if the payload looks like NS text — either an ASCII digit
+/// (no prefix) or the `MISC` prefix the gateway uses for some message types
+/// (e.g. `NS_MISC_URLS_RESPONSE`, `NS_TEST_REQUEST`, `NS_HEART_BEAT`).
 pub fn is_ns_text(payload: &[u8]) -> bool {
-    payload.first().map_or(false, |b| b.is_ascii_digit())
+    match payload.first() {
+        Some(b) if b.is_ascii_digit() => true,
+        _ => payload.starts_with(b"MISC"),
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +153,31 @@ mod tests {
         assert_eq!(version, 38);
         assert_eq!(msg_type, 529);
         assert_eq!(fields, vec!["key=val"]);
+    }
+
+    #[test]
+    fn heart_beat_echoes_timestamp() {
+        let msg = ns_build_heart_beat(50, "20260430-22:58:25");
+        let payload = std::str::from_utf8(&msg[8..]).unwrap();
+        // Must use MISC prefix, type 531, and carry the original timestamp.
+        assert!(payload.starts_with("MISC50;531;20260430-22:58:25;"), "got {payload}");
+    }
+
+    #[test]
+    fn parse_test_request_extracts_timestamp() {
+        let msg = ns_build(50, NS_TEST_REQUEST, &["20260430-22:58:25"], "MISC");
+        let payload = &msg[8..];
+        assert_eq!(
+            parse_test_request_timestamp(payload),
+            Some("20260430-22:58:25".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_test_request_rejects_wrong_type() {
+        let msg = ns_build(50, NS_HEART_BEAT, &["20260430-22:58:25"], "MISC");
+        let payload = &msg[8..];
+        assert_eq!(parse_test_request_timestamp(payload), None);
     }
 
     #[test]
