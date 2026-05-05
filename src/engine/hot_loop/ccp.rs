@@ -50,7 +50,11 @@ pub(crate) struct CcpState {
     pub(crate) bulletin_next_id: i32,
     pub(crate) news_subscriptions: Vec<(InstrumentId, u32)>,
     pub(crate) disconnected: bool,
-    pub(crate) pending_secdef: Vec<u32>,
+    /// (req_id, is_single_shot). Single-shot = known-conId lookup whose
+    /// first 35=d reply is also the last (server emits no 323=5/6 terminator
+    /// for these). Multi-record by-symbol/matching-symbols requests push
+    /// `false` and rely on the response-type sentinel for is_last.
+    pub(crate) pending_secdef: Vec<(u32, bool)>,
     pub(crate) pending_matching_symbols: Vec<u32>,
     /// keepUpToDate historical queries routed through CCP: (query_id, req_id)
     pub(crate) pending_kut_historical: Vec<(String, u32)>,
@@ -290,6 +294,10 @@ impl CcpState {
             "d" => {
                 if let Some(def) = crate::control::contracts::parse_secdef_response(msg) {
                     let is_last = crate::control::contracts::secdef_response_is_last(msg);
+                    // Override: single-shot (known-conId) requests get one reply
+                    // with no 323=5/6 terminator. Treat that first reply as last.
+                    let single_shot = self.pending_secdef.first().map(|(_, s)| *s).unwrap_or(false);
+                    let is_last = is_last || single_shot;
                     if def.con_id != 0 {
                         let sec_type_str = match def.sec_type {
                             crate::control::contracts::SecurityType::Stock => "STK",
@@ -313,7 +321,7 @@ impl CcpState {
                             ..Default::default()
                         });
                     }
-                    if let Some(&req_id) = self.pending_secdef.first() {
+                    if let Some(&(req_id, _)) = self.pending_secdef.first() {
                         let join_key = def.join_key.clone();
                         if is_last {
                             self.pending_secdef.remove(0);
@@ -979,7 +987,8 @@ impl CcpState {
             log::info!("Sent secdef request: req_id={} con_id={}", req_id, con_id);
             hb.last_ccp_sent = Instant::now();
         }
-        self.pending_secdef.push(req_id);
+        // Known-conId lookup: single record, no paginated terminator.
+        self.pending_secdef.push((req_id, true));
     }
 
     pub(crate) fn send_secdef_request_by_symbol(&mut self, req_id: u32, symbol: &str, sec_type: &str, exchange: &str, currency: &str, ccp_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
@@ -1004,7 +1013,8 @@ impl CcpState {
             log::info!("Sent secdef-by-symbol: req_id={} symbol={} sec_type={}", req_id, symbol, sec_type);
             hb.last_ccp_sent = Instant::now();
         }
-        self.pending_secdef.push(req_id);
+        // By-symbol lookup may return multiple records; rely on 323=5/6 terminator.
+        self.pending_secdef.push((req_id, false));
     }
 
     pub(crate) fn send_matching_symbols_request(&mut self, req_id: u32, pattern: &str, ccp_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
