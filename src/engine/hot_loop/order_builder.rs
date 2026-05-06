@@ -705,7 +705,7 @@ pub(crate) fn drain_and_send_orders(
                     (55, &symbol),
                     (54, side_str),
                     (38, &qty_str),
-                    (40, "K"),          // OrdType = Limit if Touched
+                    (40, "LT"),         // OrdType = Limit If Touched (per ib-agent#138)
                     (44, &price_str),   // Limit price
                     (99, &stop_str),    // StopPx = trigger price
                     (59, "0"),          // TIF = DAY
@@ -819,6 +819,9 @@ pub(crate) fn drain_and_send_orders(
                 let offset_str = format_price(offset);
                 let symbol = context.market.symbol(instrument).to_string();
                 let now = chrono_free_timestamp();
+                // Per ib-agent#138 capture: Relative shares OrdType=P with
+                // Trail and is disambiguated by ExecInst=R. Peg offset goes
+                // on tag 211 (not 99 outbound), and there is no tag 44.
                 conn.send_fix(&[
                     (fix::TAG_MSG_TYPE, fix::MSG_NEW_ORDER),
                     (fix::TAG_SENDING_TIME, &now),
@@ -828,8 +831,9 @@ pub(crate) fn drain_and_send_orders(
                     (55, &symbol),
                     (54, side_str),
                     (38, &qty_str),
-                    (40, "R"),              // OrdType = Relative
-                    (99, &offset_str),      // Peg offset (auxPrice)
+                    (40, "P"),              // OrdType = Pegged (used for Relative too)
+                    (211, &offset_str),     // PegOffset
+                    (18, "R"),              // ExecInst = Relative
                     (59, "0"),              // TIF = DAY
                     (60, &now),
                     (167, "STK"),

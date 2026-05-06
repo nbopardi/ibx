@@ -313,7 +313,9 @@ pub(super) fn run_submit_cancel_phase(
         match event_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Event::OrderUpdate(update)) => {
                 match update.status {
-                    OrderStatus::Submitted => {
+                    // OPG orders only get PendingSubmit until next open, so
+                    // accept it as the success ack and fire cancel from there.
+                    OrderStatus::PendingSubmit | OrderStatus::Submitted => {
                         order_acked = true;
                         if !cancel_sent {
                             control_tx.send(ControlCommand::Order(OrderRequest::Cancel { order_id })).unwrap();
