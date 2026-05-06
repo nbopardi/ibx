@@ -89,6 +89,18 @@ pub fn token_short_hash(session_token: &BigUint) -> String {
 }
 
 /// Build auth server logon message.
+///
+/// Tag 6266 (`encoded`) carries `{jdkVer}/{platform}/{locale}/{dist}`.
+/// The auth server requires the `{locale}` segment to be a canonical Java
+/// `Locale.toString()` value — `en_US`, `fr`, `ja_JP`, etc. Bare `en` is
+/// rejected as `invalid twsInfo`. Override via `IBX_LOCALE` (locale only)
+/// or `IBX_ENCODED` (full string).
+///
+/// Tag 8361 = `"(rolling)"` is load-bearing: it marks the client as a
+/// rolling-release build, which bypasses the server's IB_BUILD allow-list
+/// check. Without it the server rejects with "The TWS build you are
+/// currently running is no longer supported." Tags 6397/6947/8098 also
+/// look like metadata but are kept conservatively until proven removable.
 pub fn build_ccp_logon(hw_info: &str, encoded: &str, heartbeat: u64, seq: u32) -> Vec<u8> {
     let now = chrono_free_timestamp();
     let tz = "UTC";
