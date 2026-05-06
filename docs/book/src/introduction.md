@@ -1,5 +1,7 @@
 <div class="ibx-hero">
 
+<img class="ibx-logo" src="./banner.png" alt="IBX" />
+
 # IBX
 
 <p class="ibx-tagline">Direct IB connection engine. No Java Gateway. No middleman. Built in Rust for ultra-low-latency, available as both a Rust crate and a Python wheel.</p>

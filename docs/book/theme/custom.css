@@ -214,6 +214,17 @@ pre > code.hljs {
     border-bottom: 1px solid var(--ibx-border);
 }
 
+.ibx-hero .ibx-logo {
+    display: block;
+    width: 100%;
+    max-width: 560px;
+    height: auto;
+    margin: 0 auto 1.75rem;
+    border-radius: 12px;
+    border: 1px solid var(--ibx-border);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.18);
+}
+
 .ibx-hero h1 {
     font-size: 3.4rem !important;
     font-weight: 800 !important;
