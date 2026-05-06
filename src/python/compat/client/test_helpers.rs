@@ -325,7 +325,7 @@ impl EClient {
         let shared = self.shared_state()?;
         let ps = PRICE_SCALE as f64;
         shared.portfolio.set_position_info(PositionInfo {
-            con_id, position, avg_cost: (avg_cost * ps) as i64,
+            con_id, position, avg_cost: (avg_cost * ps) as i64, ..Default::default()
         });
         Ok(())
     }

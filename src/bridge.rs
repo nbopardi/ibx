@@ -635,12 +635,12 @@ impl PortfolioState {
 
     /// Get all position infos (for reqPositions).
     pub fn position_infos(&self) -> Vec<PositionInfo> {
-        self.position_infos.lock().unwrap().values().copied().collect()
+        self.position_infos.lock().unwrap().values().cloned().collect()
     }
 
     /// Get position info for a single conId (for pnlSingle).
     pub fn position_info(&self, con_id: i64) -> Option<PositionInfo> {
-        self.position_infos.lock().unwrap().get(&con_id).copied()
+        self.position_infos.lock().unwrap().get(&con_id).cloned()
     }
 
     /// Read current position for an instrument.
@@ -671,7 +671,18 @@ impl PortfolioState {
     }
 
     #[doc(hidden)] pub fn set_position_info(&self, info: PositionInfo) {
-        self.position_infos.lock().unwrap().insert(info.con_id, info);
+        let mut map = self.position_infos.lock().unwrap();
+        match map.get_mut(&info.con_id) {
+            Some(existing) => {
+                existing.position = info.position;
+                existing.avg_cost = info.avg_cost;
+                if !info.symbol.is_empty() { existing.symbol = info.symbol; }
+                if !info.sec_type.is_empty() { existing.sec_type = info.sec_type; }
+                if !info.currency.is_empty() { existing.currency = info.currency; }
+                if !info.multiplier.is_empty() { existing.multiplier = info.multiplier; }
+            }
+            None => { map.insert(info.con_id, info); }
+        }
     }
 
     #[doc(hidden)] pub fn set_position(&self, id: InstrumentId, pos: i64) {

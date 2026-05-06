@@ -1235,11 +1235,15 @@ pub struct AccountState {
 }
 
 /// Position with average cost, for P&L computation and reqPositions.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PositionInfo {
     pub con_id: i64,
     pub position: i64,
     pub avg_cost: Price,      // per-share avg cost * PRICE_SCALE
+    pub symbol: String,
+    pub sec_type: String,
+    pub currency: String,
+    pub multiplier: String,
 }
 
 /// Per-position midnight seed from 6040=143 P&L subscription.

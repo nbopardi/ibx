@@ -498,10 +498,10 @@ fn account_req_positions_reflects_fills() {
 
     // Set position info (as engine would after fills)
     shared.portfolio.set_position_info(PositionInfo {
-        con_id: 756733, position: 100, avg_cost: 450 * PRICE_SCALE,
+        con_id: 756733, position: 100, avg_cost: 450 * PRICE_SCALE, ..Default::default()
     });
     shared.portfolio.set_position_info(PositionInfo {
-        con_id: 265598, position: -50, avg_cost: 150 * PRICE_SCALE,
+        con_id: 265598, position: -50, avg_cost: 150 * PRICE_SCALE, ..Default::default()
     });
 
     let mut w = RecordingWrapper::default();
@@ -1002,6 +1002,7 @@ fn pnl_single_dispatches_position_info() {
         con_id: 265598,
         position: 100,
         avg_cost: 150 * PRICE_SCALE,
+        ..Default::default()
     });
 
     let mut w = RecordingWrapper::default();

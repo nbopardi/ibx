@@ -1376,7 +1376,9 @@ fn handle_position_feed(
             // Flush previous position if any
             if count > 0 && con_id != 0 {
                 let avg_cost = (avg_cost_raw * PRICE_SCALE as f64) as Price;
-                shared.portfolio.set_position_info(PositionInfo { con_id, position: qty, avg_cost });
+                shared.portfolio.set_position_info(PositionInfo {
+                    con_id, position: qty, avg_cost, ..Default::default()
+                });
                 if let Some(instrument) = context.market.instrument_by_con_id(con_id) {
                     shared.portfolio.set_position(instrument, qty);
                     emit(event_tx, Event::PositionUpdate { instrument, con_id, position: qty, avg_cost });
@@ -1395,7 +1397,9 @@ fn handle_position_feed(
     // Flush last position
     if count > 0 && con_id != 0 {
         let avg_cost = (avg_cost_raw * PRICE_SCALE as f64) as Price;
-        shared.portfolio.set_position_info(PositionInfo { con_id, position: qty, avg_cost });
+        shared.portfolio.set_position_info(PositionInfo {
+            con_id, position: qty, avg_cost, ..Default::default()
+        });
         if let Some(instrument) = context.market.instrument_by_con_id(con_id) {
             shared.portfolio.set_position(instrument, qty);
             emit(event_tx, Event::PositionUpdate { instrument, con_id, position: qty, avg_cost });
@@ -1422,9 +1426,17 @@ pub(crate) fn handle_position_update(
         .and_then(|s| s.parse::<f64>().ok())
         .map(|v| (v * PRICE_SCALE as f64) as Price)
         .unwrap_or(0);
+    // Symbol arrives space-padded; trim trailing whitespace.
+    let symbol = parsed.get(&6068).map(|s| s.trim_end().to_string()).unwrap_or_default();
+    let sec_type = parsed.get(&167).cloned().unwrap_or_default();
+    let currency = parsed.get(&15).cloned().unwrap_or_default();
+    let multiplier = parsed.get(&8002).cloned().unwrap_or_default();
 
     // Always store position info for reqPositions/pnlSingle, regardless of instrument registry.
-    shared.portfolio.set_position_info(PositionInfo { con_id, position, avg_cost });
+    shared.portfolio.set_position_info(PositionInfo {
+        con_id, position, avg_cost,
+        symbol, sec_type, currency, multiplier,
+    });
 
     if let Some(instrument) = context.market.instrument_by_con_id(con_id) {
         let current = context.position(instrument);

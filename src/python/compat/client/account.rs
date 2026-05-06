@@ -77,8 +77,12 @@ impl EClient {
                 c.currency = ac.currency;
                 c
             }).unwrap_or_else(|| {
+                // Cache miss: fall back to wire-derived PositionInfo fields.
                 let mut c = Contract::default();
                 c.con_id = pi.con_id;
+                c.symbol = pi.symbol.clone();
+                c.sec_type = pi.sec_type.clone();
+                c.currency = pi.currency.clone();
                 c
             });
             let c_py = Py::new(py, c)?.into_any();

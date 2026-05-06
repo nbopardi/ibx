@@ -897,8 +897,8 @@ impl ClientCore {
             total_realized += seed.realized_pnl;
 
             let pi = shared.portfolio.position_info(seed.con_id);
-            let qty_now = pi.map(|p| p.position).unwrap_or(0);
-            let avg_cost = pi.map(|p| p.avg_cost).unwrap_or(0);
+            let qty_now = pi.as_ref().map(|p| p.position).unwrap_or(0);
+            let avg_cost = pi.as_ref().map(|p| p.avg_cost).unwrap_or(0);
 
             if let Some(&iid) = con_id_map.get(&seed.con_id) {
                 let q = shared.market.quote(iid);

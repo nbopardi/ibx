@@ -29,8 +29,17 @@ impl EClient {
         }
         let positions = self.shared.portfolio.position_infos();
         for pi in &positions {
+            // Prefer the secdef cache (carries exchange/localSymbol/tradingClass),
+            // but fall back to the wire-derived PositionInfo fields when cold.
             let c = self.core.get_contract(pi.con_id, &self.shared)
-                .unwrap_or_else(|| Contract { con_id: pi.con_id, ..Default::default() });
+                .unwrap_or_else(|| Contract {
+                    con_id: pi.con_id,
+                    symbol: pi.symbol.clone(),
+                    sec_type: pi.sec_type.clone(),
+                    currency: pi.currency.clone(),
+                    multiplier: pi.multiplier.clone(),
+                    ..Default::default()
+                });
             let avg_cost = pi.avg_cost as f64 / PRICE_SCALE_F;
             wrapper.position(&self.account_id, &c, pi.position as f64, avg_cost);
         }
