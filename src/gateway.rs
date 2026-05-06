@@ -817,7 +817,17 @@ impl Gateway {
         }
 
         let hw_info = session::get_hw_info();
-        let encoded = IB_ENCODED.to_string();
+        // Tag 6266 carries `{jdkVer}/{platform}/{locale}/{dist}`. The locale
+        // segment must be a canonical Java `Locale.toString()` value (e.g.
+        // `en_US`, `fr`, `ja_JP`); bare `en` is rejected as `invalid twsInfo`.
+        // `IBX_LOCALE` overrides just the locale; `IBX_ENCODED` overrides
+        // the whole string for full control.
+        let encoded = std::env::var("IBX_ENCODED").unwrap_or_else(|_| {
+            match std::env::var("IBX_LOCALE") {
+                Ok(loc) if !loc.is_empty() => format!("17.0.10.0.101/W/{}/G", loc),
+                _ => IB_ENCODED.to_string(),
+            }
+        });
 
         // --- Phase 1: TLS + auth ---
         log::info!("Connecting to auth server {}:{}", host, AUTH_PORT);

@@ -1,7 +1,7 @@
 /// Client version identifiers.
 pub const IB_BUILD: &str = "10401";
 pub const IB_VERSION: &str = "c";
-pub const IB_ENCODED: &str = "17.0.10.0.101/W/en/G";
+pub const IB_ENCODED: &str = "17.0.10.0.101/W/en_US/G";
 
 /// Auth server endpoints.
 pub const CCP_HOSTS: &[&str] = &[
