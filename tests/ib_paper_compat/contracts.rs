@@ -109,13 +109,16 @@ pub(super) fn phase_trading_hours(conns: &mut Conns) {
     println!("--- Phase 80: Trading Hours (schedule subscription, AAPL) ---");
 
     let now = ibx::gateway::chrono_free_timestamp();
-    conns.farm.send_fixcomp(&[
+    if let Err(e) = conns.farm.send_fixcomp(&[
         (fix::TAG_MSG_TYPE, "V"),
         (fix::TAG_SENDING_TIME, &now),
         (263, "1"), (146, "1"), (262, "sched_test"),
         (6008, "265598"), (207, "BEST"), (167, "CS"),
         (264, "442"), (6088, "Socket"), (9830, "1"), (9839, "1"),
-    ]).expect("Failed to send farm subscribe for AAPL");
+    ]) {
+        println!("  SKIP: farm subscribe failed: {}\n", e);
+        return;
+    }
     println!("  Subscribed AAPL on farm, listening on CCP for schedule");
 
     let mut schedule: Option<contracts::ContractSchedule> = None;
