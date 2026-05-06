@@ -99,11 +99,17 @@ pub fn token_short_hash(session_token: &BigUint) -> String {
 /// Tag 8361 = `"(rolling)"` is load-bearing: it marks the client as a
 /// rolling-release build, which bypasses the server's IB_BUILD allow-list
 /// check. Without it the server rejects with "The TWS build you are
-/// currently running is no longer supported." Tags 6397/6947/8098 also
-/// look like metadata but are kept conservatively until proven removable.
+/// currently running is no longer supported." Per ib-agent#141 the
+/// official client also keeps 6397/6947/8098, so we leave them in.
+///
+/// Tag 6947 carries the JVM default timezone (e.g. `Europe/Paris`,
+/// `America/New_York`). The auth server doesn't validate it — `UTC` is
+/// the safe default — but `IBX_TZ` overrides for users who want to mirror
+/// their locale or comply with regional logging requirements.
 pub fn build_ccp_logon(hw_info: &str, encoded: &str, heartbeat: u64, seq: u32) -> Vec<u8> {
     let now = chrono_free_timestamp();
-    let tz = "UTC";
+    let tz_owned = std::env::var("IBX_TZ").unwrap_or_else(|_| "UTC".to_string());
+    let tz = tz_owned.as_str();
     let hb_str = heartbeat.to_string();
     let hw_field = format!("<{}|{}>", hw_info, session::get_lan_ip());
     fix_build(
