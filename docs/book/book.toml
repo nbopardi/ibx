@@ -11,6 +11,7 @@ preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/deepentropy/ibx"
 edit-url-template = "https://github.com/deepentropy/ibx/edit/main/docs/book/{path}"
 no-section-label = true
+additional-css = ["theme/custom.css"]
 
 [output.html.fold]
 enable = true
