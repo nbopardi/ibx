@@ -503,7 +503,9 @@ pub enum OrderRequest {
         instrument: InstrumentId,
         side: Side,
         qty: u32,
-        price: Price,
+        /// Limit offset from the trail-stop price (wire tag 6370 LimitPriceOffset).
+        /// The gateway derives the absolute limit price; do not pass an absolute price here.
+        lmt_offset: Price,
         trail_amt: Price,
     },
     /// Trailing stop by percentage (tag 6268). Trail percent is in basis points (1% = 100).

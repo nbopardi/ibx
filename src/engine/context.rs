@@ -344,7 +344,7 @@ impl Context {
         instrument: InstrumentId,
         side: Side,
         qty: u32,
-        price: Price,
+        lmt_offset: Price,
         trail_amt: Price,
     ) -> OrderId {
         let id = self.next_order_id;
@@ -354,7 +354,7 @@ impl Context {
             instrument,
             side,
             qty,
-            price,
+            lmt_offset,
             trail_amt,
         });
         id

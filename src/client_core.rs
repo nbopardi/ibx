@@ -1234,9 +1234,17 @@ impl ClientCore {
                 }
             }
             "TRAIL LIMIT" => {
-                let price = (order.lmt_price * PRICE_SCALE_F) as i64;
+                // Wire-side semantic is `LimitPriceOffset` (tag 6370), not an
+                // absolute limit price. Prefer `lmt_price_offset`; fall back
+                // to `lmt_price` for callers that haven't migrated.
+                let offset_f = if order.lmt_price_offset != f64::MAX {
+                    order.lmt_price_offset
+                } else {
+                    order.lmt_price
+                };
+                let lmt_offset = (offset_f * PRICE_SCALE_F) as i64;
                 let trail = (order.aux_price * PRICE_SCALE_F) as i64;
-                OrderRequest::SubmitTrailingStopLimit { order_id, instrument, side, qty, price, trail_amt: trail }
+                OrderRequest::SubmitTrailingStopLimit { order_id, instrument, side, qty, lmt_offset, trail_amt: trail }
             }
             "MOC" => OrderRequest::SubmitMoc { order_id, instrument, side, qty },
             "LOC" => {

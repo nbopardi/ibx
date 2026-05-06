@@ -450,6 +450,10 @@ pub(crate) fn drain_and_send_orders(
                 let trail_str = format_price(trail_amt);
                 let symbol = context.market.symbol(instrument).to_string();
                 let now = chrono_free_timestamp();
+                // Per ib-agent#136 capture: amount-based trailing stop carries
+                // the trail amount in both 99 (StopPx) and 211 (PegOffset),
+                // and requires 18=a (ExecInst = TrailingStop). Without 18,
+                // the gateway rejects with "Invalid value in field # 18".
                 conn.send_fix(&[
                     (fix::TAG_MSG_TYPE, fix::MSG_NEW_ORDER),
                     (fix::TAG_SENDING_TIME, &now),
@@ -459,8 +463,10 @@ pub(crate) fn drain_and_send_orders(
                     (55, &symbol),
                     (54, side_str),
                     (38, &qty_str),
-                    (40, "P"),          // OrdType = Trailing Stop
+                    (40, "P"),          // OrdType = Stop (used for trailing too)
                     (99, &trail_str),   // StopPx = trail amount
+                    (211, &trail_str), // PegOffset = trail amount
+                    (18, "a"),          // ExecInst = TrailingStop
                     (59, "0"),          // TIF = DAY
                     (60, &now),
                     (167, "STK"),
@@ -469,18 +475,23 @@ pub(crate) fn drain_and_send_orders(
                     (204, "0"),
                 ])
             }
-            OrderRequest::SubmitTrailingStopLimit { order_id, instrument, side, qty, price, trail_amt } => {
+            OrderRequest::SubmitTrailingStopLimit { order_id, instrument, side, qty, lmt_offset, trail_amt } => {
                 context.insert_order(crate::types::Order::new(
-                    order_id, instrument, side, qty, price, b'P', b'0', 0,
+                    order_id, instrument, side, qty, lmt_offset, b'P', b'0', 0,
                 ));
                 let ver = *context.modify_versions.get(&order_id).unwrap_or(&0);
                 let clord_str = format!("{}.{}", order_id, ver);
                 let side_str = fix_side(side);
                 let qty_str = format_uint(qty as u64);
-                let price_str = format_price(price);
+                let offset_str = format_price(lmt_offset);
                 let trail_str = format_price(trail_amt);
                 let symbol = context.market.symbol(instrument).to_string();
                 let now = chrono_free_timestamp();
+                // Per ib-agent#136 capture: TRAIL LIMIT uses OrdType=TSL (not P),
+                // does NOT carry tag 44 (gateway derives the limit price from
+                // 6370 + the activation reference), does NOT carry tag 18, and
+                // carries the trail amount in both 99 and 211. The 6370
+                // LimitPriceOffset is the limit-vs-trail offset.
                 conn.send_fix(&[
                     (fix::TAG_MSG_TYPE, fix::MSG_NEW_ORDER),
                     (fix::TAG_SENDING_TIME, &now),
@@ -490,10 +501,11 @@ pub(crate) fn drain_and_send_orders(
                     (55, &symbol),
                     (54, side_str),
                     (38, &qty_str),
-                    (40, "P"),          // OrdType = Trailing Stop (IB uses P for both)
-                    (44, &price_str),   // Limit price
-                    (99, &trail_str),   // StopPx = trail amount
-                    (59, "0"),          // TIF = DAY
+                    (40, "TSL"),         // OrdType = Trailing Stop Limit
+                    (99, &trail_str),    // StopPx = trail amount
+                    (6370, &offset_str), // LimitPriceOffset
+                    (211, &trail_str),   // PegOffset = trail amount
+                    (59, "0"),           // TIF = DAY
                     (60, &now),
                     (167, "STK"),
                     (100, "SMART"),
@@ -868,6 +880,9 @@ pub(crate) fn drain_and_send_orders(
                 let symbol = context.market.symbol(instrument).to_string();
                 let now = chrono_free_timestamp();
                 let priority_str = priority.as_str();
+                // Per ib-agent#136 capture: Adaptive needs 18=e (ExecInst =
+                // Adaptive algo wrapper). Without it, gateway rejects with
+                // "Invalid value in field # 18".
                 conn.send_fix(&[
                     (fix::TAG_MSG_TYPE, fix::MSG_NEW_ORDER),
                     (fix::TAG_SENDING_TIME, &now),
@@ -879,6 +894,7 @@ pub(crate) fn drain_and_send_orders(
                     (38, &qty_str),
                     (40, "2"),              // OrdType = Limit
                     (44, &price_str),
+                    (18, "e"),              // ExecInst = Adaptive algo
                     (59, "0"),              // TIF = DAY
                     (60, &now),
                     (167, "STK"),
