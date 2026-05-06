@@ -3,10 +3,23 @@
 [Introduction](./introduction.md)
 [Getting Started](./getting-started.md)
 
-# Recipes
+# Rust Recipes
 
-- [Streaming L2 Market Depth](./recipes/streaming-l2.md)
-- [Order Lifecycle](./recipes/order-lifecycle.md)
+- [Login](./recipes/rust/login.md)
+- [Request Contract Details](./recipes/rust/contract-details.md)
+- [Request Account PnL](./recipes/rust/account-pnl.md)
+- [Send a Limit Order](./recipes/rust/limit-order.md)
+- [Send a Stop Order](./recipes/rust/stop-order.md)
+- [Streaming L2 Market Depth](./recipes/rust/streaming-l2.md)
+
+# Python Recipes
+
+- [Login](./recipes/python/login.md)
+- [Request Contract Details](./recipes/python/contract-details.md)
+- [Request Account PnL](./recipes/python/account-pnl.md)
+- [Send a Limit Order](./recipes/python/limit-order.md)
+- [Send a Stop Order](./recipes/python/stop-order.md)
+- [Order Lifecycle](./recipes/python/order-lifecycle.md)
 
 # API Reference
 

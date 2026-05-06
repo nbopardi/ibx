@@ -23,5 +23,5 @@ IB_USERNAME=... IB_PASSWORD=... python examples/ex96_order_lifecycle.py
 ## Source
 
 ```python
-{{#include ../../../../examples/ex96_order_lifecycle.py}}
+{{#include ../../../../../examples/ex96_order_lifecycle.py}}
 ```

@@ -89,5 +89,6 @@ c.req_mkt_data(1, spy, "", False)
 
 ## Next steps
 
-- [Streaming L2 Market Depth](./recipes/streaming-l2.md) — full L2 order book for two tickers
-- [Order Lifecycle](./recipes/order-lifecycle.md) — place / modify / cancel / fill on a single order
+- [Login (Rust)](./recipes/rust/login.md) · [Login (Python)](./recipes/python/login.md) — minimal connect / `next_valid_id` / disconnect
+- [Streaming L2 Market Depth (Rust)](./recipes/rust/streaming-l2.md) — full L2 order book for two tickers
+- [Order Lifecycle (Python)](./recipes/python/order-lifecycle.md) — place / modify / cancel / fill on a single order

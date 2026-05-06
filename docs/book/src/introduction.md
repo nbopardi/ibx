@@ -8,7 +8,7 @@
 
 <p class="ibx-cta">
   <a class="primary" href="./getting-started.html">Get Started →</a>
-  <a class="secondary" href="./recipes/streaming-l2.html">Read the recipes</a>
+  <a class="secondary" href="./recipes/rust/login.html">Read the recipes</a>
   <a class="secondary" href="https://github.com/deepentropy/ibx">GitHub</a>
 </p>
 
@@ -74,7 +74,7 @@ Hot loop pinned to a core, zero-allocation tick parsing, lock-free dispatch. Tic
 ## Where to go next
 
 - **New here?** → [Getting Started](./getting-started.html) — install, credentials, hello-world in both languages.
-- **Want to see real code?** → [Recipes](./recipes/streaming-l2.html) — end-to-end flows with full source from `examples/`.
+- **Want to see real code?** → Recipes for [Rust](./recipes/rust/login.html) and [Python](./recipes/python/login.html) — end-to-end flows with full source from `examples/`.
 - **Looking up a specific call?** → [Rust API](./api/rust.html) · [Python API](./api/python.html).
 - **Wondering what's wired up?** → [Endpoint Coverage](./reference/coverage.html).
 

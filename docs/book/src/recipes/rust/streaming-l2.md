@@ -24,5 +24,5 @@ IB_HOST=cdc1.ibllc.com DURATION_SECS=30 cargo run --example l2_aapl_tsla
 ## Source
 
 ```rust
-{{#include ../../../../examples/l2_aapl_tsla.rs}}
+{{#include ../../../../../examples/l2_aapl_tsla.rs}}
 ```
