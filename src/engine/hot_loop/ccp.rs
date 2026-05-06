@@ -949,10 +949,14 @@ impl CcpState {
             }
         });
         for p in emit_now {
-            shared.reference.push_contract_details(p.api_req_id, p.def);
-            emit(event_tx, Event::ContractDetailsEnd(p.api_req_id));
+            shared.reference.push_contract_details(p.api_req_id, p.def.clone());
+            emit(event_tx, Event::ContractDetails {
+                req_id: p.api_req_id,
+                details: p.def,
+            });
             if p.is_last {
                 shared.reference.push_contract_details_end(p.api_req_id);
+                emit(event_tx, Event::ContractDetailsEnd(p.api_req_id));
             }
         }
     }
