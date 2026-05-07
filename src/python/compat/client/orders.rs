@@ -356,6 +356,9 @@ impl EClient {
                     let o_py = Py::new(py, Order::default())?.into_any();
                     self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, &state_py))?;
                 }
+                // Bound `order_cache` growth: terminal entries are no longer
+                // needed once delivered through `completed_order`.
+                shared.orders.remove_order_info(co.order_id);
             }
             self.wrapper.call_method0(py, "completed_orders_end")?;
         }

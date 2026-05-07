@@ -234,6 +234,22 @@ pub struct PortfolioUpdateEntry {
     pub avg_cost: f64,
 }
 
+/// True when `status` names an IB order state that is still working on the broker.
+/// Whitelist (rather than blacklist) so non-canonical or empty strings — and
+/// any future terminal states added by IB — are treated as "not open".
+#[inline]
+pub fn is_open_status(status: &str) -> bool {
+    matches!(
+        status,
+        "ApiPending"
+            | "PendingSubmit"
+            | "PendingCancel"
+            | "PreSubmitted"
+            | "Submitted"
+            | "PartiallyFilled"
+    )
+}
+
 /// Convert OrderStatus enum to ibapi-compatible string.
 #[inline]
 pub fn order_status_str(status: OrderStatus) -> &'static str {
@@ -737,7 +753,7 @@ impl ClientCore {
         {
             let orders = self.open_orders.lock().unwrap();
             for (&oid, o) in orders.iter() {
-                if !matches!(o.status.as_str(), "Filled" | "Cancelled" | "Inactive") {
+                if is_open_status(&o.status) {
                     let contract = if o.contract.con_id != 0 {
                         self.get_contract(o.contract.con_id, shared).unwrap_or_else(|| o.contract.clone())
                     } else {
@@ -757,7 +773,7 @@ impl ClientCore {
 
         // Add shared-only entries not already present from local
         for (oid, info) in shared_orders {
-            if matches!(info.order_state.status.as_str(), "Filled" | "Cancelled" | "Inactive") {
+            if !is_open_status(&info.order_state.status) {
                 continue;
             }
             if !result.iter().any(|(id, _)| *id == oid) {

@@ -120,6 +120,9 @@ impl EClient {
                 };
                 wrapper.completed_order(&contract, &api_order, &state);
             }
+            // Bound `order_cache` growth: terminal entries are no longer needed
+            // once delivered through `completed_order`.
+            self.shared.orders.remove_order_info(order.order_id);
         }
         wrapper.completed_orders_end();
     }

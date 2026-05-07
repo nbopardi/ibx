@@ -268,16 +268,27 @@ impl OrderState {
         self.completed_orders.lock().unwrap().drain(..).collect()
     }
 
-    /// Snapshot all enriched orders (for open_order callbacks).
-    /// Does NOT remove entries — they persist for req_completed_orders lookups.
+    /// Snapshot enriched entries whose latest status is an open IB state.
+    /// Terminal entries (Filled / Cancelled / Inactive / etc.) are filtered out
+    /// so `req_open_orders` does not leak historical orders that are still cached
+    /// for `req_completed_orders` lookups.
     pub fn drain_open_orders(&self) -> Vec<(u64, RichOrderInfo)> {
         let lock = self.order_cache.lock().unwrap();
-        lock.iter().map(|(&k, v)| (k, v.clone())).collect()
+        lock.iter()
+            .filter(|(_, v)| crate::client_core::is_open_status(&v.order_state.status))
+            .map(|(&k, v)| (k, v.clone()))
+            .collect()
     }
 
     /// Get enriched order info by order_id.
     pub fn get_order_info(&self, order_id: u64) -> Option<RichOrderInfo> {
         self.order_cache.lock().unwrap().get(&order_id).cloned()
+    }
+
+    /// Remove an enriched entry. Called after a completed order has been
+    /// delivered to the user, to bound `order_cache` growth in long sessions.
+    pub fn remove_order_info(&self, order_id: u64) {
+        self.order_cache.lock().unwrap().remove(&order_id);
     }
 
     // ── Hot-loop-side writers ──
