@@ -74,6 +74,37 @@ pub fn parse_farm_route(route: &str) -> Option<(String, String)> {
     Some((host, farm))
 }
 
+/// Returns true if `buf` contains at least one complete `8=O` (binary) or
+/// `8=FIXCOMP` frame. Used to terminate read drains as soon as the expected
+/// response is fully buffered.
+fn has_complete_response_frame(buf: &[u8]) -> bool {
+    if buf.starts_with(b"8=O\x01") {
+        if let Some(tag9_off) = buf[4..].windows(2).position(|w| w == b"9=") {
+            let tag9_pos = 4 + tag9_off;
+            if let Some(soh_off) = buf[tag9_pos..].iter().position(|&b| b == b'\x01') {
+                let soh_pos = tag9_pos + soh_off;
+                if let Ok(s) = std::str::from_utf8(&buf[tag9_pos + 2..soh_pos]) {
+                    if let Ok(body_len) = s.parse::<usize>() {
+                        return soh_pos + 1 + body_len <= buf.len();
+                    }
+                }
+            }
+        }
+        return false;
+    }
+    let mut cursor = 0usize;
+    while cursor + 12 <= buf.len() {
+        if buf[cursor..].starts_with(b"8=FIXCOMP\x01") {
+            if let Some(total_len) = fixcomp::fixcomp_length(&buf[cursor..]) {
+                return cursor + total_len <= buf.len();
+            }
+            return false;
+        }
+        cursor += 1;
+    }
+    false
+}
+
 /// Compute token short hash for farm logon (FIX tag 8483).
 ///
 /// Per ib-agent#125: gateway always emits this as **8 hex chars padded with
@@ -453,16 +484,26 @@ pub fn connect_farm(
     let final_sign_iv = new_sign_iv;
     log::info!("{} sent routing request (6556={})", farm_id, channel_id);
 
-    // Read routing response (stream is still blocking)
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    // Read routing response. Frame-based termination: poll with a short
+    // timeout, break as soon as we have at least one complete FIXCOMP frame
+    // buffered. The 5-s read timeout remains as the worst-case fallback.
+    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
     let mut resp_buf = Vec::new();
+    let routing_deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let mut tmp = [0u8; 8192];
         match stream.read(&mut tmp) {
             Ok(0) => break,
-            Ok(n) => resp_buf.extend_from_slice(&tmp[..n]),
+            Ok(n) => {
+                resp_buf.extend_from_slice(&tmp[..n]);
+                if has_complete_response_frame(&resp_buf) { break; }
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock
-                || e.kind() == io::ErrorKind::TimedOut => break,
+                || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                if has_complete_response_frame(&resp_buf) { break; }
+                if std::time::Instant::now() >= routing_deadline { break; }
+            }
             Err(e) => return Err(e),
         }
     }
@@ -1227,14 +1268,12 @@ impl Gateway {
 
         // Drain init responses — extract account ID + farm routing tags.
         // Per ib-agent#134 read-throughput investigation (2026-05-05):
-        // the burst's bulk (~28 kB compressed) arrives in ~300 ms, after
-        // which the server emits 67-byte keep-alive trickles every ~10 s
-        // until it FINs the socket at ~140 s. The previous 15-s timeout
-        // therefore wasted 130+ s reading those trickles, which pushed our
-        // grace-window app messages past the server's deadline. Use a 1-s
-        // timeout and exit on the first idle gap so we send AR + 35=H
-        // within ~1.3 s of burst-end.
-        tls.get_ref().set_read_timeout(Some(Duration::from_secs(1)))?;
+        // the burst's bulk (~28 kB compressed) arrives in ~300 ms continuous,
+        // after which the server emits 67-byte keep-alive trickles every ~10 s
+        // until it FINs the socket at ~140 s. A 300 ms idle-gap is past any
+        // intra-burst jitter (the burst is continuous) and well short of the
+        // 10 s keep-alive trickle interval, so we exit promptly after burst-end.
+        tls.get_ref().set_read_timeout(Some(Duration::from_millis(300)))?;
         let mut init_data: Vec<u8> = Vec::with_capacity(65536);
         let mut tmp_buf = vec![0u8; 65536];
         let read_start = std::time::Instant::now();
@@ -1289,16 +1328,6 @@ impl Gateway {
         }
         if !inflated_extra.is_empty() {
             log::info!("Inflated {} bytes of FIXCOMP content; appending to scan buffer", inflated_extra.len());
-            // TEMP: dump inflated content to disk so we can grep for routing
-            // tags / verify what's actually in the auth-logon ACK body.
-            if let Err(e) = std::fs::write(
-                std::path::Path::new(r"D:\RustroverProjects\ibx\scripts\.tmp\logs\inflated_init.bin"),
-                &inflated_extra,
-            ) {
-                log::warn!("Could not write inflated_init.bin: {}", e);
-            } else {
-                log::info!("Dumped inflated content to scripts/.tmp/logs/inflated_init.bin");
-            }
             init_data.extend_from_slice(&inflated_extra);
         }
 
@@ -1479,17 +1508,32 @@ impl Gateway {
         log::info!("Farm routing: trading={}/{}, mktdata={}/{}",
             trading_host, trading_farm, mktdata_host, mktdata_farm);
 
-        // Serialize farm logons (avoids any "competing login" rejection
-        // the live server may emit; paper tolerates parallelism but serial
-        // is harmless there).
-        let farm_conn = connect_farm(
-            &trading_host, &trading_farm, &config.username, &config.password,
-            config.paper, &server_session_id, &farm_token, &hw_info, &encoded, 18,
-        )?;
-        let hmds_conn = match connect_farm(
-            &mktdata_host, &mktdata_farm, &config.username, &config.password,
-            config.paper, &server_session_id, &farm_token, &hw_info, &encoded, 17,
-        ) {
+        // Parallel farm logons: validated against paper and live (each farm
+        // logon is ~6 s sequentially; running them in parallel halves the
+        // farm-logon phase). Both servers accept concurrent logons with the
+        // same credentials — see examples/ex_parallel_farm_logon.rs.
+        let (farm_conn, hmds_conn) = std::thread::scope(|scope| {
+            let username = &config.username;
+            let password = &*config.password;
+            let paper = config.paper;
+            let ssid = &server_session_id;
+            let token = &farm_token;
+            let hw = &hw_info;
+            let enc = &encoded;
+            let trading_handle = scope.spawn(move || {
+                connect_farm(&trading_host, &trading_farm, username, password,
+                    paper, ssid, token, hw, enc, 18)
+            });
+            let mktdata_handle = scope.spawn(move || {
+                connect_farm(&mktdata_host, &mktdata_farm, username, password,
+                    paper, ssid, token, hw, enc, 17)
+            });
+            let trading = trading_handle.join().expect("trading farm thread panicked");
+            let mktdata = mktdata_handle.join().expect("mktdata farm thread panicked");
+            (trading, mktdata)
+        });
+        let farm_conn = farm_conn?;
+        let hmds_conn = match hmds_conn {
             Ok(c) => { log::info!("Historical data farm connected"); Some(c) }
             Err(e) => { log::warn!("Historical data farm connection failed (non-fatal): {}", e); None }
         };
