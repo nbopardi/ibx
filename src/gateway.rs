@@ -689,8 +689,9 @@ fn reconnect_ccp_attempt(auth: &ReconnectAuth, token_hash: &str, host: &str, dep
         do_srp(&mut tls, &auth.username, &auth.password)?;
     }
 
-    // Post-auth: wait for NS_CONNECT_RESPONSE → NEWCOMMPORTTYPE → NS_FIX_START
-    tls.get_ref().set_read_timeout(Some(Duration::from_secs(30)))?;
+    // Post-auth: wait for NS_CONNECT_RESPONSE → NEWCOMMPORTTYPE → NS_FIX_START.
+    // Per-iteration read timeout aligned with the initial-connect path.
+    tls.get_ref().set_read_timeout(Some(Duration::from_secs_f64(TIMEOUT_FIX_LOGON)))?;
     let mut fix_ready = false;
     for _ in 0..20 {
         let (payload, _) = match ns::ns_recv(&mut tls) {
@@ -1004,7 +1005,10 @@ impl Gateway {
             }
         }
 
-        // Receive post-auth messages (encrypted via 534)
+        // Receive post-auth messages (encrypted via 534).
+        // Per-iteration read timeout: a stalled server would otherwise wedge
+        // the connect path indefinitely (no timeout on the TCP socket).
+        tls.get_ref().set_read_timeout(Some(Duration::from_secs_f64(TIMEOUT_FIX_LOGON)))?;
         let mut fix_ready = false;
         for _ in 0..10 {
             let (payload, _) = match ns::ns_recv(&mut tls) {
