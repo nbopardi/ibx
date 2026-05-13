@@ -386,11 +386,6 @@ impl CcpState {
 
                 if let Some(def) = crate::control::contracts::parse_secdef_response(msg) {
                     let is_last_wire = crate::control::contracts::secdef_response_is_last(msg);
-                    // Override: single-shot (known-conId) requests get one reply
-                    // with no 323=5/6 terminator. Treat that first reply as last.
-                    let single_shot = self.pending_secdef.first().map(|(_, s)| *s).unwrap_or(false);
-                    let is_by_symbol = self.pending_secdef.first().map(|(_, s)| !*s).unwrap_or(false);
-                    let is_last = is_last_wire || single_shot;
                     if def.con_id != 0 {
                         let sec_type_str = sec_type_to_str(def.sec_type);
                         shared.reference.cache_contract(def.con_id as i64, api::Contract {
@@ -406,6 +401,22 @@ impl CcpState {
                         });
                         self.try_release_scanner_enrichments(def.con_id as i64, shared);
                     }
+                    // Match the response to its originating pending_secdef entry
+                    // by tag 320 (response_req_id). Without this, an internal
+                    // auto-fetch reply (e.g. position-driven secdef for SPY)
+                    // landing while a user request is in flight would be
+                    // attributed to `pending_secdef.first()` and leak as a
+                    // bogus contract_details callback on the user's req_id.
+                    let matched_idx: Option<usize> = response_req_id.as_ref()
+                        .and_then(|rid| rid.parse::<u32>().ok())
+                        .and_then(|rid_u32| {
+                            self.pending_secdef.iter().position(|(pid, _)| *pid == rid_u32)
+                        });
+                    let single_shot = matched_idx
+                        .map(|i| self.pending_secdef[i].1).unwrap_or(false);
+                    let is_by_symbol = matched_idx
+                        .map(|i| !self.pending_secdef[i].1).unwrap_or(false);
+                    let is_last = is_last_wire || single_shot;
                     // Fan-out detection: by-symbol master reply carries the full
                     // exchange list in tag 6046. Drop SMART/BEST and dispatch
                     // one per-exchange `35=c` per remaining entry. The per-
@@ -419,20 +430,32 @@ impl CcpState {
                     } else {
                         Vec::new()
                     };
-                    if let Some(&(req_id, _)) = self.pending_secdef.first() {
+                    if let Some(idx) = matched_idx {
+                        let req_id = self.pending_secdef[idx].0;
+                        // Internal sentinel req_ids (auto-fetch for cold-cache
+                        // positions, scanner enrichment) start at 0xF000_0000.
+                        // Their replies must populate the contract cache but
+                        // never surface as user-visible contract_details
+                        // callbacks.
+                        let is_internal = req_id >= 0xF000_0000;
                         let join_key = def.join_key.clone();
                         if is_last {
-                            self.pending_secdef.remove(0);
+                            self.pending_secdef.remove(idx);
                         }
                         let con_id = def.con_id as i64;
                         if join_key.is_empty() {
                             // No join key — emit immediately without schedule data.
-                            shared.reference.push_contract_details(req_id, def.clone());
-                            emit(event_tx, Event::ContractDetails { req_id, details: def });
-                            if is_last {
-                                shared.reference.push_contract_details_end(req_id);
-                                emit(event_tx, Event::ContractDetailsEnd(req_id));
+                            if !is_internal {
+                                shared.reference.push_contract_details(req_id, def.clone());
+                                emit(event_tx, Event::ContractDetails { req_id, details: def });
+                                if is_last {
+                                    shared.reference.push_contract_details_end(req_id);
+                                    emit(event_tx, Event::ContractDetailsEnd(req_id));
+                                }
                             }
+                        } else if is_internal {
+                            // Skip schedule pairing for internal sentinels — no
+                            // user is awaiting the trading_hours enrichment.
                         } else {
                             self.pending_schedule_pair.push(PendingSchedulePair {
                                 api_req_id: req_id,
