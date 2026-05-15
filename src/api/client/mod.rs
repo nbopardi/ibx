@@ -125,13 +125,13 @@ impl EClient {
         let shared = Arc::new(SharedState::new());
         gw.populate_init_data(&shared);
 
-        let (mut hot_loop, control_tx) = gw.into_hot_loop_with_farms(
+        let (hot_loop, control_tx) = gw.into_hot_loop_with_farms(
             shared.clone(), None, farm_conn, ccp_conn, hmds_conn, config.core_id,
         );
 
         let handle = thread::Builder::new()
             .name("ib-engine-hotloop".into())
-            .spawn(move || { hot_loop.run(); })?;
+            .spawn(move || { hot_loop.run_with_panic_recovery(); })?;
 
         let start_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

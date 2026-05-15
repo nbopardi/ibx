@@ -175,6 +175,26 @@ impl HotLoop {
         (hl, tx)
     }
 
+    /// Run the hot loop under `catch_unwind`. On panic, log the payload and
+    /// emit `Event::Disconnected` so consumers see the dead engine without
+    /// having to wait for the next outbound call to fail. Use this from the
+    /// engine-spawn site instead of `run()` directly (ibx#182).
+    pub fn run_with_panic_recovery(mut self) {
+        let event_tx = self.event_tx.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.run();
+        }));
+        if let Err(payload) = result {
+            let msg: &str = payload
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                .unwrap_or("<non-string panic payload>");
+            log::error!("Engine hot loop panicked, emitting Disconnected: {}", msg);
+            emit(&event_tx, Event::Disconnected);
+        }
+    }
+
     /// Run the hot loop. Blocks until Shutdown command received.
     pub fn run(&mut self) {
         if let Some(core) = self.core_id {

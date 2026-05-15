@@ -88,18 +88,37 @@ impl HmdsState {
                     }
                 }
                 let frames = conn.extract_frames();
+                // ibx#183 follow-up: frame-extraction tracer. If a recv produces
+                // 0 frames AND buffered_after > 0, the bytes are stuck waiting for
+                // more (incomplete FIXCOMP frame — declared tag-9 length exceeds
+                // received bytes). If buffered_after == 0, the bytes were dropped
+                // outright (no recognized header — buf.clear() path).
+                log::warn!(
+                    "HMDS poll: extracted={} frames, buffered_after={}B",
+                    frames.len(),
+                    conn.buffered(),
+                );
                 let mut msgs = Vec::new();
                 for frame in &frames {
                     match frame {
                         Frame::FixComp(raw) => {
                             let (unsigned, _valid) = conn.unsign(raw);
-                            let inner = fixcomp::fixcomp_decompress(&unsigned);
-                            if log::log_enabled!(log::Level::Trace) {
-                                for m in &inner {
-                                    log::trace!("WIRE< hmds/comp {}", crate::protocol::fix::fmt_pipe(m));
+                            match fixcomp::fixcomp_decompress(&unsigned) {
+                                Ok(inner) => {
+                                    if log::log_enabled!(log::Level::Trace) {
+                                        for m in &inner {
+                                            log::trace!("WIRE< hmds/comp {}", crate::protocol::fix::fmt_pipe(m));
+                                        }
+                                    }
+                                    msgs.extend(inner);
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "HMDS: dropping malformed FIXCOMP frame ({} bytes): {}",
+                                        unsigned.len(), e,
+                                    );
                                 }
                             }
-                            msgs.extend(inner);
                         }
                         Frame::Binary(raw) => {
                             let (unsigned, _valid) = conn.unsign(raw);
@@ -155,15 +174,39 @@ impl HmdsState {
             }
             "W" => {
                 if let Some(xml_tag) = parsed.get(&6118) {
+                    // ibx#183 follow-up: unconditional XML root tracer — logs the head
+                    // of every W/6118 payload so we can see the element type even when
+                    // it falls through every parse branch silently.
+                    log::warn!(
+                        "HMDS W xml head (len={}): {:?}",
+                        xml_tag.len(),
+                        &xml_tag[..xml_tag.len().min(200)],
+                    );
                     if let Some(resp) = crate::control::historical::parse_bar_response(xml_tag) {
                         if let Some(pos) = self.pending_historical.iter().position(|(qid, _)| resp.query_id.starts_with(qid.as_str())) {
                             let (_, req_id) = self.pending_historical[pos];
                             let is_complete = resp.is_complete;
+                            // ibx#182 follow-up: bisect — log every matched bar response.
+                            // If we see this fire repeatedly with eoq=false and never an
+                            // eoq=true follow-up, we're in case L170 (gateway never sends
+                            // the completion sentinel for this request).
+                            log::warn!(
+                                "HMDS W matched: req_id={} query_id={:?} eoq={} bars={}",
+                                req_id, resp.query_id, is_complete, resp.bars.len()
+                            );
                             shared.reference.push_historical_data(req_id, resp.clone());
                             emit(event_tx, Event::HistoricalData { req_id, data: resp });
                             if is_complete && !self.keep_up_to_date_reqs.contains(&req_id) {
                                 self.pending_historical.remove(pos);
                             }
+                        } else {
+                            // ibx#182 follow-up: diagnostic bisect — when parse_bar_response
+                            // returns Some but the query_id doesn't match any in-flight
+                            // pending_historical, the response is silently dropped.
+                            log::warn!(
+                                "HMDS W parsed but no pending_historical match: resp.query_id={:?} eoq={} bars={} pending={:?}",
+                                resp.query_id, resp.is_complete, resp.bars.len(), self.pending_historical
+                            );
                         }
                     }
                     else if let Some(resp) = crate::control::historical::parse_head_timestamp_response(xml_tag) {
@@ -224,8 +267,14 @@ impl HmdsState {
                         }
                     }
                     else {
-                        log::debug!("HMDS unmatched W response (len={}): {:?}", xml_tag.len(), xml_tag);
+                        // ibx#182 follow-up: bumped from debug to warn so silent
+                        // drops in the W cascade surface at Info-level apps.
+                        log::warn!("HMDS unmatched W response (len={}): {:?}", xml_tag.len(), xml_tag);
                     }
+                } else {
+                    // ibx#183 follow-up: W message with no 6118 payload — fourth
+                    // silent-drop path missed in the original cascade audit.
+                    log::warn!("HMDS W with no tag 6118 (msg_len={})", msg.len());
                 }
             }
             "U" => {
@@ -301,7 +350,12 @@ impl HmdsState {
                 }
             }
             "G" => self.handle_rtbar_data(msg, shared),
-            _ => {}
+            other => {
+                // ibx#183 follow-up: was a silent _ => {} arm — log unhandled
+                // msg_types so we can catch frames that bypass the W cascade
+                // entirely (e.g. completion sentinels delivered as a different type).
+                log::warn!("HMDS unhandled msg_type={:?} (msg_len={})", other, msg.len());
+            }
         }
     }
 
