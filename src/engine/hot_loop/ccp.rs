@@ -184,13 +184,22 @@ impl CcpState {
                     match frame {
                         Frame::FixComp(raw) => {
                             let (unsigned, _) = conn.unsign(&raw);
-                            let inner = fixcomp::fixcomp_decompress(&unsigned);
-                            if log::log_enabled!(log::Level::Trace) {
-                                for m in &inner {
-                                    log::trace!("WIRE< ccp/comp {}", fix::fmt_pipe(m));
+                            match fixcomp::fixcomp_decompress(&unsigned) {
+                                Ok(inner) => {
+                                    if log::log_enabled!(log::Level::Trace) {
+                                        for m in &inner {
+                                            log::trace!("WIRE< ccp/comp {}", fix::fmt_pipe(m));
+                                        }
+                                    }
+                                    msgs.extend(inner);
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "CCP: dropping malformed FIXCOMP frame ({} bytes): {}",
+                                        unsigned.len(), e,
+                                    );
                                 }
                             }
-                            msgs.extend(inner);
                         }
                         Frame::Fix(raw) => {
                             let (unsigned, _) = conn.unsign(&raw);
