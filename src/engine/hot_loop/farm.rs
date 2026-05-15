@@ -86,13 +86,22 @@ impl FarmState {
                 match frame {
                     Frame::FixComp(raw) => {
                         let (unsigned, _valid) = conn.unsign(raw);
-                        let inner = fixcomp::fixcomp_decompress(&unsigned);
-                        if log::log_enabled!(log::Level::Trace) {
-                            for m in &inner {
-                                log::trace!("WIRE< farm/comp {}", fix::fmt_pipe(m));
+                        match fixcomp::fixcomp_decompress(&unsigned) {
+                            Ok(inner) => {
+                                if log::log_enabled!(log::Level::Trace) {
+                                    for m in &inner {
+                                        log::trace!("WIRE< farm/comp {}", fix::fmt_pipe(m));
+                                    }
+                                }
+                                self.farm_msg_buf.extend(inner);
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Farm: dropping malformed FIXCOMP frame ({} bytes): {}",
+                                    unsigned.len(), e,
+                                );
                             }
                         }
-                        self.farm_msg_buf.extend(inner);
                     }
                     Frame::Binary(raw) => {
                         let (unsigned, _valid) = conn.unsign(raw);

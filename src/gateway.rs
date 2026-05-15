@@ -528,7 +528,10 @@ pub fn connect_farm(
         match frame {
             crate::protocol::connection::Frame::FixComp(raw) => {
                 let (unsigned, _valid) = conn.unsign(raw);
-                let inner = fixcomp::fixcomp_decompress(&unsigned);
+                let inner = fixcomp::fixcomp_decompress(&unsigned).unwrap_or_else(|e| {
+                    log::warn!("{}: dropping malformed FIXCOMP frame: {}", farm_id, e);
+                    Vec::new()
+                });
                 for m in &inner {
                     let parsed = fix_parse(m);
                     let mt = parsed.get(&35).map(|s| s.as_str()).unwrap_or("");
@@ -1118,7 +1121,7 @@ impl Gateway {
             // (See ib-agent#128 + #129.)
             let mut response = raw_response.clone();
             if raw_response.starts_with(b"8=FIXCOMP\x01") {
-                let inflated_msgs = fixcomp::fixcomp_decompress(&raw_response);
+                let inflated_msgs = fixcomp::fixcomp_decompress(&raw_response)?;
                 let total: usize = inflated_msgs.iter().map(|m| m.len()).sum();
                 log::info!("Auth FIXCOMP envelope: {} bytes compressed → {} inner messages, ~{} inflated bytes",
                     raw_response.len(), inflated_msgs.len(), total);
@@ -1326,7 +1329,10 @@ impl Gateway {
             if init_data[cursor..].starts_with(b"8=FIXCOMP\x01") {
                 if let Some(total_len) = fixcomp::fixcomp_length(&init_data[cursor..]) {
                     let segment = &init_data[cursor..cursor + total_len.min(init_data.len() - cursor)];
-                    let inflated = fixcomp::fixcomp_decompress(segment);
+                    let inflated = fixcomp::fixcomp_decompress(segment).unwrap_or_else(|e| {
+                        log::warn!("Init FIXCOMP segment at offset {}: dropping malformed frame: {}", cursor, e);
+                        Vec::new()
+                    });
                     let inflated_bytes: usize = inflated.iter().map(|m| m.len() + 1).sum();
                     log::info!(
                         "Init FIXCOMP segment at offset {}: {} compressed → {} inner messages, ~{} inflated bytes",
