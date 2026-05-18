@@ -205,6 +205,90 @@ pub(super) fn phase_cancel_historical(mut conns: Conns, gw: &Gateway, config: &G
     conns
 }
 
+/// ibx#186: gateway rejects certain bar_size/duration combos with a QueryError
+/// XML payload on HMDS. Validates that the rejection now surfaces as a queued
+/// error (code 162) + terminal historical_data sentinel rather than leaking the
+/// pending entry forever.
+pub(super) fn phase_query_error_surfaces(mut conns: Conns, gw: &Gateway, config: &GatewayConfig) -> Conns {
+    println!("--- Phase 186: HMDS QueryError surfaces (15 mins / 1 W rejection) ---");
+
+    ccp_keepalive(&mut conns.ccp);
+    let hmds = match connect_farm(
+        &config.host, "ushmds", &config.username, &config.password, config.paper,
+        &gw.server_session_id, &gw.session_token, &gw.hw_info, &gw.encoded, 17,
+    ) {
+        Ok(c) => { println!("  HMDS reconnected"); c }
+        Err(e) => {
+            println!("  SKIP: ushmds reconnect failed: {}\n", e);
+            return Conns { farm: conns.farm, ccp: conns.ccp, hmds: None, account_id: conns.account_id };
+        }
+    };
+
+    let account_id = conns.account_id;
+    let shared = Arc::new(SharedState::new());
+    let (hot_loop, control_tx) = HotLoop::with_connections(
+        shared.clone(), None, account_id.clone(), conns.farm, conns.ccp, Some(hmds), None,
+    );
+
+    const REQ_ID: u32 = 18600;
+    // The combo `bar_size=15 mins` + `duration=1 W` is technically within the IB
+    // docs' allowed ranges but is rejected by the live gateway with
+    // <QueryError>Invalid time length</QueryError>. If IB ever lifts this
+    // restriction, the phase will report SKIP rather than fail.
+    control_tx.send(ControlCommand::FetchHistorical {
+        req_id: REQ_ID, con_id: 756733, symbol: "SPY".into(),
+        end_date_time: now_ib_timestamp(), duration: "1 W".into(),
+        bar_size: "15 mins".into(), what_to_show: "TRADES".into(), use_rth: true,
+        keep_up_to_date: false,
+    }).unwrap();
+    let join = run_hot_loop(hot_loop);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut error: Option<(u32, i32, String)> = None;
+    let mut got_end_sentinel = false;
+    let mut bars_seen: usize = 0;
+
+    while Instant::now() < deadline {
+        for (rid, code, msg) in shared.reference.drain_historical_errors() {
+            if rid == REQ_ID {
+                println!("  HMDS error: code={} msg={:?}", code, msg);
+                error = Some((rid, code, msg));
+            }
+        }
+        for (rid, resp) in shared.reference.drain_historical_data() {
+            if rid == REQ_ID {
+                bars_seen += resp.bars.len();
+                if resp.is_complete { got_end_sentinel = true; }
+            }
+        }
+        if error.is_some() && got_end_sentinel { break; }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let conns = shutdown_and_reclaim(&control_tx, join, account_id);
+
+    match error {
+        None => {
+            // Either the gateway accepted the combo (rare — would deliver bars)
+            // or HMDS was throttled. Don't fail the suite for an upstream policy
+            // change; surface as SKIP with diagnostic.
+            println!("  SKIP: no QueryError received (bars_seen={}, end={})\n",
+                bars_seen, got_end_sentinel);
+        }
+        Some((_, code, msg)) => {
+            assert_eq!(code, 162, "expected canonical HMDS error code 162");
+            assert!(!msg.is_empty(), "error message must not be empty");
+            assert!(
+                got_end_sentinel,
+                "terminal historical_data sentinel must follow the error so consumers waiting on historical_data_end unblock"
+            );
+            assert_eq!(bars_seen, 0, "no bars should be delivered for a rejected request");
+            println!("  PASS (error surfaced, end sentinel delivered)\n");
+        }
+    }
+    conns
+}
+
 pub(super) fn phase_head_timestamp(mut conns: Conns, gw: &Gateway, config: &GatewayConfig) -> Conns {
     println!("--- Phase 79: Head Timestamp (SPY, TRADES) ---");
 

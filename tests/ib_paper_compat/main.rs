@@ -101,7 +101,7 @@ fn compat_suite() {
                         };
                         let (unsigned, valid) = conn.unsign(raw);
                         if label == "FIXCOMP" {
-                            let inner = fixcomp::fixcomp_decompress(&unsigned);
+                            let inner = fixcomp::fixcomp_decompress(&unsigned).unwrap_or_default();
                             for m in &inner {
                                 let preview = String::from_utf8_lossy(&m[..std::cmp::min(150, m.len())]);
                                 println!("  {} inner (valid={}): {}", label, valid, preview);
@@ -171,6 +171,7 @@ fn compat_suite() {
     conns = historical::phase_historical_data(conns, &gw, &config);
     conns = historical::phase_historical_daily_bars(conns, &gw, &config);
     conns = historical::phase_cancel_historical(conns, &gw, &config);
+    conns = historical::phase_query_error_surfaces(conns, &gw, &config);
     conns = historical::phase_head_timestamp(conns, &gw, &config);
     conns = historical::phase_scanner_subscription(conns, &gw, &config);
     conns = historical::phase_historical_news(conns, &gw, &config);
@@ -402,4 +403,30 @@ fn compat_suite() {
     let ran = total_phases - skipped + forex_fallback;
     println!("\n=== {}/{} phases ran ({} skipped, {} forex-fallback, {:?}) in {:.1}s ===",
         ran, total_phases, skipped, forex_fallback, session, suite_start.elapsed().as_secs_f64());
+}
+
+/// ibx#186 focused live entry — runs only the QueryError phase so you don't
+/// pay the full ~128-phase suite cost just to validate this fix.
+#[test]
+fn query_error_phase_live() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let config = match get_config() {
+        Some(c) => c,
+        None => { println!("Skipping: IB credentials not set"); return; }
+    };
+
+    println!("=== ibx#186 focused live test ===\n");
+    let (mut gw, farm_conn, ccp_conn, hmds_conn) = Gateway::connect(&config)
+        .expect("Gateway::connect() failed");
+
+    let conns = Conns {
+        farm: farm_conn,
+        ccp: ccp_conn,
+        hmds: hmds_conn,
+        account_id: gw.account_id.clone(),
+    };
+
+    let conns = historical::phase_query_error_surfaces(conns, &gw, &config);
+    let conns = ensure_ccp_alive(conns, &mut gw, &config);
+    let _ = connection::phase_graceful_shutdown(conns);
 }
