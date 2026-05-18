@@ -266,6 +266,72 @@ impl HmdsState {
                             log::info!("HMDS TBT ticker_id assigned: {}", ticker_id_str);
                         }
                     }
+                    else if xml_tag.contains("<QueryError>") {
+                        // ibx#186: gateway rejected the query (e.g. "Invalid time length").
+                        // Without this branch the pending entry leaks forever and the
+                        // consumer sees no completion or error event.
+                        let query_id = crate::control::historical::extract_xml_tag(xml_tag, "id")
+                            .map(|s| s.to_string());
+                        let error_msg = crate::control::historical::extract_xml_tag(xml_tag, "error")
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        // IB canonical error code for HMDS-side validation/rejection.
+                        const HMDS_ERROR_CODE: i32 = 162;
+                        let mut released_req_id: Option<u32> = None;
+                        let mut from_historical = false;
+                        if let Some(qid) = &query_id {
+                            if let Some(pos) = self.pending_historical.iter().position(|(q, _)| q == qid) {
+                                let (_, req_id) = self.pending_historical.remove(pos);
+                                self.keep_up_to_date_reqs.remove(&req_id);
+                                released_req_id = Some(req_id);
+                                from_historical = true;
+                            } else if let Some(pos) = self.pending_head_ts.iter().position(|(q, _)| q == qid) {
+                                let (_, req_id) = self.pending_head_ts.remove(pos);
+                                released_req_id = Some(req_id);
+                            } else if let Some(pos) = self.pending_histogram.iter().position(|(q, _)| q == qid) {
+                                let (_, req_id) = self.pending_histogram.remove(pos);
+                                released_req_id = Some(req_id);
+                            } else if let Some(pos) = self.pending_ticks.iter().position(|(q, _, _)| q == qid) {
+                                let (_, req_id, _) = self.pending_ticks.remove(pos);
+                                released_req_id = Some(req_id);
+                            } else if let Some(pos) = self.pending_schedule.iter().position(|(q, _)| q == qid) {
+                                let (_, req_id) = self.pending_schedule.remove(pos);
+                                released_req_id = Some(req_id);
+                            } else if let Some(pos) = self.pending_scanner.iter().position(|(q, _)| q == qid) {
+                                let (_, req_id) = self.pending_scanner.remove(pos);
+                                released_req_id = Some(req_id);
+                            }
+                        }
+                        match released_req_id {
+                            Some(req_id) => {
+                                log::warn!(
+                                    "HMDS QueryError req_id={} query_id={:?}: {}",
+                                    req_id, query_id, error_msg
+                                );
+                                shared.reference.push_historical_error(req_id, HMDS_ERROR_CODE, error_msg.clone());
+                                // Surface a terminal sentinel for historical-bar consumers
+                                // that wait on historical_data_end. Empty response with
+                                // is_complete=true unblocks the existing dispatch path.
+                                if from_historical {
+                                    shared.reference.push_historical_data(
+                                        req_id,
+                                        crate::control::historical::HistoricalResponse {
+                                            query_id: query_id.clone().unwrap_or_default(),
+                                            timezone: String::new(),
+                                            is_complete: true,
+                                            bars: Vec::new(),
+                                        },
+                                    );
+                                }
+                            }
+                            None => {
+                                log::warn!(
+                                    "HMDS QueryError for unknown query_id={:?}: {}",
+                                    query_id, error_msg
+                                );
+                            }
+                        }
+                    }
                     else {
                         // ibx#182 follow-up: bumped from debug to warn so silent
                         // drops in the W cascade surface at Info-level apps.
@@ -983,5 +1049,84 @@ impl HmdsState {
             log::info!("Sent schedule request: req_id={} con_id={}", req_id, con_id);
         }
         self.pending_schedule.push((query_id, req_id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_query_error_msg(query_id: &str, error: &str) -> Vec<u8> {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<QueryError>\n\t<id>{}</id>\n\t<error>{}</error>\n</QueryError>\n",
+            query_id, error,
+        );
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"35=W\x016118=");
+        msg.extend_from_slice(xml.as_bytes());
+        msg.push(0x01);
+        msg
+    }
+
+    #[test]
+    fn query_error_releases_historical_and_emits_error_and_end_sentinel() {
+        let mut hmds = HmdsState::new();
+        let shared = SharedState::new();
+        let mut hb = HeartbeatState::new();
+        let mut conn: Option<Connection> = None;
+        hmds.pending_historical.push(("hist_1003".to_string(), 11));
+        hmds.keep_up_to_date_reqs.insert(11);
+
+        let msg = make_query_error_msg("hist_1003", "Invalid time length");
+        hmds.process_hmds_message(&msg, &mut conn, &shared, &None, &mut hb);
+
+        assert!(hmds.pending_historical.is_empty(), "pending entry should be drained");
+        assert!(!hmds.keep_up_to_date_reqs.contains(&11), "kut flag should be cleared");
+
+        let errors = shared.reference.drain_historical_errors();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, 11);
+        assert_eq!(errors[0].1, 162);
+        assert_eq!(errors[0].2, "Invalid time length");
+
+        let hist = shared.reference.drain_historical_data();
+        assert_eq!(hist.len(), 1, "terminal sentinel must be queued for historical req");
+        assert_eq!(hist[0].0, 11);
+        assert!(hist[0].1.is_complete);
+        assert!(hist[0].1.bars.is_empty());
+    }
+
+    #[test]
+    fn query_error_releases_head_timestamp_without_sentinel() {
+        let mut hmds = HmdsState::new();
+        let shared = SharedState::new();
+        let mut hb = HeartbeatState::new();
+        let mut conn: Option<Connection> = None;
+        hmds.pending_head_ts.push(("hts_1004".to_string(), 42));
+
+        let msg = make_query_error_msg("hts_1004", "No head timestamp");
+        hmds.process_hmds_message(&msg, &mut conn, &shared, &None, &mut hb);
+
+        assert!(hmds.pending_head_ts.is_empty());
+        let errors = shared.reference.drain_historical_errors();
+        assert_eq!(errors, vec![(42, 162, "No head timestamp".to_string())]);
+        // Head-ts is not a bar request — no historical_data sentinel should fire.
+        assert!(shared.reference.drain_historical_data().is_empty());
+    }
+
+    #[test]
+    fn query_error_for_unknown_query_id_drops_nothing_and_emits_no_error() {
+        let mut hmds = HmdsState::new();
+        let shared = SharedState::new();
+        let mut hb = HeartbeatState::new();
+        let mut conn: Option<Connection> = None;
+        hmds.pending_historical.push(("hist_1003".to_string(), 11));
+
+        let msg = make_query_error_msg("hist_9999", "Boom");
+        hmds.process_hmds_message(&msg, &mut conn, &shared, &None, &mut hb);
+
+        assert_eq!(hmds.pending_historical.len(), 1, "unrelated entry must stay");
+        assert!(shared.reference.drain_historical_errors().is_empty());
+        assert!(shared.reference.drain_historical_data().is_empty());
     }
 }

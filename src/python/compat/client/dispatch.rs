@@ -313,6 +313,12 @@ impl EClient {
             self.core.open_orders.lock().unwrap().remove(&wi.order_id);
         }
 
+        // Drain HMDS query errors -> error (ibx#186). Surface gateway-side validation
+        // failures (e.g. "Invalid time length") that previously vanished silently.
+        for (req_id, code, msg) in shared.reference.drain_historical_errors() {
+            call_wrapper!(self.wrapper, py, "error", (req_id as i64, code as i64, msg.as_str(), ""));
+        }
+
         // Drain historical data -> historicalData + historicalDataEnd / historicalDataUpdate
         let hist_data = shared.reference.drain_historical_data();
         for (req_id, response) in hist_data {

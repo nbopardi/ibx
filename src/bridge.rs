@@ -333,6 +333,9 @@ pub struct ReferenceState {
     histogram_data: Mutex<Vec<(u32, Vec<HistogramEntry>)>>,
     historical_ticks: Mutex<Vec<(u32, HistoricalTickData, String, bool)>>,
     historical_schedules: Mutex<Vec<(u32, HistoricalScheduleResponse)>>,
+    /// Errors surfaced by HMDS for in-flight reference queries (req_id, code, message).
+    /// Drained by the dispatcher and forwarded to `Wrapper::error`. ibx#186.
+    historical_errors: Mutex<Vec<(u32, i32, String)>>,
     market_rules: Mutex<Vec<MarketRule>>,
     depth_exchanges_cache: Mutex<Vec<DepthMktDataDescription>>,
     depth_exchanges_pending: Mutex<bool>,
@@ -366,6 +369,7 @@ impl ReferenceState {
             histogram_data: Mutex::new(Vec::with_capacity(4)),
             historical_ticks: Mutex::new(Vec::with_capacity(4)),
             historical_schedules: Mutex::new(Vec::with_capacity(4)),
+            historical_errors: Mutex::new(Vec::with_capacity(4)),
             market_rules: Mutex::new(Vec::new()),
             depth_exchanges_cache: Mutex::new(Vec::new()),
             depth_exchanges_pending: Mutex::new(false),
@@ -430,6 +434,10 @@ impl ReferenceState {
 
     pub fn drain_historical_schedules(&self) -> Vec<(u32, HistoricalScheduleResponse)> {
         self.historical_schedules.lock().unwrap().drain(..).collect()
+    }
+
+    pub fn drain_historical_errors(&self) -> Vec<(u32, i32, String)> {
+        self.historical_errors.lock().unwrap().drain(..).collect()
     }
 
     /// Get cached market rules.
@@ -499,6 +507,10 @@ impl ReferenceState {
 
     #[doc(hidden)] pub fn push_historical_schedule(&self, req_id: u32, response: HistoricalScheduleResponse) {
         self.historical_schedules.lock().unwrap().push((req_id, response));
+    }
+
+    #[doc(hidden)] pub fn push_historical_error(&self, req_id: u32, code: i32, message: String) {
+        self.historical_errors.lock().unwrap().push((req_id, code, message));
     }
 
     #[doc(hidden)] pub fn push_market_rules(&self, rules: Vec<MarketRule>) {
