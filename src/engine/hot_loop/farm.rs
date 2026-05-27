@@ -55,6 +55,7 @@ impl FarmState {
                 Err(e) => {
                     log::error!("Farm connection lost: {}", e);
                     self.handle_disconnect(context, event_tx);
+                    shared.note_farm_disconnect();
                     return;
                 }
                 Ok(n) => {

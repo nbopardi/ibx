@@ -404,6 +404,7 @@ impl HotLoop {
                     if now.duration_since(*sent_at).as_secs() > CCP_HEARTBEAT_SECS {
                         log::error!("CCP heartbeat timeout — connection lost");
                         self.ccp.handle_disconnect(&mut self.context, &self.event_tx);
+                        self.shared.note_ccp_disconnect();
                     }
                 } else {
                     let test_id = self.hb.next_test_id();
@@ -438,6 +439,7 @@ impl HotLoop {
                     if now.duration_since(*sent_at).as_secs() > FARM_HEARTBEAT_SECS {
                         log::error!("Farm heartbeat timeout — connection lost");
                         self.farm.handle_disconnect(&mut self.context, &self.event_tx);
+                        self.shared.note_farm_disconnect();
                     }
                 } else {
                     let test_id = self.hb.next_test_id();

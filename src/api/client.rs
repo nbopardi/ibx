@@ -148,6 +148,17 @@ impl EClient {
         self.connected.load(Ordering::Relaxed)
     }
 
+    /// Whether the UsFarm / UsFuture market-data connection has dropped.
+    /// Does not auto-reset on reconnect; reflects "ever disconnected since process start".
+    pub fn is_farm_disconnected(&self) -> bool {
+        self.shared.farm_disconnected()
+    }
+
+    /// Whether the CCP (auth + order routing) connection has dropped.
+    pub fn is_ccp_disconnected(&self) -> bool {
+        self.shared.ccp_disconnected()
+    }
+
     pub fn disconnect(&self) {
         let _ = self.control_tx.send(ControlCommand::Shutdown);
         self.connected.store(false, Ordering::Release);
@@ -583,6 +594,9 @@ impl EClient {
     /// Drain all SharedState queues and dispatch to the Wrapper.
     /// Call this in a loop — it is the Rust equivalent of C++ `EReader::processMsgs()`.
     pub fn process_msgs(&self, wrapper: &mut impl Wrapper) {
+        if self.shared.take_disconnect_event() {
+            wrapper.connection_closed();
+        }
         self.dispatch_orders(wrapper);
         self.dispatch_quotes(wrapper);
         self.dispatch_data(wrapper);

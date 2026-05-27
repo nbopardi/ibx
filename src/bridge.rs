@@ -6,7 +6,7 @@
 //! - The HotLoop pushes to SharedState directly.
 //! - External callers read snapshots and poll events without blocking the hot loop.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::cell::UnsafeCell;
 
@@ -145,6 +145,15 @@ pub struct SharedState {
     account: Mutex<AccountState>,
     /// InstrumentId counter — set by hot loop on RegisterInstrument.
     instrument_count: AtomicU64,
+    /// True once the primary (UsFarm) or UsFuture-secondary connection has dropped.
+    /// Stays true until a successful reconnect — not automatic; consumer must observe.
+    farm_disconnected: AtomicBool,
+    /// True once the CCP (auth + order routing) connection has dropped.
+    ccp_disconnected: AtomicBool,
+    /// One-shot edge flag — set by the hot loop on any disconnect, consumed by
+    /// `EClient::process_msgs` to fire `Wrapper::connection_closed` exactly once
+    /// per disconnect event.
+    disconnect_event_pending: AtomicBool,
 }
 
 impl SharedState {
@@ -181,6 +190,9 @@ impl SharedState {
             positions: std::array::from_fn(|_| AtomicU64::new(0)),
             account: Mutex::new(AccountState::default()),
             instrument_count: AtomicU64::new(0),
+            farm_disconnected: AtomicBool::new(false),
+            ccp_disconnected: AtomicBool::new(false),
+            disconnect_event_pending: AtomicBool::new(false),
         }
     }
 
@@ -506,6 +518,38 @@ impl SharedState {
 
     #[doc(hidden)] pub fn set_account(&self, account: &AccountState) {
         *self.account.lock().unwrap() = *account;
+    }
+
+    /// Whether the UsFarm (or UsFuture-secondary) market-data connection has dropped.
+    pub fn farm_disconnected(&self) -> bool {
+        self.farm_disconnected.load(Ordering::Relaxed)
+    }
+
+    /// Whether the CCP (auth + order routing) connection has dropped.
+    pub fn ccp_disconnected(&self) -> bool {
+        self.ccp_disconnected.load(Ordering::Relaxed)
+    }
+
+    /// Mark the farm connection as dropped and arm a one-shot for `process_msgs`
+    /// to fire `Wrapper::connection_closed` on the next dispatch.
+    #[doc(hidden)]
+    pub fn note_farm_disconnect(&self) {
+        self.farm_disconnected.store(true, Ordering::Relaxed);
+        self.disconnect_event_pending.store(true, Ordering::Relaxed);
+    }
+
+    /// Mark the CCP connection as dropped and arm the one-shot.
+    #[doc(hidden)]
+    pub fn note_ccp_disconnect(&self) {
+        self.ccp_disconnected.store(true, Ordering::Relaxed);
+        self.disconnect_event_pending.store(true, Ordering::Relaxed);
+    }
+
+    /// Consume the disconnect-event one-shot. Returns true if a disconnect happened
+    /// since the last call.
+    #[doc(hidden)]
+    pub fn take_disconnect_event(&self) -> bool {
+        self.disconnect_event_pending.swap(false, Ordering::Relaxed)
     }
 
     #[doc(hidden)] pub fn set_instrument_count(&self, count: u32) {
