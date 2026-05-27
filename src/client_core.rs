@@ -268,6 +268,17 @@ impl ClientCore {
 
     /// Find instrument ID for a contract, registering if needed.
     /// Returns `Err` if the control channel is closed.
+    ///
+    /// The engine's `market.register(con_id)` is idempotent on `con_id` — it returns
+    /// the existing `InstrumentId` if `con_id` has already been registered, otherwise
+    /// it allocates a new one. We rely on that for the lookup; both
+    /// `RegisterInstrument` and `Subscribe` handlers call it and the `Subscribe`
+    /// reply carries the canonical InstrumentId for this `con_id`.
+    ///
+    /// Note: this used to do `instrument_to_req.iter().next()` as a "find" shortcut,
+    /// which returned an arbitrary (and usually wrong) `InstrumentId` whenever any
+    /// instrument was already registered. The result was that orders for instrument B
+    /// would be routed to instrument A's con_id/symbol whenever A was registered first.
     pub fn find_or_register_instrument(
         &self,
         shared: &SharedState,
@@ -277,25 +288,19 @@ impl ClientCore {
         exchange: &str,
         sec_type: &str,
     ) -> Result<InstrumentId, String> {
-        // Check if already mapped
-        {
-            let map = self.instrument_to_req.lock().unwrap();
-            if let Some((&iid, _)) = map.iter().next() {
-                return Ok(iid);
-            }
-        }
-
-        // Register new
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        control_tx.send(ControlCommand::RegisterInstrument { con_id, reply_tx: None })
+        control_tx
+            .send(ControlCommand::RegisterInstrument { con_id, reply_tx: None })
             .map_err(|e| format!("Engine stopped: {}", e))?;
-        control_tx.send(ControlCommand::Subscribe {
-            con_id,
-            symbol: symbol.to_string(),
-            exchange: exchange.to_string(),
-            sec_type: sec_type.to_string(),
-            reply_tx: Some(reply_tx),
-        }).map_err(|e| format!("Engine stopped: {}", e))?;
+        control_tx
+            .send(ControlCommand::Subscribe {
+                con_id,
+                symbol: symbol.to_string(),
+                exchange: exchange.to_string(),
+                sec_type: sec_type.to_string(),
+                reply_tx: Some(reply_tx),
+            })
+            .map_err(|e| format!("Engine stopped: {}", e))?;
 
         match Self::recv_registration(reply_rx) {
             Ok(id) => Ok(id),
