@@ -56,6 +56,7 @@ impl CcpState {
                     Err(e) => {
                         log::error!("CCP connection lost: {}", e);
                         self.handle_disconnect(context, event_tx);
+                        shared.note_ccp_disconnect();
                         return;
                     }
                     Ok(_) => {
@@ -892,6 +893,50 @@ impl CcpState {
                         (15, "USD"),
                         (204, "0"),
                     ])
+                }
+                OrderRequest::SubmitStopEx { order_id, instrument, side, qty, stop_price, tif, attrs } => {
+                    context.insert_order(crate::types::Order::new(
+                        order_id, instrument, side, qty, stop_price, b'3', tif, stop_price,
+                    ));
+                    let clord_str = order_id.to_string();
+                    let side_str = fix_side(side);
+                    let qty_str = qty.to_string();
+                    let stop_str = format_price(stop_price);
+                    let tif_byte = [tif];
+                    let tif_str = std::str::from_utf8(&tif_byte).unwrap_or("0");
+                    let symbol = context.market.symbol(instrument).to_string();
+                    let sec_type_str = context.market.sec_type(instrument).to_string();
+                    let exchange_str = context.market.exchange(instrument).to_string();
+                    let con_id_str = context.market.con_id(instrument).unwrap_or(0).to_string();
+                    let now = chrono_free_timestamp();
+                    let oca_str = if attrs.oca_group > 0 { format!("OCA_{}", attrs.oca_group) } else { String::new() };
+                    let mut fields: Vec<(u32, &str)> = vec![
+                        (fix::TAG_MSG_TYPE, fix::MSG_NEW_ORDER),
+                        (fix::TAG_SENDING_TIME, &now),
+                        (11, &clord_str),
+                        (1, account_id),
+                        (21, "2"),               // HandlInst = Automated
+                        (55, &symbol),
+                        (6008, &con_id_str),     // ConId
+                        (54, side_str),
+                        (38, &qty_str),
+                        (40, "3"),               // OrdType = Stop
+                        (99, &stop_str),         // StopPx
+                        (59, tif_str),
+                        (60, &now),
+                        (167, &sec_type_str),
+                        (100, &exchange_str),
+                        (15, "USD"),
+                        (204, "0"),
+                    ];
+                    if attrs.outside_rth {
+                        fields.push((6433, "1"));
+                    }
+                    if attrs.oca_group > 0 {
+                        fields.push((583, &oca_str));
+                        fields.push((6209, "CancelOnFillWBlock"));
+                    }
+                    conn.send_fix(&fields)
                 }
                 OrderRequest::SubmitStopGtc { order_id, instrument, side, qty, stop_price, outside_rth } => {
                     context.insert_order(crate::types::Order::new(
@@ -2236,13 +2281,17 @@ pub(crate) fn handle_position_update(
         .map(|v| (v * PRICE_SCALE as f64) as Price)
         .unwrap_or(0);
 
+    // Always cache the position info by con_id — this lets `req_positions` return
+    // positions for contracts that haven't been registered as market-data instruments
+    // yet (e.g. IB's initial post-login push arrives before our `req_mkt_data` calls).
+    shared.set_position_info(PositionInfo { con_id, position, avg_cost });
+
     if let Some(instrument) = context.market.instrument_by_con_id(con_id) {
         let current = context.position(instrument);
         let delta = position - current;
         if delta != 0 {
             context.update_position(instrument, delta);
         }
-        shared.set_position_info(PositionInfo { con_id, position, avg_cost });
         shared.set_position(instrument, position);
         emit(event_tx, Event::PositionUpdate { instrument, con_id, position, avg_cost });
     }

@@ -715,7 +715,16 @@ impl ClientCore {
             }
             "STP" => {
                 let stop = (order.aux_price * PRICE_SCALE_F) as i64;
-                OrderRequest::SubmitStop { order_id, instrument, side, qty, stop_price: stop }
+                if order.has_extended_attrs() || order.tif != "DAY" {
+                    OrderRequest::SubmitStopEx {
+                        order_id, instrument, side, qty,
+                        stop_price: stop,
+                        tif: order.tif_byte(),
+                        attrs: order.attrs(),
+                    }
+                } else {
+                    OrderRequest::SubmitStop { order_id, instrument, side, qty, stop_price: stop }
+                }
             }
             "STP LMT" => {
                 let price = (order.lmt_price * PRICE_SCALE_F) as i64;

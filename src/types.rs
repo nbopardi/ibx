@@ -543,6 +543,18 @@ pub enum OrderRequest {
         tif: u8,
         attrs: OrderAttrs,
     },
+    /// Extended stop order with optional attributes (OCA group, GTC, outside_rth, etc).
+    /// The plain `SubmitStop` variant hardcodes TIF=DAY and ignores OCA/attrs, so any
+    /// STP order with a non-DAY TIF or any extended attribute must route here instead.
+    SubmitStopEx {
+        order_id: OrderId,
+        instrument: InstrumentId,
+        side: Side,
+        qty: u32,
+        stop_price: Price,
+        tif: u8,
+        attrs: OrderAttrs,
+    },
     /// Relative / Pegged-to-Primary order: pegs to NBBO with optional offset.
     SubmitRel {
         order_id: OrderId,
