@@ -418,6 +418,26 @@ pub struct GatewayConfig {
     pub paper: bool,
 }
 
+/// Returns true if `s` looks like a real IB account id: a prefix of `DU`, `DF`,
+/// or `U` followed by alphanumerics including at least one digit. We use this
+/// as an invariant gate so an outgoing order can never carry the IB username
+/// (e.g. `kbigyh846`) in the account field — which IB silently rejects with
+/// `Invalid or missing IBCustAcctNo`, surfaced as a `status=Inactive` ExecReport.
+pub(crate) fn is_ib_account_id(s: &str) -> bool {
+    let rest = if let Some(r) = s.strip_prefix("DU") {
+        r
+    } else if let Some(r) = s.strip_prefix("DF") {
+        r
+    } else if let Some(r) = s.strip_prefix('U') {
+        r
+    } else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.chars().all(|c| c.is_ascii_alphanumeric())
+        && rest.chars().any(|c| c.is_ascii_digit())
+}
+
 impl Gateway {
     /// Connect to IB: auth + logon + data farm connections.
     /// Returns Gateway + farm Connection + auth Connection + optional historical data Connection.
@@ -661,6 +681,19 @@ impl Gateway {
             server_session_id = session_id.clone();
         }
 
+        // Sanity-check the tag-1 echo. On IB's 3rd reconnect of a session, the
+        // ACK has been observed to contain a non-account-shaped value (the
+        // username gets parsed in). Clear it so we don't carry it forward as a
+        // poisoned account id — the init-response scan below gets another shot.
+        if !account_id.is_empty() && !is_ib_account_id(&account_id) {
+            log::warn!(
+                "Auth logon tag 1='{}' is not an IB account id; ignoring and \
+                 relying on init-response scan to populate account_id",
+                account_id
+            );
+            account_id.clear();
+        }
+
         log::info!(
             "Auth logon: account={} session_id={} hb={}s",
             account_id, server_session_id, heartbeat_interval
@@ -775,8 +808,27 @@ impl Gateway {
             Err(e) => { log::warn!("usfuture connection failed (non-fatal): {}", e); None }
         };
 
+        // Hard invariant: an outgoing order without a real account id will be
+        // rejected by IB silently (reason='Invalid or missing IBCustAcctNo'),
+        // and the prior code silently substituted `config.username` which IB
+        // rejects every time. Refuse to construct a Gateway in that state;
+        // the executor's outer reconnect loop will back off and retry.
+        if !is_ib_account_id(&account_id) {
+            log::error!(
+                "Gateway::connect: no valid IB account id found after auth + init \
+                 (logon tag 1='{}', init-response scan empty). IB likely refused \
+                 the session (look for SessionReject 'Invalid account'). \
+                 Aborting connect; outer reconnect loop will retry.",
+                account_id
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "no valid IB account id from auth/init handshake",
+            ));
+        }
+
         let gw = Gateway {
-            account_id: if account_id.is_empty() { config.username.clone() } else { account_id },
+            account_id,
             session_token: session_key,
             server_session_id,
             ccp_token,
@@ -1092,5 +1144,46 @@ mod tests {
         };
         assert_eq!(config.username, "user");
         assert!(config.paper);
+    }
+
+    // ─── Account-ID invariant gate (guards against the 3rd-reconnect bug
+    //     where the IB username got written into orders as the account id) ───
+
+    #[test]
+    fn account_id_accepts_paper() {
+        assert!(super::is_ib_account_id("DUP500458"));
+    }
+
+    #[test]
+    fn account_id_accepts_du_prefix() {
+        assert!(super::is_ib_account_id("DU1234567"));
+    }
+
+    #[test]
+    fn account_id_accepts_live_u_prefix() {
+        assert!(super::is_ib_account_id("U1234567"));
+    }
+
+    #[test]
+    fn account_id_rejects_username() {
+        // The actual symptom: `kbigyh846` should NEVER be accepted as an account.
+        assert!(!super::is_ib_account_id("kbigyh846"));
+    }
+
+    #[test]
+    fn account_id_rejects_empty() {
+        assert!(!super::is_ib_account_id(""));
+    }
+
+    #[test]
+    fn account_id_rejects_letters_only() {
+        // Must contain at least one digit — DUABC alone isn't a real account.
+        assert!(!super::is_ib_account_id("DUABC"));
+    }
+
+    #[test]
+    fn account_id_rejects_lowercase_prefix() {
+        // The prefix check is case-sensitive; ibx upstream emits uppercase.
+        assert!(!super::is_ib_account_id("du1234567"));
     }
 }

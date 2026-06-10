@@ -126,7 +126,26 @@ impl CcpState {
             "3" => {
                 let reason = parsed.get(&58).map(|s| s.as_str()).unwrap_or("unknown");
                 let ref_tag = parsed.get(&371).map(|s| s.as_str()).unwrap_or("?");
-                log::warn!("SessionReject: reason='{}' refTag={}", reason, ref_tag);
+                // SessionReject can be benign (e.g. transient field validation
+                // on a single message), or fatal (IB refused our account/auth).
+                // The "Invalid account" variant has been observed after the 3rd
+                // reconnect of a session and indicates that any subsequent
+                // orders would be rejected with "Invalid or missing IBCustAcctNo".
+                // Escalate it: tear the session down so the executor reconnects
+                // (and the outer Gateway::connect's account-id invariant gate
+                // will surface the real failure if it keeps recurring).
+                let lower = reason.to_ascii_lowercase();
+                if lower.contains("invalid account") {
+                    log::error!(
+                        "Fatal SessionReject from IB auth: reason='{}' refTag={} — \
+                         tearing down session so executor reconnects",
+                        reason, ref_tag
+                    );
+                    self.handle_disconnect(context, event_tx);
+                    shared.note_ccp_disconnect();
+                } else {
+                    log::warn!("SessionReject: reason='{}' refTag={}", reason, ref_tag);
+                }
             }
             "U" => {
                 if let Some(comm) = parsed.get(&6040) {

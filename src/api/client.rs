@@ -31,7 +31,7 @@
 //! }
 //! ```
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -71,6 +71,13 @@ pub struct EClient {
     pub account_id: String,
     connected: AtomicBool,
     next_order_id: AtomicU64,
+    /// Market data type preference (1=live, 2=frozen, 3=delayed, 4=delayed-frozen).
+    /// Stored for API compatibility with the standard ibapi `reqMarketDataType`.
+    /// NOTE: this fork connects directly to IBKR farm servers, which deliver the
+    /// feed the account is entitled to — toggling this value does NOT switch the
+    /// wire feed to delayed data. It is recorded so consumers can observe the
+    /// preference and so the `market_data_type` wrapper callback can echo it back.
+    market_data_type: AtomicI32,
     core: ClientCore,
 }
 
@@ -108,6 +115,7 @@ impl EClient {
             account_id,
             connected: AtomicBool::new(true),
             next_order_id: AtomicU64::new(start_id),
+            market_data_type: AtomicI32::new(1),
             core: ClientCore::new(),
         })
     }
@@ -131,6 +139,7 @@ impl EClient {
             account_id,
             connected: AtomicBool::new(true),
             next_order_id: AtomicU64::new(start_id),
+            market_data_type: AtomicI32::new(1),
             core: ClientCore::new(),
         }
     }
@@ -185,6 +194,25 @@ impl EClient {
         if let Some(instrument) = self.core.unregister_mkt_data(req_id) {
             let _ = self.control_tx.send(ControlCommand::Unsubscribe { instrument });
         }
+    }
+
+    /// Set market data type. Matches `reqMarketDataType` in C++.
+    /// Values: 1=live, 2=frozen, 3=delayed, 4=delayed-frozen.
+    ///
+    /// IMPORTANT: this fork connects directly to IBKR farm servers, which deliver
+    /// the feed the account is entitled to. Calling this method records the
+    /// preference (for `market_data_type()` callback observability) but does NOT
+    /// switch the wire feed to delayed data. If your account lacks a real-time
+    /// CME entitlement, the underlying gateway will simply not publish LAST
+    /// ticks regardless of the value passed here.
+    pub fn req_market_data_type(&self, market_data_type: i32) {
+        self.market_data_type.store(market_data_type, Ordering::Relaxed);
+    }
+
+    /// Read the current market data type preference set via `req_market_data_type`.
+    /// Default is 1 (live).
+    pub fn market_data_type(&self) -> i32 {
+        self.market_data_type.load(Ordering::Relaxed)
     }
 
     /// Subscribe to tick-by-tick data. Matches `reqTickByTickData` in C++.
